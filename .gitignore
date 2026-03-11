@@ -1,0 +1,32 @@
+# Credentials & secrets
+.credentials.json
+
+# Session & history data
+history.jsonl
+session-env/
+shell-snapshots/
+file-history/
+paste-cache/
+
+# Cache & temp
+cache/
+downloads/
+debug/
+backups/
+telemetry/
+mcp-needs-auth-cache.json
+
+# Project-specific state (per-repo settings, memory, todos)
+projects/
+todos/
+plans/
+tasks/
+
+# Installed plugins (managed by Claude Code)
+plugins/
+
+# Local-only settings (machine-specific permissions)
+settings.local.json
+
+# Git internals
+.git/
