@@ -26,15 +26,53 @@ Build a feature using specialized review agents. Each feature runs in an isolate
 
 **State file:** `.claude/features.json` (relative to the main repo root)
 
+The state file uses this structure:
+```json
+{
+  "project": {
+    "repoName": "...",
+    "defaultBranch": "main",
+    "pkgMgr": "bun",
+    "installCmd": "bun install",
+    "buildCmd": "bun run build",
+    "devCmd": "bun run dev",
+    "stack": "Next.js 16, Drizzle ORM, PostgreSQL, Tailwind CSS",
+    "deployModel": "GitHub Actions: push to main triggers deploy",
+    "hasScreenshots": true,
+    "envFile": ".env.local",
+    "detectedAt": "2026-03-24T..."
+  },
+  "features": [...]
+}
+```
+
+The `project` key caches project-level detection so it only runs once per repo. Individual features are in the `features` array. When reading/writing feature records, always access `.features` (not the root).
+
 ---
 
 ## Step -1: Parse Command
 
-Before doing anything else, parse `$ARGUMENTS` to determine the subcommand.
+Before doing anything else, **migrate the state file** if it uses the old flat-array format:
+
+```bash
+if [ -f .claude/features.json ]; then
+  node -e "
+  const fs = require('fs');
+  const p = '.claude/features.json';
+  const d = JSON.parse(fs.readFileSync(p,'utf8'));
+  if (Array.isArray(d)) {
+    fs.writeFileSync(p, JSON.stringify({project: null, features: d}, null, 2));
+    console.log('Migrated features.json to new format');
+  }
+  "
+fi
+```
+
+Then parse `$ARGUMENTS` to determine the subcommand.
 
 ### If `$ARGUMENTS` is empty or is exactly `list`:
 
-Read `.claude/features.json` and display all tracked features in a table format:
+Read `.claude/features.json` and display all tracked features (from the `.features` array) in a table format:
 
 | Name | Status | Step | Branch | Worktree | Port | Updated |
 |------|--------|------|--------|----------|------|---------|
@@ -70,7 +108,9 @@ If found:
    - `$SCREENSHOT_DIR` = `screenshotDir`
    - `$FEATURE_NAME` = `name`
    - `$PLAN` = `plan` (if stored)
-4. **Jump to the step recorded in `step`** (skip all prior steps). If the step is `4` (implementing), resume at Step 4. If `6` (reviewing), resume at Step 6. Etc.
+4. Load project-level variables from the `.project` key in `features.json`:
+   - `$REPO_NAME`, `$DEFAULT_BRANCH`, `$PKG_MGR`, `$INSTALL_CMD`, `$BUILD_CMD`, `$DEV_CMD`, `$STACK_SUMMARY`, `$DEPLOY_MODEL`, `$HAS_SCREENSHOTS`, `$ENV_FILE`
+5. **Jump to the step recorded in `step`** (skip all prior steps). If the step is `4` (implementing), resume at Step 4. If `6` (reviewing), resume at Step 6. Etc.
 
 ### If `$ARGUMENTS` starts with `complete `:
 
@@ -83,13 +123,13 @@ Update the record:
 node -e "
 const fs = require('fs');
 const p = '.claude/features.json';
-const f = JSON.parse(fs.readFileSync(p,'utf8'));
-const i = f.findIndex(x => x.name === '<NAME>');
+const d = JSON.parse(fs.readFileSync(p,'utf8'));
+const i = d.features.findIndex(x => x.name === '<NAME>');
 if (i === -1) { console.log('Not found'); process.exit(1); }
-f[i].status = 'complete';
-f[i].updatedAt = new Date().toISOString();
-fs.writeFileSync(p, JSON.stringify(f, null, 2));
-console.log('Marked', f[i].name, 'as complete');
+d.features[i].status = 'complete';
+d.features[i].updatedAt = new Date().toISOString();
+fs.writeFileSync(p, JSON.stringify(d, null, 2));
+console.log('Marked', d.features[i].name, 'as complete');
 "
 ```
 
@@ -110,14 +150,14 @@ If not found, say: "No feature named '<name>' found." **Stop here.**
    node -e "
    const fs = require('fs');
    const p = '.claude/features.json';
-   const f = JSON.parse(fs.readFileSync(p,'utf8'));
-   const i = f.findIndex(x => x.name === '<NAME>');
+   const d = JSON.parse(fs.readFileSync(p,'utf8'));
+   const i = d.features.findIndex(x => x.name === '<NAME>');
    if (i === -1) { console.log('Not found'); process.exit(1); }
-   f[i].status = 'abandoned';
-   f[i].worktreePath = null;
-   f[i].updatedAt = new Date().toISOString();
-   fs.writeFileSync(p, JSON.stringify(f, null, 2));
-   console.log('Abandoned', f[i].name);
+   d.features[i].status = 'abandoned';
+   d.features[i].worktreePath = null;
+   d.features[i].updatedAt = new Date().toISOString();
+   fs.writeFileSync(p, JSON.stringify(d, null, 2));
+   console.log('Abandoned', d.features[i].name);
    "
    ```
 
@@ -138,12 +178,12 @@ If not found, say: "No feature named '<name>' found." **Stop here.**
    node -e "
    const fs = require('fs');
    const p = '.claude/features.json';
-   const f = JSON.parse(fs.readFileSync(p,'utf8'));
-   const i = f.findIndex(x => x.name === '<NAME>');
+   const d = JSON.parse(fs.readFileSync(p,'utf8'));
+   const i = d.features.findIndex(x => x.name === '<NAME>');
    if (i === -1) { console.log('Not found'); process.exit(1); }
-   const name = f[i].name;
-   f.splice(i, 1);
-   fs.writeFileSync(p, JSON.stringify(f, null, 2));
+   const name = d.features[i].name;
+   d.features.splice(i, 1);
+   fs.writeFileSync(p, JSON.stringify(d, null, 2));
    console.log('Removed', name);
    "
    ```
@@ -158,9 +198,38 @@ Treat `$ARGUMENTS` as a new feature description. Continue to Step 0.
 
 ## Step 0: Detect Project & Create Worktree
 
-### 0a: Project Detection
+### 0a: Project Detection (cached)
 
-Before creating the worktree, detect the project's characteristics. These variables will be used throughout:
+Project characteristics are detected once and cached in `.claude/features.json` under the `project` key. On subsequent features in the same repo, the cached profile is reused.
+
+**First, check for a cached project profile:**
+
+```bash
+mkdir -p .claude
+if [ -f .claude/features.json ]; then
+  node -e "
+  const d = JSON.parse(require('fs').readFileSync('.claude/features.json','utf8'));
+  if (d.project) { console.log('CACHED'); console.log(JSON.stringify(d.project)); }
+  else console.log('NONE');
+  "
+fi
+```
+
+**If CACHED:** Load all variables from the cached `project` object:
+- `$REPO_NAME` = `project.repoName`
+- `$DEFAULT_BRANCH` = `project.defaultBranch`
+- `$PKG_MGR` = `project.pkgMgr`
+- `$INSTALL_CMD` = `project.installCmd`
+- `$BUILD_CMD` = `project.buildCmd`
+- `$DEV_CMD` = `project.devCmd`
+- `$STACK_SUMMARY` = `project.stack`
+- `$DEPLOY_MODEL` = `project.deployModel`
+- `$HAS_SCREENSHOTS` = `project.hasScreenshots`
+- `$ENV_FILE` = `project.envFile`
+
+Skip the detection steps below and proceed to **0b: Create Worktree**.
+
+**If NONE (no cached profile):** Run full detection:
 
 1. **Detect repo name** from the git remote or directory name:
    ```bash
@@ -205,6 +274,33 @@ Before creating the worktree, detect the project's characteristics. These variab
 
    Set `$DEPLOY_MODEL` to a description like "GitHub Actions: push to main triggers deploy via SSH to production server" or "Vercel: auto-deploys on push to main".
 
+**After detection, cache the project profile** (this runs only on first feature in a repo):
+```bash
+[ -f .claude/features.json ] || echo '{"project":null,"features":[]}' > .claude/features.json
+node -e "
+const fs = require('fs');
+const p = '.claude/features.json';
+const d = JSON.parse(fs.readFileSync(p,'utf8'));
+// Migrate from old array format if needed
+if (Array.isArray(d)) { const features = d; var data = {project: null, features}; } else { var data = d; }
+data.project = {
+  repoName: '$REPO_NAME',
+  defaultBranch: '$DEFAULT_BRANCH',
+  pkgMgr: '$PKG_MGR',
+  installCmd: '$INSTALL_CMD',
+  buildCmd: '$BUILD_CMD',
+  devCmd: '$DEV_CMD',
+  stack: '$STACK_SUMMARY',
+  deployModel: $(printf '%s' '$DEPLOY_MODEL' | node -e \"process.stdout.write(JSON.stringify(require('fs').readFileSync('/dev/stdin','utf8')))\"),
+  hasScreenshots: $HAS_SCREENSHOTS,
+  envFile: '$ENV_FILE',
+  detectedAt: new Date().toISOString()
+};
+fs.writeFileSync(p, JSON.stringify(data, null, 2));
+console.log('Project profile cached');
+"
+```
+
 ### 0b: Create Worktree
 
 Set up an isolated working environment for this feature:
@@ -244,15 +340,13 @@ Set up an isolated working environment for this feature:
    SCREENSHOT_DIR="/tmp/${REPO_NAME}-screenshots-${FEATURE_NAME}"
    ```
 
-10. **Track the feature** — initialize `.claude/features.json` if it doesn't exist, then add a record:
+10. **Track the feature** — add a record to the `features` array in `.claude/features.json`:
     ```bash
-    mkdir -p .claude
-    [ -f .claude/features.json ] || echo '[]' > .claude/features.json
     node -e "
     const fs = require('fs');
     const p = '.claude/features.json';
-    const f = JSON.parse(fs.readFileSync(p,'utf8'));
-    f.push({
+    const d = JSON.parse(fs.readFileSync(p,'utf8'));
+    d.features.push({
       name: '$FEATURE_NAME',
       description: $(printf '%s' '$ARGUMENTS' | node -e "process.stdout.write(JSON.stringify(require('fs').readFileSync('/dev/stdin','utf8')))"),
       branch: 'feature/$FEATURE_NAME',
@@ -262,12 +356,10 @@ Set up an isolated working environment for this feature:
       status: 'planning',
       step: 0,
       plan: null,
-      stack: '$STACK_SUMMARY',
-      deployModel: '$DEPLOY_MODEL',
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString()
     });
-    fs.writeFileSync(p, JSON.stringify(f, null, 2));
+    fs.writeFileSync(p, JSON.stringify(d, null, 2));
     console.log('Tracking feature:', '$FEATURE_NAME');
     "
     ```
@@ -283,9 +375,9 @@ Remember all variables (`$WORKTREE_PATH`, `$PORT`, `$SCREENSHOT_DIR`, `$FEATURE_
 node -e "
 const fs = require('fs');
 const p = '.claude/features.json';
-const f = JSON.parse(fs.readFileSync(p,'utf8'));
-const i = f.findIndex(x => x.name === '$FEATURE_NAME');
-if (i !== -1) { f[i].step = 1; f[i].status = 'planning'; f[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(f, null, 2)); }
+const d = JSON.parse(fs.readFileSync(p,'utf8'));
+const i = d.features.findIndex(x => x.name === '$FEATURE_NAME');
+if (i !== -1) { d.features[i].step = 1; d.features[i].status = 'planning'; d.features[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(d, null, 2)); }
 "
 ```
 
@@ -323,9 +415,9 @@ Save the plan output to a variable for the next steps.
 node -e "
 const fs = require('fs');
 const p = '.claude/features.json';
-const f = JSON.parse(fs.readFileSync(p,'utf8'));
-const i = f.findIndex(x => x.name === '$FEATURE_NAME');
-if (i !== -1) { f[i].plan = $(printf '%s' '$PLAN' | node -e "process.stdout.write(JSON.stringify(require('fs').readFileSync('/dev/stdin','utf8')))"); f[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(f, null, 2)); }
+const d = JSON.parse(fs.readFileSync(p,'utf8'));
+const i = d.features.findIndex(x => x.name === '$FEATURE_NAME');
+if (i !== -1) { d.features[i].plan = $(printf '%s' '$PLAN' | node -e "process.stdout.write(JSON.stringify(require('fs').readFileSync('/dev/stdin','utf8')))"); d.features[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(d, null, 2)); }
 "
 ```
 
@@ -338,9 +430,9 @@ if (i !== -1) { f[i].plan = $(printf '%s' '$PLAN' | node -e "process.stdout.writ
 node -e "
 const fs = require('fs');
 const p = '.claude/features.json';
-const f = JSON.parse(fs.readFileSync(p,'utf8'));
-const i = f.findIndex(x => x.name === '$FEATURE_NAME');
-if (i !== -1) { f[i].step = 2; f[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(f, null, 2)); }
+const d = JSON.parse(fs.readFileSync(p,'utf8'));
+const i = d.features.findIndex(x => x.name === '$FEATURE_NAME');
+if (i !== -1) { d.features[i].step = 2; d.features[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(d, null, 2)); }
 "
 ```
 
@@ -379,9 +471,9 @@ If BLOCKED, send the feedback back to the Plan agent (re-run Step 1 with the fee
 node -e "
 const fs = require('fs');
 const p = '.claude/features.json';
-const f = JSON.parse(fs.readFileSync(p,'utf8'));
-const i = f.findIndex(x => x.name === '$FEATURE_NAME');
-if (i !== -1) { f[i].step = 3; f[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(f, null, 2)); }
+const d = JSON.parse(fs.readFileSync(p,'utf8'));
+const i = d.features.findIndex(x => x.name === '$FEATURE_NAME');
+if (i !== -1) { d.features[i].step = 3; d.features[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(d, null, 2)); }
 "
 ```
 
@@ -405,9 +497,9 @@ If the user provides feedback, incorporate it and re-run from Step 1 (or just ad
 node -e "
 const fs = require('fs');
 const p = '.claude/features.json';
-const f = JSON.parse(fs.readFileSync(p,'utf8'));
-const i = f.findIndex(x => x.name === '$FEATURE_NAME');
-if (i !== -1) { f[i].step = 4; f[i].status = 'implementing'; f[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(f, null, 2)); }
+const d = JSON.parse(fs.readFileSync(p,'utf8'));
+const i = d.features.findIndex(x => x.name === '$FEATURE_NAME');
+if (i !== -1) { d.features[i].step = 4; d.features[i].status = 'implementing'; d.features[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(d, null, 2)); }
 "
 ```
 
@@ -450,9 +542,9 @@ Save the list of changed files and affected URLs.
 node -e "
 const fs = require('fs');
 const p = '.claude/features.json';
-const f = JSON.parse(fs.readFileSync(p,'utf8'));
-const i = f.findIndex(x => x.name === '$FEATURE_NAME');
-if (i !== -1) { f[i].step = 5; f[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(f, null, 2)); }
+const d = JSON.parse(fs.readFileSync(p,'utf8'));
+const i = d.features.findIndex(x => x.name === '$FEATURE_NAME');
+if (i !== -1) { d.features[i].step = 5; d.features[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(d, null, 2)); }
 "
 ```
 
@@ -488,9 +580,9 @@ Read the screenshot images from `$SCREENSHOT_DIR` so they're available for the v
 node -e "
 const fs = require('fs');
 const p = '.claude/features.json';
-const f = JSON.parse(fs.readFileSync(p,'utf8'));
-const i = f.findIndex(x => x.name === '$FEATURE_NAME');
-if (i !== -1) { f[i].step = 6; f[i].status = 'reviewing'; f[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(f, null, 2)); }
+const d = JSON.parse(fs.readFileSync(p,'utf8'));
+const i = d.features.findIndex(x => x.name === '$FEATURE_NAME');
+if (i !== -1) { d.features[i].step = 6; d.features[i].status = 'reviewing'; d.features[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(d, null, 2)); }
 "
 ```
 
@@ -548,9 +640,9 @@ Append to the prompt:
 node -e "
 const fs = require('fs');
 const p = '.claude/features.json';
-const f = JSON.parse(fs.readFileSync(p,'utf8'));
-const i = f.findIndex(x => x.name === '$FEATURE_NAME');
-if (i !== -1) { f[i].step = 7; f[i].status = 'implementing'; f[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(f, null, 2)); }
+const d = JSON.parse(fs.readFileSync(p,'utf8'));
+const i = d.features.findIndex(x => x.name === '$FEATURE_NAME');
+if (i !== -1) { d.features[i].step = 7; d.features[i].status = 'implementing'; d.features[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(d, null, 2)); }
 "
 ```
 
@@ -599,9 +691,9 @@ After the revision agent returns, if `$HAS_SCREENSHOTS` is true and any view-rel
 node -e "
 const fs = require('fs');
 const p = '.claude/features.json';
-const f = JSON.parse(fs.readFileSync(p,'utf8'));
-const i = f.findIndex(x => x.name === '$FEATURE_NAME');
-if (i !== -1) { f[i].step = 8; f[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(f, null, 2)); }
+const d = JSON.parse(fs.readFileSync(p,'utf8'));
+const i = d.features.findIndex(x => x.name === '$FEATURE_NAME');
+if (i !== -1) { d.features[i].step = 8; d.features[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(d, null, 2)); }
 "
 ```
 
@@ -631,9 +723,9 @@ git push -u origin feature/$FEATURE_NAME
 node -e "
 const fs = require('fs');
 const p = '.claude/features.json';
-const f = JSON.parse(fs.readFileSync(p,'utf8'));
-const i = f.findIndex(x => x.name === '$FEATURE_NAME');
-if (i !== -1) { f[i].step = 9; f[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(f, null, 2)); }
+const d = JSON.parse(fs.readFileSync(p,'utf8'));
+const i = d.features.findIndex(x => x.name === '$FEATURE_NAME');
+if (i !== -1) { d.features[i].step = 9; d.features[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(d, null, 2)); }
 "
 ```
 
@@ -696,9 +788,9 @@ Note the branch name and move on.
 node -e "
 const fs = require('fs');
 const p = '.claude/features.json';
-const f = JSON.parse(fs.readFileSync(p,'utf8'));
-const i = f.findIndex(x => x.name === '$FEATURE_NAME');
-if (i !== -1) { f[i].step = 10; f[i].status = 'complete'; f[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(f, null, 2)); }
+const d = JSON.parse(fs.readFileSync(p,'utf8'));
+const i = d.features.findIndex(x => x.name === '$FEATURE_NAME');
+if (i !== -1) { d.features[i].step = 10; d.features[i].status = 'complete'; d.features[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(d, null, 2)); }
 "
 ```
 
