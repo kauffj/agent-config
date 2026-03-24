@@ -52,6 +52,6 @@
 - **Simplicity First**: Make every change as simple as possible. Impact minimal code.
 - **No Laziness**: Find root causes. No temporary fixes. Senior developer standards.
 - **Minimal Impact**: Changes should only touch what’s necessary. Avoid introducing bugs.
-
-@/home/you/.claude/hickey-principles.md
-@/home/you/.claude/ui-design-principles.md
+- **Simple over Easy**: Prefer solutions that are objectively simple (not complected) over ones that are merely familiar or convenient. Ask "am I braiding things together that should be separate?"
+- **Data over Types**: Prefer plain data (maps, arrays) over custom classes when the structure is simple. Don’t create a wrapper when the underlying value carries the meaning.
+- **UI for Humans**: Show system status, speak the user’s language, give control and clear exits, be consistent, prevent errors before they happen. Every element must earn its place on screen.

@@ -7,10 +7,10 @@ argument-hint: "<feature description>" | list | resume <name> | complete <name> 
 
 Build a feature using specialized review agents. Each feature runs in an isolated git worktree with its own dev server port, so multiple features can be developed simultaneously. Follows a push-to-deploy model: merge to the default branch triggers CI/CD deployment.
 
-**Reference files (direct paths on this machine):**
-- `$HICKEY_PRINCIPLES` = `/home/you/.claude/hickey-principles.md`
-- `$UI_PRINCIPLES` = `/home/you/.claude/ui-design-principles.md`
-- Agent prompts are in `/home/you/.claude/agents/`
+**Reference files:**
+- `$HICKEY_PRINCIPLES` = `$HOME/.claude/hickey-principles.md`
+- `$UI_PRINCIPLES` = `$HOME/.claude/ui-design-principles.md`
+- Agent prompts are in `$HOME/.claude/agents/`
 
 ---
 
@@ -349,7 +349,7 @@ Launch an Agent to review the PLAN (not code) against simplicity principles.
 Prompt the agent with:
 > You are a design reviewer focused on simplicity and avoiding complection.
 >
-> First, read the file at `/home/you/.claude/hickey-principles.md` to load your review criteria.
+> First, read the file at `$HOME/.claude/hickey-principles.md` to load your review criteria.
 >
 > Then review this plan:
 >
@@ -496,35 +496,35 @@ if (i !== -1) { f[i].step = 6; f[i].status = 'reviewing'; f[i].updatedAt = new D
 
 Launch review agents **simultaneously** (all in a single message). Launch all 5 if screenshots are available; skip 6b (Visual Review) if no screenshots.
 
-Each agent's full persona and review criteria are defined in its agent file under `/home/you/.claude/agents/`. Read the agent file and use it as the base prompt, then append the context-specific details listed below.
+Each agent's full persona and review criteria are defined in its agent file under `$HOME/.claude/agents/`. Read the agent file and use it as the base prompt, then append the context-specific details listed below.
 
 ### 6a. UI Review Agent
 
-Use the agent defined in `/home/you/.claude/agents/ui-reviewer.md`.
+Use the agent defined in `$HOME/.claude/agents/ui-reviewer.md`.
 
 Append to the prompt:
-- Set `$UI_PRINCIPLES` = `/home/you/.claude/ui-design-principles.md`
+- Set `$UI_PRINCIPLES` = `$HOME/.claude/ui-design-principles.md`
 - Changed files to review (in `$WORKTREE_PATH`): [LIST OF CHANGED FILES WITH FULL WORKTREE PATHS]
 
 ### 6b. Visual Review Agent (skip if no screenshots)
 
-Use the agent defined in `/home/you/.claude/agents/visual-reviewer.md`.
+Use the agent defined in `$HOME/.claude/agents/visual-reviewer.md`.
 
 Append to the prompt:
-- Set `$UI_PRINCIPLES` = `/home/you/.claude/ui-design-principles.md`
+- Set `$UI_PRINCIPLES` = `$HOME/.claude/ui-design-principles.md`
 - Screenshot images from `$SCREENSHOT_DIR`: [LIST OF SCREENSHOT FILE PATHS]
 
 ### 6c. Simplicity Review Agent
 
-Use the agent defined in `/home/you/.claude/agents/simplicity-reviewer.md`.
+Use the agent defined in `$HOME/.claude/agents/simplicity-reviewer.md`.
 
 Append to the prompt:
-- Set `$HICKEY_PRINCIPLES` = `/home/you/.claude/hickey-principles.md`
+- Set `$HICKEY_PRINCIPLES` = `$HOME/.claude/hickey-principles.md`
 - Changed files to review (in `$WORKTREE_PATH`): [LIST OF CHANGED FILES WITH FULL WORKTREE PATHS]
 
 ### 6d. Security Review Agent
 
-Use the agent defined in `/home/you/.claude/agents/security-reviewer.md`.
+Use the agent defined in `$HOME/.claude/agents/security-reviewer.md`.
 
 Append to the prompt:
 - Changed files to review (in `$WORKTREE_PATH`): [LIST OF CHANGED FILES WITH FULL WORKTREE PATHS]
@@ -532,7 +532,7 @@ Append to the prompt:
 
 ### 6e. Functional QA Agent
 
-Use the agent defined in `/home/you/.claude/agents/qa-tester.md`.
+Use the agent defined in `$HOME/.claude/agents/qa-tester.md`.
 
 Append to the prompt:
 - Dev server URL: `http://localhost:$PORT`
