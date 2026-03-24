@@ -30,3 +30,4 @@ settings.local.json
 
 # Git internals
 .git/
+sessions/
