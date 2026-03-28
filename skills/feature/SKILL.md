@@ -1,6 +1,8 @@
 ---
+name: feature
 description: Multi-agent feature pipeline with worktree isolation, parallel reviews, and push-to-deploy
 argument-hint: "<feature description>" | list | resume <name> | complete <name> | abandon <name> | remove <name>
+disable-model-invocation: true
 ---
 
 # /feature — Multi-Agent Feature Pipeline
@@ -8,8 +10,7 @@ argument-hint: "<feature description>" | list | resume <name> | complete <name> 
 Build a feature using specialized review agents. Each feature runs in an isolated git worktree with its own dev server port, so multiple features can be developed simultaneously. Follows a push-to-deploy model: merge to the default branch triggers CI/CD deployment.
 
 **Reference files:**
-- `$HICKEY_PRINCIPLES` = `$HOME/.claude/hickey-principles.md`
-- `$UI_PRINCIPLES` = `$HOME/.claude/ui-design-principles.md`
+- `$HICKEY_PRINCIPLES` and `$UI_PRINCIPLES` are set via settings.json env
 - Agent prompts are in `$HOME/.claude/agents/`
 
 ---

@@ -1,12 +1,130 @@
 {
-  "skipDangerousModePermissionPrompt": true,
   "permissions": {
-    "defaultMode": "auto",
     "allow": [
       "Bash(git *)",
       "Bash(gh *)",
       "Bash(npm run *)",
-      "Bash(npm test *)"
+      "Bash(npm test *)",
+      "Bash(bun *)",
+      "Bash(npx *)",
+      "Bash(node *)",
+      "Bash(ls *)",
+      "Bash(find *)",
+      "Bash(cat *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(wc *)",
+      "Bash(sort *)",
+      "Bash(diff *)",
+      "Bash(mkdir *)",
+      "Bash(which *)",
+      "Bash(echo *)",
+      "Bash(jq *)",
+      "Bash(curl *)",
+      "Bash(grep *)",
+      "Bash(rg *)",
+      "Bash(sed *)",
+      "Bash(awk *)",
+      "Bash(test *)",
+      "Bash(ss *)",
+      "Bash(basename *)",
+      "Bash(dirname *)",
+      "Bash(realpath *)",
+      "Bash(md5sum *)",
+      "Bash(printf *)"
+    ],
+    "defaultMode": "auto"
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash -c 'dir=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; project=\"${dir##*/}\"; branch=$(git -C \"$dir\" symbolic-ref --short HEAD 2>/dev/null); label_file=\"/tmp/.tab-label-$(echo \"$dir\" | md5sum | cut -c1-8)\"; if [ -f \"$label_file\" ]; then label=$(cat \"$label_file\"); else label=\"$branch\"; fi; printf \"\\e]0;%s %s\\a\" \"${label:-$project}\" \"$project\" >&2'"
+          }
+        ]
+      },
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo 'POST-COMPACTION CONTEXT: Enter plan mode for non-trivial tasks. Update tasks/lessons.md after corrections. Verify before marking complete. Simplicity first — no premature abstractions. Check tasks/todo.md for current progress.'"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/on-stop.sh"
+          }
+        ]
+      }
+    ],
+    "PermissionRequest": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/on-permission.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/on-pre-tool.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/on-edit-format.sh"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "matcher": "idle_prompt",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/on-notify.sh"
+          }
+        ]
+      }
     ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "~/.claude/statusline.sh"
+  },
+  "terminalTitleFromRename": false,
+  "effortLevel": "high",
+  "skipDangerousModePermissionPrompt": true,
+  "env": {
+    "HICKEY_PRINCIPLES": "$HOME/.claude/hickey-principles.md",
+    "UI_PRINCIPLES": "$HOME/.claude/ui-design-principles.md"
+  },
+  "attribution": {
+    "commit": "",
+    "pr": "Generated with [Claude Code](https://claude.com/claude-code)"
+  },
+  "worktree": {
+    "symlinkDirectories": ["node_modules", ".next"]
   }
 }

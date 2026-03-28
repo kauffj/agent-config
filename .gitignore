@@ -15,6 +15,7 @@ debug/
 backups/
 telemetry/
 mcp-needs-auth-cache.json
+image-cache/
 
 # Project-specific state (per-repo settings, memory, todos)
 projects/
