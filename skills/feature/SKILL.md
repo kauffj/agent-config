@@ -111,7 +111,7 @@ If found:
    - `$PLAN` = `plan` (if stored)
 4. Load project-level variables from the `.project` key in `features.json`:
    - `$REPO_NAME`, `$DEFAULT_BRANCH`, `$PKG_MGR`, `$INSTALL_CMD`, `$BUILD_CMD`, `$DEV_CMD`, `$STACK_SUMMARY`, `$DEPLOY_MODEL`, `$HAS_SCREENSHOTS`, `$ENV_FILE`
-5. **Jump to the step recorded in `step`** (skip all prior steps). If the step is `4` (implementing), resume at Step 4. If `6` (reviewing), resume at Step 6. Etc.
+5. **Jump to the step recorded in `step`** (skip all prior steps). If the step is `4` (implementing), resume at Step 4. If `6` (reviewing), resume at Step 6. If `8` (manual-review), resume at Step 8. Etc.
 
 ### If `$ARGUMENTS` starts with `complete `:
 
@@ -685,7 +685,7 @@ After the revision agent returns, if `$HAS_SCREENSHOTS` is true and any view-rel
 
 ---
 
-## Step 8: Commit & Push
+## Step 8: Manual Review
 
 **Update tracking:**
 ```bash
@@ -694,7 +694,63 @@ const fs = require('fs');
 const p = '.claude/features.json';
 const d = JSON.parse(fs.readFileSync(p,'utf8'));
 const i = d.features.findIndex(x => x.name === '$FEATURE_NAME');
-if (i !== -1) { d.features[i].step = 8; d.features[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(d, null, 2)); }
+if (i !== -1) { d.features[i].step = 8; d.features[i].status = 'manual-review'; d.features[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(d, null, 2)); }
+"
+```
+
+Ensure the dev server is running in the worktree. If not, start it:
+```bash
+cd $WORKTREE_PATH && PORT=$PORT $DEV_CMD &
+```
+
+Wait for it to be ready (check that `http://localhost:$PORT` responds):
+```bash
+for i in $(seq 1 30); do curl -s -o /dev/null -w "%{http_code}" http://localhost:$PORT && break || sleep 1; done
+```
+
+Present the feature to the user for manual review using `AskUserQuestion`:
+
+> **Ready for manual review!**
+>
+> The dev server is running at **http://localhost:$PORT**
+>
+> **Affected URLs:**
+> [LIST EACH AFFECTED URL AS A FULL CLICKABLE LINK, e.g.:]
+> - http://localhost:$PORT/path/one
+> - http://localhost:$PORT/path/two
+>
+> **What was built:** [ONE-LINE SUMMARY FROM PLAN]
+>
+> **Automated review summary:**
+> - MUST FIX: [count] found, all resolved
+> - SHOULD FIX: [count] found, [count] resolved
+> - CONSIDER: [count] suggestions ([count] addressed, [count] skipped)
+>
+> Please open the links above and review the feature. Reply:
+> - **"approved"** — proceed to commit & push
+> - **Any other feedback** — I'll make changes and present again for review
+
+If the user provides feedback (anything other than "approved"):
+1. Launch an Agent to address the feedback, working in `$WORKTREE_PATH`
+2. After changes are made, run `$BUILD_CMD` to verify the build still passes
+3. Loop back to the top of this step (re-present the URLs and ask again)
+
+Maximum 3 feedback rounds. After 3 rounds, ask the user if they'd like to proceed to commit as-is or continue iterating.
+
+If the user replies "approved", proceed to Step 9.
+
+---
+
+## Step 9: Commit & Push
+
+**Update tracking:**
+```bash
+node -e "
+const fs = require('fs');
+const p = '.claude/features.json';
+const d = JSON.parse(fs.readFileSync(p,'utf8'));
+const i = d.features.findIndex(x => x.name === '$FEATURE_NAME');
+if (i !== -1) { d.features[i].step = 9; d.features[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(d, null, 2)); }
 "
 ```
 
@@ -717,7 +773,7 @@ git push -u origin feature/$FEATURE_NAME
 
 ---
 
-## Step 9: Deploy
+## Step 10: Deploy
 
 **Update tracking:**
 ```bash
@@ -726,7 +782,7 @@ const fs = require('fs');
 const p = '.claude/features.json';
 const d = JSON.parse(fs.readFileSync(p,'utf8'));
 const i = d.features.findIndex(x => x.name === '$FEATURE_NAME');
-if (i !== -1) { d.features[i].step = 9; d.features[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(d, null, 2)); }
+if (i !== -1) { d.features[i].step = 10; d.features[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(d, null, 2)); }
 "
 ```
 
@@ -782,7 +838,7 @@ Note the branch name and move on.
 
 ---
 
-## Step 10: Report
+## Step 11: Report
 
 **Update tracking:**
 ```bash
@@ -791,7 +847,7 @@ const fs = require('fs');
 const p = '.claude/features.json';
 const d = JSON.parse(fs.readFileSync(p,'utf8'));
 const i = d.features.findIndex(x => x.name === '$FEATURE_NAME');
-if (i !== -1) { d.features[i].step = 10; d.features[i].status = 'complete'; d.features[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(d, null, 2)); }
+if (i !== -1) { d.features[i].step = 11; d.features[i].status = 'complete'; d.features[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(d, null, 2)); }
 "
 ```
 
