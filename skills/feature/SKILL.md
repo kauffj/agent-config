@@ -119,7 +119,17 @@ Extract the feature name. Read `.claude/features.json`, find the matching record
 
 If not found, say: "No feature named '<name>' found." **Stop here.**
 
-Update the record:
+Load the default branch from the project profile (`d.project.defaultBranch`).
+
+**Verify the feature branch is merged into the default branch:**
+```bash
+git fetch origin $DEFAULT_BRANCH
+git branch --merged origin/$DEFAULT_BRANCH | grep -q "feature/<NAME>" && echo "MERGED" || echo "NOT_MERGED"
+```
+
+**If NOT_MERGED:** Say: "Feature '<name>' branch `feature/<NAME>` is not yet merged into `$DEFAULT_BRANCH`. Merge or get the PR merged first, then run `/feature complete <name>` again." **Stop here.**
+
+**If MERGED:** Update the record and clean up the worktree:
 ```bash
 node -e "
 const fs = require('fs');
@@ -134,7 +144,14 @@ console.log('Marked', d.features[i].name, 'as complete');
 "
 ```
 
-Say: "Feature '<name>' marked as complete." **Stop here.**
+If the feature has a worktree, clean it up:
+```bash
+if [ -d "<worktreePath>" ]; then
+  git worktree remove "<worktreePath>" --force
+fi
+```
+
+Say: "Feature '<name>' is merged and marked as complete. Worktree cleaned up." **Stop here.**
 
 ### If `$ARGUMENTS` starts with `abandon `:
 
@@ -821,7 +838,7 @@ PREOF
 )"
 ```
 
-Report the PR URL to the user.
+Report the PR URL to the user. Set `$DEPLOY_CHOICE` to `pr`.
 
 **If the user chooses 2 (Merge directly):**
 ```bash
@@ -831,39 +848,56 @@ git merge feature/$FEATURE_NAME --no-ff -m "Merge feature/$FEATURE_NAME"
 git push origin $DEFAULT_BRANCH
 ```
 
-Report that deploy has been triggered via CI/CD.
+Report that deploy has been triggered via CI/CD. Set `$DEPLOY_CHOICE` to `merged`.
 
 **If the user chooses 3 (Skip):**
-Note the branch name and move on.
+Note the branch name and move on. Set `$DEPLOY_CHOICE` to `skipped`.
 
 ---
 
 ## Step 11: Report
 
-**Update tracking:**
+**Update tracking based on whether the branch is merged:**
+
+- If `$DEPLOY_CHOICE` is `merged`: status = `complete` (branch is in default branch)
+- If `$DEPLOY_CHOICE` is `pr`: status = `pr-open` (waiting for PR merge)
+- If `$DEPLOY_CHOICE` is `skipped`: status = `pushed` (branch pushed but not merged)
+
 ```bash
 node -e "
 const fs = require('fs');
 const p = '.claude/features.json';
 const d = JSON.parse(fs.readFileSync(p,'utf8'));
 const i = d.features.findIndex(x => x.name === '$FEATURE_NAME');
-if (i !== -1) { d.features[i].step = 11; d.features[i].status = 'complete'; d.features[i].updatedAt = new Date().toISOString(); fs.writeFileSync(p, JSON.stringify(d, null, 2)); }
+if (i !== -1) {
+  d.features[i].step = 11;
+  d.features[i].status = '$STATUS';
+  d.features[i].updatedAt = new Date().toISOString();
+  fs.writeFileSync(p, JSON.stringify(d, null, 2));
+}
 "
+```
+
+Where `$STATUS` is set from `$DEPLOY_CHOICE` as described above.
+
+If the feature was directly merged (`complete` status), also clean up the worktree:
+```bash
+if [ -d "$WORKTREE_PATH" ]; then
+  git worktree remove "$WORKTREE_PATH" --force
+fi
 ```
 
 Summarize to the user:
 
 1. **What was built** — brief description
 2. **Branch** — the feature branch name
-3. **Worktree** — path to the worktree (`$WORKTREE_PATH`)
-4. **Port** — dev server port used (`$PORT`)
-5. **Files changed** — final list
-6. **Review findings** — how many MUST/SHOULD/CONSIDER items were found and addressed
-7. **Remaining CONSIDER items** — any unaddressed suggestions with reasoning
-8. **Deploy status** — PR created / merged & deploying / skipped
-9. **URLs to test** — where the user can see the changes (using `localhost:$PORT`)
-10. **Next steps** — Ask the user if they'd like to:
-    - Continue working on the branch (worktree stays at `$WORKTREE_PATH`)
-    - Clean up: remove worktree and switch back to `$DEFAULT_BRANCH` (`git worktree remove $WORKTREE_PATH`)
+3. **Files changed** — final list
+4. **Review findings** — how many MUST/SHOULD/CONSIDER items were found and addressed
+5. **Remaining CONSIDER items** — any unaddressed suggestions with reasoning
+6. **Deploy status** — PR created / merged & deploying / skipped
+7. **Next steps** — based on deploy choice:
+    - If **merged**: "Feature is complete and deployed. Worktree cleaned up."
+    - If **PR created**: "Feature is waiting for PR merge. Run `/feature complete $FEATURE_NAME` after the PR is merged to finalize."
+    - If **skipped**: "Branch `feature/$FEATURE_NAME` is pushed but not merged. Run `/feature complete $FEATURE_NAME` after merging to finalize."
 
 Done!
