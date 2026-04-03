@@ -545,11 +545,21 @@ Prompt the agent with:
 >
 > **Output:**
 > 1. **Changed files** — list of all files created or modified (paths relative to worktree root)
-> 2. **Affected URLs** — all routes that were added or changed (full paths like http://localhost:$PORT/path)
+> 2. **Affected URLs** — every route whose UI changed, as full clickable URLs (e.g. `http://localhost:$PORT/events`, `http://localhost:$PORT/events/123`). Include both new routes AND existing routes whose rendered output changed. For dynamic routes (e.g. `/events/[id]`), substitute a real ID from the dev database so the URL is directly visitable. If a route requires specific state (e.g. logged-in user, specific role), note that next to the URL.
 > 3. **Decisions made** — anything you chose during implementation that wasn't specified in the plan (and why)
 > 4. **Verification results** — confirm build passed, URLs load, and acceptance criteria met
 
 Save the list of changed files and affected URLs.
+
+**Print the affected URLs to the user immediately after implementation completes:**
+
+> **Implementation complete.** Affected URLs (visit these to see what changed):
+> [LIST EVERY AFFECTED URL AS A FULL LINK, one per line, e.g.:]
+> - http://localhost:$PORT/events
+> - http://localhost:$PORT/events/123
+> - http://localhost:$PORT/settings/notifications _(requires admin login)_
+>
+> If more than 20 URLs are affected, group them by route pattern and list representative examples for each group.
 
 ---
 
@@ -731,10 +741,13 @@ Present the feature to the user for manual review using `AskUserQuestion`:
 >
 > The dev server is running at **http://localhost:$PORT**
 >
-> **Affected URLs:**
-> [LIST EACH AFFECTED URL AS A FULL CLICKABLE LINK, e.g.:]
-> - http://localhost:$PORT/path/one
-> - http://localhost:$PORT/path/two
+> **Pages to review** (every UI that changed):
+> [LIST EVERY AFFECTED URL as a full clickable link. Include both new and modified routes. For dynamic routes, use real IDs from the dev database. Note any auth/role requirements inline.]
+> - http://localhost:$PORT/events
+> - http://localhost:$PORT/events/123
+> - http://localhost:$PORT/settings/notifications _(requires admin)_
+>
+> If more than 20 URLs, group by route pattern with representative examples.
 >
 > **What was built:** [ONE-LINE SUMMARY FROM PLAN]
 >
