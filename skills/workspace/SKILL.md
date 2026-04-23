@@ -59,9 +59,9 @@ If `$ARGUMENTS` is empty, run **List**.
 
 ---
 
-## Create — `/workspace new <description> [--kind feature|bug|refactor|spike] [--from <branch>]`
+## Create — `/workspace new <description> [--kind feature|bug|refactor|spike] [--name <slug>] [--from <branch>]`
 
-Parse `--kind` (default `feature`) and `--from` (default: repo's default branch).
+Parse `--kind` (default `feature`), `--name` (default: derive from description), and `--from` (default: repo's default branch).
 
 1. **Ensure clean working tree.** If uncommitted changes exist, stop and ask the user how to proceed.
 
@@ -71,7 +71,7 @@ Parse `--kind` (default `feature`) and `--from` (default: repo's default branch)
    ```
    Parse the returned JSON to get `$REPO_NAME`, `$DEFAULT_BRANCH`, `$INSTALL_CMD`, `$ENV_FILE`, etc.
 
-3. **Derive names.** Pick a short kebab-case name for the workspace from the description (under ~40 chars). `$NAME` = that kebab. Branch prefix follows `--kind`:
+3. **Derive name.** If `--name <slug>` was passed, use it verbatim. Otherwise pick a short kebab-case name from the description (under ~40 chars). `$NAME` = that kebab. Branch prefix follows `--kind`:
    - `feature` → `feature/$NAME`
    - `bug` → `fix/$NAME`
    - `refactor` → `refactor/$NAME`
@@ -109,17 +109,7 @@ Parse `--kind` (default `feature`) and `--from` (default: repo's default branch)
      '{name:$n, kind:$k, description:$d, branch:$b, worktreePath:$w, port:$p, envFile:$e, screenshotDir:$s, status:"active"}')"
    ```
 
-9. **Print a machine-parseable block** so callers can consume the result:
-   ```
-   WORKSPACE_CREATED
-   name=<NAME>
-   kind=<KIND>
-   branch=<BRANCH>
-   worktreePath=<WORKTREE_PATH>
-   port=<PORT>
-   screenshotDir=<SCREENSHOT_DIR>
-   envFile=<ENV_FILE>
-   ```
+9. **Report.** Tell the user the workspace name, worktree path, and port. Callers that need to consume the record programmatically should read it back with `node $HOME/.claude/lib/workspace.mjs get <NAME>` — that's the source of truth.
 
 ---
 
@@ -174,7 +164,7 @@ Returns non-zero if not found.
      ```
    - Branch gone → say: "Both worktree and branch are gone for '<name>'. Consider `/workspace remove <name>`." **Stop.**
 
-4. Print the `WORKSPACE_RESUMED` block (same shape as `WORKSPACE_CREATED`) so callers can pick up variables.
+4. Tell the user the workspace is ready. Callers read the record back with `node $HOME/.claude/lib/workspace.mjs get <NAME>`.
 
 ---
 

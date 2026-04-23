@@ -117,25 +117,17 @@ If the user provides feedback, incorporate it and re-run from Step 1 (or just ad
 
 ## Output
 
-On approval, save the plan for resume / downstream use:
+On approval, save the plan to a well-known path. The slug is the workspace name if `--workspace <name>` was passed; otherwise derive a kebab-case slug from the description.
 
 ```bash
 mkdir -p .claude/plans
 echo "$PLAN" > .claude/plans/<slug>.md
 ```
 
-If `--workspace <name>` was provided, also store the plan in the workspace record's `pipeline`:
+If `--workspace <name>` was provided, also record the plan path in the workspace record's `pipeline` so downstream skills can find it:
 
 ```bash
-node $HOME/.claude/lib/workspace.mjs update <NAME> "$(jq -n --arg p "$PLAN" '{pipeline: {plan: $p}}')"
+node $HOME/.claude/lib/workspace.mjs update <NAME> "$(jq -n --arg p ".claude/plans/<slug>.md" '{pipeline: {planPath: $p}}')"
 ```
 
-Print a machine-parseable block so callers can consume the result:
-
-```
-PROPOSAL_APPROVED
-planPath=.claude/plans/<slug>.md
-workspace=<NAME or empty>
-```
-
-Also print the plan itself so the user sees the final version.
+Print the plan to the user so they see the final version. Callers know where the file is: `.claude/plans/<slug>.md` (or, if they have a workspace name, read `pipeline.planPath` from the workspace record).

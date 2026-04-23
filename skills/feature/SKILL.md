@@ -56,9 +56,10 @@ If empty: "No features tracked. Use `/feature \"description\"` to start one." **
    ```
    Invoke /workspace resume <NAME>
    ```
-3. Set variables from the record: `$WORKTREE_PATH`, `$PORT`, `$SCREENSHOT_DIR`, `$BRANCH`, `$NAME`, `$PLAN` (from `pipeline.plan`).
-4. Load project profile via `node $HOME/.claude/lib/project.mjs load`.
-5. **Jump to the step recorded in `pipeline.step`** — if 4, resume at Step 4; if 6, resume at Step 6; etc.
+3. Set variables from the record: `$WORKTREE_PATH`, `$PORT`, `$SCREENSHOT_DIR`, `$BRANCH`, `$NAME`.
+4. **Load the plan.** Prefer `pipeline.planPath` (new format) and `cat` the file. Fall back to `pipeline.plan` (legacy: plan was stored inline). Set `$PLAN`.
+5. Load project profile via `node $HOME/.claude/lib/project.mjs load`.
+6. **Jump to the step recorded in `pipeline.step`** — if 4, resume at Step 4; if 6, resume at Step 6; etc.
 
 ### Complete
 
@@ -88,21 +89,19 @@ Delegate to `/workspace remove <NAME>`. **Stop.**
 
 ## Step 0: Create workspace
 
-Invoke `/workspace new "$ARGUMENTS" --kind feature` and read the `WORKSPACE_CREATED` block. Set variables from it:
+1. **Derive a slug** from `$ARGUMENTS` — short kebab-case, under ~40 chars. Set `$NAME` to this slug.
+2. **Invoke** `/workspace new "$ARGUMENTS" --kind feature --name $NAME`. (Passing `--name` explicitly means you already know what the workspace will be called.)
+3. **Read the record** back — this is the source of truth:
+   ```bash
+   node $HOME/.claude/lib/workspace.mjs get $NAME
+   ```
+   Parse the JSON to get `$BRANCH`, `$WORKTREE_PATH`, `$PORT`, `$SCREENSHOT_DIR`, `$ENV_FILE`.
 
-- `$NAME`
-- `$BRANCH`
-- `$WORKTREE_PATH`
-- `$PORT`
-- `$SCREENSHOT_DIR`
-
-Also load the project profile:
-
-```bash
-node $HOME/.claude/lib/project.mjs load
-```
-
-Extract `$BUILD_CMD`, `$DEV_CMD`, `$INSTALL_CMD`, `$STACK`, `$DEPLOY_MODEL`, `$HAS_SCREENSHOTS`, `$DEFAULT_BRANCH`.
+4. **Load the project profile:**
+   ```bash
+   node $HOME/.claude/lib/project.mjs load
+   ```
+   Extract `$BUILD_CMD`, `$DEV_CMD`, `$INSTALL_CMD`, `$STACK`, `$DEPLOY_MODEL`, `$HAS_SCREENSHOTS`, `$DEFAULT_BRANCH`.
 
 Update pipeline progress:
 
@@ -114,9 +113,19 @@ node $HOME/.claude/lib/workspace.mjs update $NAME '{"pipeline":{"skill":"feature
 
 ## Step 1: Propose
 
-Invoke `/propose "$ARGUMENTS" --workspace $NAME`. Read the `PROPOSAL_APPROVED` block and capture `$PLAN_PATH`. Load `$PLAN` from that file.
+Invoke `/propose "$ARGUMENTS" --workspace $NAME`. When it returns, the approved plan is at `.claude/plans/$NAME.md` and the path is recorded in `pipeline.planPath` on the workspace record.
 
-The `/propose` skill already stored the plan in the workspace's `pipeline.plan`. Update step:
+Read the plan:
+
+```bash
+cat .claude/plans/$NAME.md
+```
+
+(Or, equivalently, read `pipeline.planPath` from the workspace record and `cat` that.)
+
+Capture the contents as `$PLAN`.
+
+Update step:
 
 ```bash
 node $HOME/.claude/lib/workspace.mjs update $NAME '{"pipeline":{"step":1}}'
