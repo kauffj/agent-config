@@ -1,8 +1,7 @@
 ---
 name: propose
-description: Produce an approved implementation proposal — plan, simplicity-review the plan, checkpoint with user. Returns a plan ready to implement.
+description: Produce an approved implementation proposal — plan, simplicity-review the plan, checkpoint with user. Use before non-trivial implementation work (architectural decisions, multi-file changes, features) when alignment is wanted before writing code. Returns a plan ready to implement.
 argument-hint: "<description of what to build> [--workspace <name>]"
-disable-model-invocation: true
 ---
 
 # /propose — align before you build
