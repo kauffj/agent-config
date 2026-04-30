@@ -2,7 +2,6 @@
 name: review-ui
 description: Review changed frontend code against UI design principles (Nielsen heuristics + Atomic Design)
 argument-hint: "[base-branch]"
-disable-model-invocation: true
 ---
 
 # Review UI Changes

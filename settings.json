@@ -1,39 +1,69 @@
 {
+  "env": {
+    "HICKEY_PRINCIPLES": "$HOME/.claude/hickey-principles.md",
+    "UI_PRINCIPLES": "$HOME/.claude/ui-design-principles.md",
+    "TEAM_OPS_REPO": "/home/you/projects/team-ops"
+  },
+  "attribution": {
+    "commit": "",
+    "pr": "Generated with [Claude Code](https://claude.com/claude-code)"
+  },
   "permissions": {
     "allow": [
-      "Bash(git *)",
+      "AskUserQuestion",
+      "Bash(*)",
+      "Bash(awk *)",
+      "Bash(basename *)",
+      "Bash(bun *)",
+      "Bash(cat *)",
+      "Bash(cd *)",
+      "Bash(chmod *)",
+      "Bash(cp *)",
+      "Bash(curl *)",
+      "Bash(diff *)",
+      "Bash(dirname *)",
+      "Bash(echo *)",
+      "Bash(find *)",
       "Bash(gh *)",
+      "Bash(git *)",
+      "Bash(grep *)",
+      "Bash(head *)",
+      "Bash(jq *)",
+      "Bash(ln *)",
+      "Bash(ls *)",
+      "Bash(md5sum *)",
+      "Bash(mkdir *)",
+      "Bash(mv *)",
+      "Bash(node *)",
       "Bash(npm run *)",
       "Bash(npm test *)",
-      "Bash(bun *)",
       "Bash(npx *)",
-      "Bash(node *)",
-      "Bash(ls *)",
-      "Bash(find *)",
-      "Bash(cat *)",
-      "Bash(head *)",
-      "Bash(tail *)",
-      "Bash(wc *)",
-      "Bash(sort *)",
-      "Bash(diff *)",
-      "Bash(mkdir *)",
-      "Bash(which *)",
-      "Bash(echo *)",
-      "Bash(jq *)",
-      "Bash(curl *)",
-      "Bash(grep *)",
+      "Bash(pipx *)",
+      "Bash(ops *)",
+      "Bash(ops-cli *)",
+      "Bash(printf *)",
+      "Bash(python *)",
+      "Bash(python3 *)",
+      "Bash(realpath *)",
       "Bash(rg *)",
       "Bash(sed *)",
-      "Bash(awk *)",
-      "Bash(test *)",
+      "Bash(sort *)",
       "Bash(ss *)",
-      "Bash(basename *)",
-      "Bash(dirname *)",
-      "Bash(realpath *)",
-      "Bash(md5sum *)",
-      "Bash(printf *)"
+      "Bash(tail *)",
+      "Bash(test *)",
+      "Bash(touch *)",
+      "Bash(wc *)",
+      "Bash(which *)",
+      "Edit",
+      "Glob",
+      "Grep",
+      "Read",
+      "Skill",
+      "WebFetch",
+      "WebSearch",
+      "Write"
     ],
-    "defaultMode": "auto"
+    "defaultMode": "dontAsk"
   },
   "hooks": {
     "SessionStart": [
@@ -109,22 +139,17 @@
       }
     ]
   },
+  "worktree": {
+    "symlinkDirectories": [
+      "node_modules",
+      ".next"
+    ]
+  },
   "statusLine": {
     "type": "command",
     "command": "~/.claude/statusline.sh"
   },
-  "terminalTitleFromRename": false,
+  "terminalTitleFromRename": true,
   "effortLevel": "high",
-  "skipDangerousModePermissionPrompt": true,
-  "env": {
-    "HICKEY_PRINCIPLES": "$HOME/.claude/hickey-principles.md",
-    "UI_PRINCIPLES": "$HOME/.claude/ui-design-principles.md"
-  },
-  "attribution": {
-    "commit": "",
-    "pr": "Generated with [Claude Code](https://claude.com/claude-code)"
-  },
-  "worktree": {
-    "symlinkDirectories": ["node_modules", ".next"]
-  }
+  "skipDangerousModePermissionPrompt": true
 }

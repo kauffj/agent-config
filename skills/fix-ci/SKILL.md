@@ -2,7 +2,6 @@
 name: fix-ci
 description: Diagnose and fix failing CI checks on the current branch
 argument-hint: "[PR number]"
-disable-model-invocation: true
 ---
 
 # Fix Failing CI

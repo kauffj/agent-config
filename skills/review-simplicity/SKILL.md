@@ -2,7 +2,6 @@
 name: review-simplicity
 description: Review changed code for unnecessary complexity, complection, premature abstraction, and incidental complexity
 argument-hint: "[base-branch]"
-disable-model-invocation: true
 ---
 
 # Review Simplicity

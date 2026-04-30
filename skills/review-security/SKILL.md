@@ -2,7 +2,6 @@
 name: review-security
 description: Review changed code for authorization gaps, input validation failures, data exposure, and injection vulnerabilities
 argument-hint: "[base-branch]"
-disable-model-invocation: true
 ---
 
 # Review Security

@@ -9,7 +9,7 @@ case "$TOOL" in
         CMD=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 
         # Block destructive patterns
-        if echo "$CMD" | grep -qE '(rm\s+-rf\s+/|rm\s+-rf\s+\.|--force\s+push|push\s+--force|reset\s+--hard|DROP\s+(TABLE|DATABASE)|TRUNCATE\s|:()\s*\{|fork\s*\()'; then
+        if echo "$CMD" | grep -qE '(rm\s+-rf\s+/|rm\s+-rf\s+\.|--force(\s|$)\s*push|push\s+--force(\s|$)|reset\s+--hard|DROP\s+(TABLE|DATABASE)|TRUNCATE\s|:\(\)\s*\{|fork\s*\()'; then
             echo "Blocked: destructive command pattern detected" >&2
             exit 2
         fi
