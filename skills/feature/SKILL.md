@@ -113,12 +113,12 @@ node $HOME/.claude/lib/workspace.mjs update $NAME '{"pipeline":{"skill":"feature
 
 ## Step 1: Propose
 
-Invoke `/propose "$ARGUMENTS" --workspace $NAME`. When it returns, the approved plan is at `.claude/plans/$NAME.md` and the path is recorded in `pipeline.planPath` on the workspace record.
+Invoke `/propose "$ARGUMENTS" --workspace $NAME`. When it returns, the approved plan is at `.workspaces/plans/$NAME.md` and the path is recorded in `pipeline.planPath` on the workspace record.
 
 Read the plan:
 
 ```bash
-cat .claude/plans/$NAME.md
+cat .workspaces/plans/$NAME.md
 ```
 
 (Or, equivalently, read `pipeline.planPath` from the workspace record and `cat` that.)

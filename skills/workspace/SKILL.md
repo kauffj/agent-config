@@ -10,8 +10,11 @@ disable-model-invocation: true
 Owns the lifecycle of isolated working environments. Each workspace = git worktree + dev-server port + state record. Callers like `/feature`, `/propose`, and `/review-pr` use these primitives; they don't reimplement them.
 
 **State files** (relative to repo root):
-- `.claude/workspaces.json` — `{ workspaces: [...] }`
-- `.claude/project.json` — cached project profile (see `lib/project.mjs`)
+- `.workspaces/workspaces.json` — `{ workspaces: [...] }`
+- `.workspaces/project.json` — cached project profile (see `lib/project.mjs`)
+- `.workspaces/plans/<slug>.md` — saved plans from `/propose`
+
+On first run after upgrading, the helpers auto-relocate any legacy state from `.claude/` to `.workspaces/`. Old `.claude/features.json` (legacy format) is also transformed.
 
 **Helper:** `$HOME/.claude/lib/workspace.mjs` — all state reads/writes go through this. Do not inline `node -e` state mutations in other skills.
 
