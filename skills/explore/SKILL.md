@@ -4,7 +4,6 @@ description: Deep codebase research in isolated context — investigate a questi
 argument-hint: "<question about the codebase>"
 context: fork
 agent: Explore
-model: sonnet
 ---
 
 # Deep Codebase Exploration
