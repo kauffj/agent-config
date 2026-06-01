@@ -95,15 +95,17 @@ Parse `--kind` (default `feature`), `--name` (default: derive from description),
 
 6. **Copy env file and rewrite URLs** (if `$ENV_FILE` is set):
    ```bash
-   cp $ENV_FILE $WORKTREE_PATH/$ENV_FILE
-   sed -i "s|^APP_URL=.*|APP_URL=http://localhost:$PORT|" $WORKTREE_PATH/$ENV_FILE
-   sed -i "s|^BASE_URL=.*|BASE_URL=http://localhost:$PORT|" $WORKTREE_PATH/$ENV_FILE
-   sed -i "s|^NEXTAUTH_URL=.*|NEXTAUTH_URL=http://localhost:$PORT|" $WORKTREE_PATH/$ENV_FILE
+   : "${WORKTREE_PATH:?set WORKTREE_PATH before copying env}" "${ENV_FILE:?ENV_FILE is empty}"
+   cp "$ENV_FILE" "$WORKTREE_PATH/$ENV_FILE"
+   sed -i "s|^APP_URL=.*|APP_URL=http://localhost:$PORT|" "$WORKTREE_PATH/$ENV_FILE"
+   sed -i "s|^BASE_URL=.*|BASE_URL=http://localhost:$PORT|" "$WORKTREE_PATH/$ENV_FILE"
+   sed -i "s|^NEXTAUTH_URL=.*|NEXTAUTH_URL=http://localhost:$PORT|" "$WORKTREE_PATH/$ENV_FILE"
    ```
 
 7. **Install deps** in the worktree:
    ```bash
-   cd $WORKTREE_PATH && $INSTALL_CMD
+   : "${WORKTREE_PATH:?set WORKTREE_PATH before installing}"
+   cd "$WORKTREE_PATH" && $INSTALL_CMD
    ```
 
 8. **Record** the workspace:

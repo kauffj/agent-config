@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# git pre-commit hook — block commits that introduce broken config references.
+#
+# Canonical (version-controlled) source: hooks/pre-commit
+# Install once with:
+#   ln -sf ../../hooks/pre-commit "$(git rev-parse --git-dir)/hooks/pre-commit"
+#
+# Runs the integrity checker; exit 1 (broken file refs / settings paths /
+# symlink) aborts the commit. Warnings alone (machine-specific paths) pass.
+exec node "$(git rev-parse --show-toplevel)/lib/doctor.mjs"

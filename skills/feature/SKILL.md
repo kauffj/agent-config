@@ -188,7 +188,8 @@ Skip this step if `$HAS_SCREENSHOTS` is false.
 Ensure the dev server is running:
 
 ```bash
-cd $WORKTREE_PATH && PORT=$PORT $DEV_CMD &
+: "${WORKTREE_PATH:?set WORKTREE_PATH first}" "${PORT:?PORT is empty}"
+cd "$WORKTREE_PATH" && PORT=$PORT $DEV_CMD &
 for i in $(seq 1 30); do curl -s -o /dev/null -w "%{http_code}" http://localhost:$PORT && break || sleep 1; done
 ```
 
@@ -294,7 +295,8 @@ node $HOME/.claude/lib/workspace.mjs update $NAME '{"pipeline":{"step":7}}'
 ```
 
 ```bash
-cd $WORKTREE_PATH
+: "${WORKTREE_PATH:?set WORKTREE_PATH first}" "${BRANCH:?BRANCH is empty}"
+cd "$WORKTREE_PATH"
 git add <specific files...>
 git commit -m "$(cat <<'EOF'
 feat: <short description>
@@ -326,7 +328,8 @@ Ask the user via `AskUserQuestion`:
 
 **Option 1 (PR):**
 ```bash
-cd $WORKTREE_PATH
+: "${WORKTREE_PATH:?set WORKTREE_PATH first}"
+cd "$WORKTREE_PATH"
 gh pr create --title "feat: <short>" --body "$(cat <<'EOF'
 ## Summary
 <bullets from plan>
@@ -345,7 +348,8 @@ Set `$DEPLOY_CHOICE=pr`.
 
 **Option 2 (merge):**
 ```bash
-cd $WORKTREE_PATH
+: "${WORKTREE_PATH:?set WORKTREE_PATH first}" "${BRANCH:?BRANCH is empty}" "${DEFAULT_BRANCH:?DEFAULT_BRANCH is empty}"
+cd "$WORKTREE_PATH"
 git checkout $DEFAULT_BRANCH
 git merge $BRANCH --no-ff -m "Merge $BRANCH"
 git push origin $DEFAULT_BRANCH

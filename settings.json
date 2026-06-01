@@ -72,6 +72,10 @@
           {
             "type": "command",
             "command": "bash -c 'dir=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; project=\"${dir##*/}\"; branch=$(git -C \"$dir\" symbolic-ref --short HEAD 2>/dev/null); label_file=\"/tmp/.tab-label-$(echo \"$dir\" | md5sum | cut -c1-8)\"; if [ -f \"$label_file\" ]; then label=$(cat \"$label_file\"); else label=\"$branch\"; fi; printf \"\\e]0;%s %s\\a\" \"${label:-$project}\" \"$project\" >&2'"
+          },
+          {
+            "type": "command",
+            "command": "node \"$HOME/.claude/lib/doctor.mjs\" || true"
           }
         ]
       },
