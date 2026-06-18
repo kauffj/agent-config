@@ -65,6 +65,10 @@
     ],
     "defaultMode": "dontAsk"
   },
+  "model": "opus",
+  "enabledMcpjsonServers": [
+    "team"
+  ],
   "hooks": {
     "SessionStart": [
       {
