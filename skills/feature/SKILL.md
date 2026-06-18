@@ -90,7 +90,7 @@ Delegate to `/workspace remove <NAME>`. **Stop.**
 ## Step 0: Create workspace
 
 1. **Derive a slug** from `$ARGUMENTS` — short kebab-case, under ~40 chars. Set `$NAME` to this slug.
-2. **Invoke** `/workspace new "$ARGUMENTS" --kind feature --name $NAME`. (Passing `--name` explicitly means you already know what the workspace will be called.)
+2. **Invoke** `/workspace new "$ARGUMENTS" --kind feature --name $NAME`. (Passing `--name` explicitly means you already know what the workspace will be called.) `/workspace` provisions an isolated per-workspace database when the project supports it; if the user asked to share the dev DB, append `--db shared`. The feature's DB is dropped automatically when you later `complete`/`abandon` it (those delegate to `/workspace`).
 3. **Read the record** back — this is the source of truth:
    ```bash
    node $HOME/.claude/lib/workspace.mjs get $NAME

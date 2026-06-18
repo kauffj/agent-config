@@ -30,6 +30,9 @@ On first run after upgrading, the helpers auto-relocate any legacy state from `.
   "envFile": ".env.local",
   "screenshotDir": "/tmp/...",
   "status": "active|done|abandoned",
+  "dbName": "myapp_dev_ws_member_event_rsvp",
+  "dbIsolation": "template|none",
+  "dbAdminUrl": "postgresql://user:pass@localhost:5432/postgres",
   "pipeline": { "skill": "feature", "step": 4, "plan": "..." },
   "createdAt": "...",
   "updatedAt": "..."
@@ -37,6 +40,8 @@ On first run after upgrading, the helpers auto-relocate any legacy state from `.
 ```
 
 Status is one of three: `active`, `done`, `abandoned`. The `pipeline` sub-object is caller-owned (e.g. `/feature` stores its step and approved plan there). `/workspace` doesn't interpret it.
+
+The `db*` fields track an isolated per-workspace database (see Create Step 6 and the shared **Clean up workspace resources** teardown). `dbName` is null when no DB was provisioned (`dbIsolation: "none"`, or `--db shared`). `dbAdminUrl` is the maintenance connection (the `postgres` DB) used to drop the workspace DB at teardown, derived once at create time so teardown never re-parses the env.
 
 ---
 
@@ -62,9 +67,9 @@ If `$ARGUMENTS` is empty, run **List**.
 
 ---
 
-## Create — `/workspace new <description> [--kind feature|bug|refactor|spike] [--name <slug>] [--from <branch>]`
+## Create — `/workspace new <description> [--kind feature|bug|refactor|spike] [--name <slug>] [--from <branch>] [--db shared]`
 
-Parse `--kind` (default `feature`), `--name` (default: derive from description), and `--from` (default: repo's default branch).
+Parse `--kind` (default `feature`), `--name` (default: derive from description), `--from` (default: repo's default branch), and `--db` (default `isolated`; pass `--db shared` to skip per-workspace DB provisioning and keep the shared dev DB).
 
 1. **Ensure clean working tree.** If uncommitted changes exist, stop and ask the user how to proceed.
 
@@ -72,7 +77,7 @@ Parse `--kind` (default `feature`), `--name` (default: derive from description),
    ```bash
    node $HOME/.claude/lib/project.mjs load
    ```
-   Parse the returned JSON to get `$REPO_NAME`, `$DEFAULT_BRANCH`, `$INSTALL_CMD`, `$ENV_FILE`, etc.
+   Parse the returned JSON to get `$REPO_NAME`, `$DEFAULT_BRANCH`, `$INSTALL_CMD`, `$ENV_FILE`, and the DB fields `$DB_ISOLATION` (`dbIsolation`), `$DB_TEMPLATE` (`dbTemplate`), and `$DB_URL_VARS` (`dbUrlVars`, space-joined), etc.
 
 3. **Derive name.** If `--name <slug>` was passed, use it verbatim. Otherwise pick a short kebab-case name from the description (under ~40 chars). `$NAME` = that kebab. Branch prefix follows `--kind`:
    - `feature` → `feature/$NAME`
@@ -102,16 +107,43 @@ Parse `--kind` (default `feature`), `--name` (default: derive from description),
    sed -i "s|^NEXTAUTH_URL=.*|NEXTAUTH_URL=http://localhost:$PORT|" "$WORKTREE_PATH/$ENV_FILE"
    ```
 
+   **Isolated database.** Resolve the mode once: use `$DB_ISOLATION` from the profile, but if `--db shared` was passed (or `$DB_ISOLATION` is `none`, or `$ENV_FILE` is empty), set `DB_NAME=""` and skip the rest of this step — the worktree keeps the shared `DATABASE_URL` and the record's `dbName`/`dbAdminUrl` stay null.
+
+   Otherwise (`$DB_ISOLATION` is `template`), clone the dev DB into a per-workspace database and repoint the env at it:
+   ```bash
+   : "${DB_TEMPLATE:?dbTemplate is empty}" "${DB_URL_VARS:?dbUrlVars is empty}"
+   # Per-workspace DB name: <template>_ws_<name>, sanitized + truncated to 63 chars.
+   DB_NAME=$(printf '%s_ws_%s' "$DB_TEMPLATE" "$NAME" | tr -c 'a-zA-Z0-9_' '_' | cut -c1-63)
+   # Admin URL = primary DB URL with the path swapped to the `postgres` maintenance DB.
+   PRIMARY_URL=$(grep -E "^\s*DATABASE_URL\s*=" "$ENV_FILE" | head -1 | sed -E 's/^[^=]*=\s*//; s/^["'"'"']//; s/["'"'"']$//')
+   DB_ADMIN_URL=$(node -e 'const u=new URL(process.argv[1]); u.pathname="/postgres"; console.log(u.href)' "$PRIMARY_URL")
+   ```
+
+   Provision the clone. If it fails (no `psql`, no `CREATEDB` privilege, or active connections to the template), **do not abort** — warn, fall back to the shared DB, and clear `DB_NAME`:
+   ```bash
+   if psql "$DB_ADMIN_URL" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$DB_NAME\" TEMPLATE \"$DB_TEMPLATE\""; then
+     node $HOME/.claude/lib/workspace.mjs rewrite-env-db "$WORKTREE_PATH/$ENV_FILE" "$DB_NAME" $DB_URL_VARS
+   else
+     echo "WARN: DB provisioning failed — worktree will use the shared dev DB ($DB_TEMPLATE)."
+     DB_NAME=""
+   fi
+   ```
+   (If `psql` reports the template has active connections, the dev server is likely running on `$DB_TEMPLATE`. Stop it and retry, or proceed with `--db shared`.)
+
 7. **Install deps** in the worktree:
    ```bash
    : "${WORKTREE_PATH:?set WORKTREE_PATH before installing}"
    cd "$WORKTREE_PATH" && $INSTALL_CMD
    ```
 
-8. **Record** the workspace:
+8. **Record** the workspace. When a DB was provisioned, include `dbName`/`dbIsolation`/`dbAdminUrl`; otherwise leave them null:
    ```bash
    node $HOME/.claude/lib/workspace.mjs create "$(jq -n --arg n "$NAME" --arg k "$KIND" --arg d "$DESCRIPTION" --arg b "$BRANCH" --arg w "$WORKTREE_PATH" --argjson p $PORT --arg e "$ENV_FILE" --arg s "/tmp/${REPO_NAME}-screenshots-${NAME}" \
-     '{name:$n, kind:$k, description:$d, branch:$b, worktreePath:$w, port:$p, envFile:$e, screenshotDir:$s, status:"active"}')"
+     --arg db "$DB_NAME" --arg dba "$DB_ADMIN_URL" \
+     '{name:$n, kind:$k, description:$d, branch:$b, worktreePath:$w, port:$p, envFile:$e, screenshotDir:$s, status:"active",
+       dbName:(if $db=="" then null else $db end),
+       dbIsolation:(if $db=="" then "none" else "template" end),
+       dbAdminUrl:(if $db=="" then null else $dba end)}')"
    ```
 
 9. **Report.** Tell the user the workspace name, worktree path, and port. Callers that need to consume the record programmatically should read it back with `node $HOME/.claude/lib/workspace.mjs get <NAME>` — that's the source of truth.
@@ -171,27 +203,48 @@ Returns non-zero if not found.
 
 4. Tell the user the workspace is ready. Callers read the record back with `node $HOME/.claude/lib/workspace.mjs get <NAME>`.
 
+   **Do not provision a database on resume.** The workspace's `dbName` already exists from Create and the recreated worktree's env (checked out from the branch) still carries the rewritten DB URL — never re-run `CREATE DATABASE`. If the worktree env somehow lacks the rewrite, re-apply it against the existing `dbName` only: `node $HOME/.claude/lib/workspace.mjs rewrite-env-db "<worktreePath>/<envFile>" "<dbName>" $DB_URL_VARS`.
+
 ---
 
-## Abandon — `/workspace abandon <name>`
+## Clean up workspace resources
 
-1. Remove worktree if it exists:
+Shared teardown used by **Abandon**, **Remove**, and **Done**. Idempotent — safe to run more than once.
+
+1. **Drop the isolated database** if the record has one. Read `dbName`/`dbAdminUrl` from the record (do not re-parse any env file — teardown is a pure function of the stored record):
+   ```bash
+   REC=$(node $HOME/.claude/lib/workspace.mjs get <NAME>)
+   DB_NAME=$(echo "$REC" | jq -r '.dbName // empty')
+   DB_ADMIN_URL=$(echo "$REC" | jq -r '.dbAdminUrl // empty')
+   if [ -n "$DB_NAME" ] && [ -n "$DB_ADMIN_URL" ]; then
+     psql "$DB_ADMIN_URL" -c "DROP DATABASE IF EXISTS \"$DB_NAME\" WITH (FORCE);" \
+       || echo "WARN: could not drop database $DB_NAME — drop it manually if it lingers."
+   fi
+   ```
+   (`WITH (FORCE)` terminates the worktree dev server's lingering connections; requires PostgreSQL 13+.)
+
+2. **Remove the worktree** if it exists:
    ```bash
    git worktree remove "<worktreePath>" --force
    ```
 
+---
+
+## Abandon — `/workspace abandon <name>`
+
+1. Run **Clean up workspace resources** for `<name>`.
 2. Update status:
    ```bash
    node $HOME/.claude/lib/workspace.mjs update <NAME> '{"status":"abandoned","worktreePath":null}'
    ```
 
-Say: "Workspace '<name>' abandoned and worktree cleaned up."
+Say: "Workspace '<name>' abandoned, database and worktree cleaned up."
 
 ---
 
 ## Remove — `/workspace remove <name>`
 
-1. Remove worktree if it exists (same as abandon step 1).
+1. Run **Clean up workspace resources** for `<name>`.
 2. Delete the record:
    ```bash
    node $HOME/.claude/lib/workspace.mjs remove <NAME>
@@ -205,10 +258,10 @@ Say: "Workspace '<name>' removed from tracking."
 
 Marks a workspace as shipped. **Does not verify anything** — the caller is responsible for confirming it's actually done (e.g. `/feature` verifies the branch is merged before calling this).
 
-1. Remove worktree if it exists.
+1. Run **Clean up workspace resources** for `<name>`.
 2. Update status:
    ```bash
    node $HOME/.claude/lib/workspace.mjs update <NAME> '{"status":"done","worktreePath":null}'
    ```
 
-Say: "Workspace '<name>' marked as done. Worktree cleaned up."
+Say: "Workspace '<name>' marked as done. Database and worktree cleaned up."
