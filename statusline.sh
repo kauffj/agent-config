@@ -12,7 +12,7 @@ cost=$(echo "$input" | jq -r '.cost.total_cost_usd // 0')
 
 # Derived values
 project="${project_dir##*/}"
-branch=$(git -C "$project_dir" symbolic-ref --short HEAD 2>/dev/null || git -C "$project_dir" rev-parse --short HEAD 2>/dev/null)
+branch=$(git -C "$current_dir" symbolic-ref --short HEAD 2>/dev/null || git -C "$current_dir" rev-parse --short HEAD 2>/dev/null)
 rel_dir="${current_dir#"$project_dir"}"
 rel_dir="${rel_dir:-/}"
 
