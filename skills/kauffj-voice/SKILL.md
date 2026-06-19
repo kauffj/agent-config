@@ -21,6 +21,18 @@ Generate or rewrite text in Jeremy Kauffman's voice. The voice spec is the sourc
 
 If no register flag is given: default to `punchy` for a short take/tweet; default to `serious` for a document rewrite or anything longform.
 
+## Natural language (flags are optional)
+
+The flags are shortcuts. Map plain requests to them:
+
+- "in my voice / as me / like Jeremy" → invoke this skill.
+- "tweet," "post," "one-liner," "zinger," "shitpost" → `--punchy`.
+- "essay," "doc," "memo," "argument," "make it serious," "intellectual," "not crass" → `--serious`.
+- "rewrite / fix / de-AI this," or being handed prose or a file path → `--rewrite` (keep meaning, change voice).
+- "give me a few / some options / N versions" → set `--n` accordingly.
+
+When the request is ambiguous (e.g. "punchier" with no voice signal, or a serious one-liner where the length and the register pull opposite ways), state the register you're assuming in one line before producing, so a wrong guess is cheap to correct. Explicit flags always override inference.
+
 ## What both registers always obey (from the spec)
 
 - **No hedging.** No "I think maybe," "to be fair," "it's worth noting," "while some might."
