@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically snapshot live Claude Code sessions
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=60
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

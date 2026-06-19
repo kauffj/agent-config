@@ -1,0 +1,46 @@
+#!/usr/bin/env python3
+"""Snapshot the set of live Claude Code interactive sessions.
+
+Run periodically (systemd-user timer, every 60s). Writes the current live set to
+~/.claude/sessions-snapshot.json so that after any shutdown — intentional, battery,
+or crash — there is a durable record of which sessions were open, for `claude-resume-all`
+to bring back. The snapshot reflects honest current state (it may be empty if nothing
+is running); restore is on-demand, so a stale set is never re-opened uninvited.
+"""
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from _claude_sessions_lib import CLAUDE_DIR, live_sessions  # noqa: E402
+
+OUT = os.path.join(CLAUDE_DIR, "sessions-snapshot.json")
+PREV = os.path.join(CLAUDE_DIR, "sessions-snapshot.prev.json")
+
+
+def main():
+    sessions = sorted(
+        live_sessions().values(),
+        key=lambda s: (s.get("cwd") or "", s["sessionId"]),
+    )
+    data = {"capturedAt": int(time.time()), "sessions": sessions}
+
+    if os.path.exists(OUT):
+        try:
+            os.replace(OUT, PREV)
+        except OSError:
+            pass
+    tmp = OUT + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, OUT)
+
+    if "-v" in sys.argv or "--verbose" in sys.argv:
+        print(f"captured {len(sessions)} session(s) -> {OUT}")
+        for s in sessions:
+            print(f"  {s['sessionId'][:8]}  {s.get('cwd')}  [{s['source']}]")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,6 @@
+[Unit]
+Description=Snapshot live Claude Code sessions for crash recovery
+
+[Service]
+Type=oneshot
+ExecStart=%h/.claude/bin/claude-snapshot

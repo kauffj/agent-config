@@ -35,3 +35,10 @@ settings.local.json
 # Git internals
 .git/
 sessions/
+
+# Runtime snapshot written by bin/claude-snapshot (not source)
+sessions-snapshot.json
+sessions-snapshot.prev.json
+
+__pycache__/
+*.pyc
