@@ -9,6 +9,7 @@ session id from the process argv (--resume / --session-id / -r).
 import glob
 import json
 import os
+from datetime import datetime
 
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.path.join(HOME, ".claude")
@@ -103,12 +104,66 @@ def _project_dir(cwd):
     return os.path.join(PROJECTS_DIR, cwd.replace("/", "-"))
 
 
-def _recent_transcripts(cwd, exclude, limit):
-    """The `limit` most-recently-modified transcript ids in cwd's project dir,
-    skipping ids already accounted for. Used to attribute fresh `claude`
-    processes (no id in argv, not in the registry) to their session."""
+_CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
+START_MARGIN = 5.0  # seconds of clock-skew slack when matching start times
+
+
+def _boot_epoch():
+    try:
+        with open("/proc/stat") as f:
+            for line in f:
+                if line.startswith("btime "):
+                    return int(line.split()[1])
+    except OSError:
+        pass
+    return None
+
+
+def _proc_start_epoch(pid):
+    """Wall-clock epoch seconds at which `pid` started, or None."""
+    btime = _boot_epoch()
+    if btime is None:
+        return None
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            data = f.read()
+        # field 22 (starttime) in clock ticks since boot; fields after comm,
+        # which is parenthesized and may contain spaces -> split on last ')'.
+        fields = data[data.rfind(")") + 2:].split()
+        return btime + int(fields[19]) / _CLK_TCK
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _transcript_first_ts(path):
+    """Epoch of the earliest event timestamp in a transcript (reads only the
+    first few lines), or None."""
+    try:
+        with open(path) as f:
+            for _ in range(5):
+                line = f.readline()
+                if not line:
+                    break
+                try:
+                    ts = json.loads(line).get("timestamp")
+                except ValueError:
+                    continue
+                if ts:
+                    return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except OSError:
+        pass
+    return None
+
+
+def _attribute_fresh(cwd, pids, exclude):
+    """Map fresh `claude` pids (no id in argv, not registered) to their session
+    transcripts. A new session's transcript cannot predate its process, so for
+    each pid we pick the unclaimed transcript whose first event is nearest to —
+    and not meaningfully before — that pid's start time. Pre-existing/closed
+    transcripts are thereby excluded; a fresh pid with no qualifying transcript
+    (e.g. an untouched session with nothing to resume) is simply left out."""
     pdir = _project_dir(cwd)
-    found = []
+    candidates = []  # (first_ts, sid)
     try:
         names = os.listdir(pdir)
     except OSError:
@@ -119,12 +174,24 @@ def _recent_transcripts(cwd, exclude, limit):
         sid = fn[:-6]
         if sid in exclude:
             continue
-        try:
-            found.append((os.path.getmtime(os.path.join(pdir, fn)), sid))
-        except OSError:
-            continue
-    found.sort(reverse=True)
-    return [sid for _, sid in found[:limit]]
+        ts = _transcript_first_ts(os.path.join(pdir, fn))
+        if ts is not None:
+            candidates.append((ts, sid))
+
+    starts = sorted((s for s in (_proc_start_epoch(p) for p in pids) if s is not None))
+    matched, used = [], set()
+    for start in starts:
+        best, best_diff = None, None
+        for ts, sid in candidates:
+            if sid in used or ts < start - START_MARGIN:
+                continue  # a session's transcript can't predate its process
+            diff = ts - start
+            if best_diff is None or diff < best_diff:
+                best, best_diff = sid, diff
+        if best is not None:
+            used.add(best)
+            matched.append(best)
+    return matched
 
 
 def live_sessions():
@@ -134,10 +201,10 @@ def live_sessions():
     Sources, in order of confidence:
       registry  — Claude's own ~/.claude/sessions/<pid>.json (pid + id, exact)
       proc      — session id recovered from process argv (--resume/--session-id)
-      heuristic — fresh `claude` (no id in argv, not yet registered) mapped to
-                  the most-recently-active transcript(s) in its cwd. When several
-                  fresh sessions share a cwd we capture that many recent
-                  transcripts (right count, best-effort identity) so none is lost.
+      heuristic — fresh `claude` (no id in argv, not yet registered) matched to
+                  the transcript whose first event is nearest to, and not before,
+                  the process's start time (a new session can't predate its
+                  process), so closed/pre-existing transcripts are excluded.
     """
     sessions = _from_registry()
     known_pids = {info["pid"] for info in sessions.values() if info.get("pid")}
@@ -145,13 +212,13 @@ def live_sessions():
     for sid, info in by_id.items():
         sessions.setdefault(sid, info)
 
-    # Attribute fresh, unregistered claude processes via recent transcripts.
+    # Attribute fresh, unregistered claude processes to their transcripts.
     by_cwd = {}
     for pid, cwd in unresolved:
         if cwd:
             by_cwd.setdefault(cwd, []).append(pid)
     for cwd, pids in by_cwd.items():
-        for sid in _recent_transcripts(cwd, set(sessions), len(pids)):
+        for sid in _attribute_fresh(cwd, pids, set(sessions)):
             sessions.setdefault(sid, {"sessionId": sid, "cwd": cwd, "pid": None,
                                       "status": None, "source": "heuristic"})
     return sessions

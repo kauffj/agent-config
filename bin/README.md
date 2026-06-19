@@ -10,9 +10,11 @@ exact conversation.
   live Claude sessions to `~/.claude/sessions-snapshot.json`. Sources, by confidence:
   - `registry` — Claude's own `~/.claude/sessions/<pid>.json` (exact pid + id)
   - `proc` — session id read from a process's argv (`--resume` / `--session-id`)
-  - `heuristic` — fresh `claude` launches (no id in argv, not yet registered) mapped
-    to the most-recently-active transcript(s) in their cwd. Right count, best-effort
-    identity; can mis-pick if a recently-closed transcript looks newer.
+  - `heuristic` — fresh `claude` launches (no id in argv, not yet registered) matched
+    to the transcript whose first event is nearest to, and not before, the process's
+    start time (a new session's transcript can't predate its process). Closed/pre-existing
+    transcripts are excluded; an untouched fresh session with no transcript yet (nothing
+    to resume) is simply skipped.
 - **`claude-resume-all`** — the on-demand restore command. Reads the latest snapshot,
   skips sessions already running, groups the rest by project, and opens one tilix
   window per project with each session a tab running `claude --resume <id>`.
