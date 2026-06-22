@@ -75,7 +75,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash -c 'dir=\"${CLAUDE_PROJECT_DIR:-$PWD}\"; project=\"${dir##*/}\"; branch=$(git -C \"$dir\" symbolic-ref --short HEAD 2>/dev/null); label_file=\"/tmp/.tab-label-$(echo \"$dir\" | md5sum | cut -c1-8)\"; if [ -f \"$label_file\" ]; then label=$(cat \"$label_file\"); else label=\"$branch\"; fi; printf \"\\e]0;%s %s\\a\" \"${label:-$project}\" \"$project\" >&2'"
+            "command": "~/.claude/hooks/tab-title.sh ''"
           },
           {
             "type": "command",
@@ -98,7 +98,17 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/on-stop.sh"
+            "command": "~/.claude/hooks/tab-title.sh '●'"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/tab-title.sh ''"
           }
         ]
       }
@@ -108,7 +118,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/on-permission.sh"
+            "command": "~/.claude/hooks/tab-title.sh '●'"
           }
         ]
       }
@@ -120,6 +130,14 @@
           {
             "type": "command",
             "command": "~/.claude/hooks/on-pre-tool.sh"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/tab-title.sh ''"
           }
         ]
       }
@@ -141,7 +159,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/on-notify.sh"
+            "command": "~/.claude/hooks/tab-title.sh '●'"
           }
         ]
       }
@@ -159,5 +177,6 @@
   },
   "terminalTitleFromRename": true,
   "effortLevel": "high",
-  "skipDangerousModePermissionPrompt": true
+  "skipDangerousModePermissionPrompt": true,
+  "skipWorkflowUsageWarning": true
 }
