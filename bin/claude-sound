@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Toggle the waiting-sound, globally or per-session. State is flag files (read by
+# hooks/session-state.sh), because a fresh hook process can't see an exported env
+# var but can always test -f.
+#
+#   claude-sound on|off                  all sessions
+#   claude-sound on|off --session SID    one session
+#   claude-sound status                  show what's muted
+#   claude-sound test                    play the sound now (verify audio)
+
+GLOBAL="$HOME/.claude/sound-off"
+cmd="${1:-status}"
+sid=""
+[[ "$2" == "--session" ]] && sid="$3"
+
+case "$cmd" in
+  off)
+    if [[ -n "$sid" ]]; then touch "$HOME/.claude/sound-off-$sid"; echo "muted session ${sid:0:8}"
+    else touch "$GLOBAL"; echo "muted ALL sessions"; fi ;;
+  on)
+    if [[ -n "$sid" ]]; then rm -f "$HOME/.claude/sound-off-$sid"; echo "unmuted session ${sid:0:8}"
+    else rm -f "$GLOBAL"; echo "unmuted ALL sessions"; fi ;;
+  status)
+    [[ -f "$GLOBAL" ]] && echo "global: MUTED" || echo "global: on"
+    for f in "$HOME"/.claude/sound-off-*; do
+      [[ -e "$f" ]] || continue
+      echo "  muted session: $(basename "$f" | sed 's/^sound-off-//' | cut -c1-8)"
+    done ;;
+  test)
+    export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+    canberra-gtk-play -i "${2:-complete}" && echo "played '${2:-complete}'" ;;
+  *)
+    echo "usage: claude-sound on|off|status|test [--session SID]"; exit 2 ;;
+esac

@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""Fleet registry — the single data source the picker, tab bar, and tooling read.
+
+Joins three things per live session:
+  - liveness/identity  (_claude_sessions_lib.live_sessions)
+  - live state          (~/.claude/state/<sid>.json, written by session-state.sh)
+  - user metadata       (~/.claude/meta/<sid>.json: group, priority, label)
+
+Usage:
+  claude-sessions            urgency-sorted table (human)
+  claude-sessions --json     records for the WezTerm picker / other tools
+  claude-sessions --group    table grouped by `group`
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from _claude_sessions_lib import live_sessions, CLAUDE_DIR  # noqa: E402
+
+STATE_DIR = os.path.join(CLAUDE_DIR, "state")
+META_DIR = os.path.join(CLAUDE_DIR, "meta")
+
+
+def _load(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def _git_branch(cwd):
+    if not cwd:
+        return None
+    try:
+        r = subprocess.run(["git", "-C", cwd, "symbolic-ref", "--short", "HEAD"],
+                           capture_output=True, text=True, timeout=1)
+        return r.stdout.strip() or None
+    except Exception:
+        return None
+
+
+def _label(sid, cwd, branch):
+    lf = "/tmp/.tab-label-%s" % sid
+    if os.path.exists(lf):
+        try:
+            return open(lf).read().strip()
+        except OSError:
+            pass
+    base = branch or (os.path.basename(cwd) if cwd else sid[:8])
+    return "%s ·%s" % (base, sid[:4])
+
+
+def _glyph(status, age):
+    if status == "waiting":
+        if age >= 600:
+            return "\U0001F534"   # 🔴  waiting >10m
+        if age >= 120:
+            return "\U0001F7E1"   # 🟡  waiting >2m
+        return "⏳"           # ⏳  waiting
+    return "·"               # ·   working
+
+
+def _age_str(age):
+    if age < 60:
+        return "%ds" % age
+    if age < 3600:
+        return "%dm" % (age // 60)
+    return "%dh" % (age // 3600)
+
+
+def _urgency(status, age, priority):
+    # waiting floats above working; older waits float higher; priority dominates.
+    base = (1000 + age) if status == "waiting" else (age // 10)
+    return base + priority * 100000
+
+
+def records():
+    live = live_sessions()
+    now = time.time()
+    out = []
+    for sid, info in live.items():
+        cwd = info.get("cwd") or ""
+        st = _load(os.path.join(STATE_DIR, "%s.json" % sid))
+        meta = _load(os.path.join(META_DIR, "%s.json" % sid))
+        status = st.get("status") or "working"
+        since = st.get("since")
+        age = int(now - since) if since else 0
+        priority = int(meta.get("priority", 0) or 0)
+        branch = _git_branch(cwd)
+        out.append({
+            "session_id": sid,
+            "cwd": cwd,
+            "project": os.path.basename(cwd) if cwd else "",
+            "branch": branch,
+            "label": meta.get("label") or _label(sid, cwd, branch),
+            "pid": info.get("pid"),
+            "source": info.get("source"),
+            "status": status,
+            "since": since,
+            "age": age,
+            "age_str": _age_str(age),
+            "glyph": _glyph(status, age),
+            "group": meta.get("group"),
+            "priority": priority,
+            "wezterm_pane": st.get("wezterm_pane"),
+            "urgency": _urgency(status, age, priority),
+        })
+    out.sort(key=lambda r: (-r["urgency"], r["project"]))
+    return out
+
+
+def _print_table(recs, grouped=False):
+    if not recs:
+        print("no live sessions")
+        return
+
+    def row(r):
+        grp = " [%s]" % r["group"] if r.get("group") else ""
+        return "%s  %-30s %-8s %4s  %s%s" % (
+            r["glyph"], r["label"][:30], r["status"], r["age_str"],
+            r["project"], grp)
+
+    if grouped:
+        seen = {}
+        for r in recs:
+            seen.setdefault(r.get("group") or "(ungrouped)", []).append(r)
+        for grp in sorted(seen):
+            print("\n== %s ==" % grp)
+            for r in seen[grp]:
+                print(row(r))
+    else:
+        for r in recs:
+            print(row(r))
+
+
+def main():
+    args = sys.argv[1:]
+    recs = records()
+    if "--json" in args:
+        print(json.dumps(recs))
+    else:
+        _print_table(recs, grouped="--group" in args)
+
+
+if __name__ == "__main__":
+    main()

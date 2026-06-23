@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""Search transcript content across Claude sessions.
+
+  claude-search PATTERN          only LIVE sessions (default)
+  claude-search PATTERN --all    all historical transcripts
+
+Live search joins live_sessions() with their transcript files, so it answers
+"which session I have open right now is the one about X" — the live-scoped
+sibling of the /find-session skill.
+
+Uses ripgrep when on PATH, else falls back to grep (ripgrep bundled with Claude
+Code is not on the user's PATH, so we can't assume `rg`).
+"""
+import os
+import shutil
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from _claude_sessions_lib import live_sessions, _project_dir, PROJECTS_DIR  # noqa: E402
+
+
+def build_cmd(pattern, all_, targets):
+    rg = shutil.which("rg")
+    if rg:
+        base = [rg, "-i", "-c", "-H", "--no-heading"]
+        return base + (["--glob", "*.jsonl", pattern, PROJECTS_DIR] if all_
+                       else [pattern, *targets])
+    grep = shutil.which("grep") or "grep"
+    if all_:
+        return [grep, "-r", "-i", "-c", "-H", "--include=*.jsonl", pattern, PROJECTS_DIR]
+    return [grep, "-i", "-c", "-H", pattern, *targets]
+
+
+def main():
+    args = sys.argv[1:]
+    all_ = "--all" in args
+    pats = [a for a in args if not a.startswith("--")]
+    if not pats:
+        print("usage: claude-search PATTERN [--all]")
+        sys.exit(2)
+    pattern = pats[0]
+
+    label_by_path = {}
+    targets = []
+    if not all_:
+        for sid, info in live_sessions().items():
+            p = os.path.join(_project_dir(info.get("cwd") or ""), "%s.jsonl" % sid)
+            if os.path.exists(p):
+                label_by_path[p] = (sid, info.get("cwd") or "")
+        if not label_by_path:
+            print("no live sessions with transcripts")
+            return
+        targets = list(label_by_path)
+
+    res = subprocess.run(build_cmd(pattern, all_, targets),
+                         capture_output=True, text=True)
+    if res.returncode not in (0, 1):   # 1 == no matches, not an error
+        sys.stderr.write(res.stderr)
+        sys.exit(res.returncode)
+
+    rows = []
+    for line in res.stdout.splitlines():
+        if not line:
+            continue
+        path, _, count = line.rpartition(":")
+        if not count.isdigit() or int(count) == 0:   # grep -c emits :0 for misses
+            continue
+        sid, cwd = label_by_path.get(path, (os.path.basename(path)[:-6], path))
+        rows.append((int(count), sid, cwd))
+
+    if not rows:
+        print("no matches for %r in %s sessions" % (pattern, "all" if all_ else "live"))
+        return
+    for count, sid, cwd in sorted(rows, reverse=True):
+        print("%4d  %s  %s" % (count, sid[:8], cwd))
+
+
+if __name__ == "__main__":
+    main()

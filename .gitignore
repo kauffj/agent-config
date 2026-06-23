@@ -40,5 +40,12 @@ sessions/
 sessions-snapshot.json
 sessions-snapshot.prev.json
 
+# Fleet control plane runtime state (written by hooks, not source)
+state/
+meta/
+sound-off
+sound-off-*
+spawned-windows.log
+
 __pycache__/
 *.pyc
