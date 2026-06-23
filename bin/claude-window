@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# Focus the window a session opened via `claude-open` (matched by its
+# WM_CLASS=claude-<sid>). Needs xdotool or wmctrl; degrades to an xprop+/proc
+# enumeration that also catches windows merely tagged with the session's env var.
+#
+# Usage: claude-window [SID]      (default: $CLAUDE_CODE_SESSION_ID)
+set -u
+sid="${1:-${CLAUDE_CODE_SESSION_ID:-}}"
+[[ -z "$sid" ]] && { echo "usage: claude-window SID"; exit 2; }
+cls="claude-$sid"
+
+if command -v xdotool >/dev/null 2>&1; then
+  wid=$(xdotool search --class "$cls" 2>/dev/null | head -1)
+  if [[ -n "$wid" ]]; then xdotool windowactivate "$wid" >/dev/null 2>&1; exit 0; fi
+elif command -v wmctrl >/dev/null 2>&1; then
+  wmctrl -x -a "$cls" 2>/dev/null && exit 0
+fi
+
+# Fallback: enumerate X11 windows, map each to its PID, read /proc environ for the
+# session tag. Works with only xprop installed (no xdotool/wmctrl).
+if command -v xprop >/dev/null 2>&1; then
+  for wid in $(xprop -root _NET_CLIENT_LIST 2>/dev/null | grep -o '0x[0-9a-f]*'); do
+    pid=$(xprop -id "$wid" _NET_WM_PID 2>/dev/null | grep -o '[0-9]*$')
+    [[ -z "$pid" ]] && continue
+    if tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null | grep -qx "CLAUDE_CODE_SESSION_ID=$sid"; then
+      echo "window $wid (pid $pid) is owned by session ${sid:0:8}"
+      command -v xdotool >/dev/null 2>&1 && xdotool windowactivate "$wid" >/dev/null 2>&1
+      exit 0
+    fi
+  done
+fi
+echo "no window found for ${sid:0:8} (install xdotool/wmctrl for reliable focus)"; exit 1

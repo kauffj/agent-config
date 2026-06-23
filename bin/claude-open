@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Open a URL from a Claude session so the resulting window traces back to it.
+#
+# Correlation is belt-and-suspenders, because an already-running browser
+# re-parents a new window onto its existing process (losing any env tag):
+#   1. Isolated launch — a session-specific --class (and, for Chromium, a private
+#      --user-data-dir) so the window carries WM_CLASS=claude-<sid> AND the new
+#      process is its own tree that keeps CLAUDE_CODE_SESSION_ID in its environ.
+#   2. Launch-time log — append "<epoch> <sid> <class> <url>" to
+#      ~/.claude/spawned-windows.log: the one record that survives re-parenting,
+#      because the launching shell knows the session id even when the window won't.
+#
+# Pair with `claude-window` to focus the window later. Usage: claude-open <url>
+set -u
+LOG="$HOME/.claude/spawned-windows.log"
+sid="${CLAUDE_CODE_SESSION_ID:-unknown}"
+url="${1:-}"
+[[ -z "$url" ]] && { echo "usage: claude-open <url>"; exit 2; }
+cls="claude-$sid"
+
+if command -v google-chrome >/dev/null 2>&1; then chrome=google-chrome
+elif command -v chromium       >/dev/null 2>&1; then chrome=chromium
+elif command -v chromium-browser >/dev/null 2>&1; then chrome=chromium-browser
+else chrome=""; fi
+
+if [[ -n "$chrome" ]]; then
+  setsid -f "$chrome" --class="$cls" --user-data-dir="/tmp/claude-browser-$sid" "$url" >/dev/null 2>&1 || true
+elif command -v firefox >/dev/null 2>&1; then
+  setsid -f firefox --class="$cls" "$url" >/dev/null 2>&1 || true
+else
+  setsid -f xdg-open "$url" >/dev/null 2>&1 || true   # untraceable, but still logged
+fi
+
+printf '%s %s %s %s\n' "$(printf '%(%s)T' -1)" "$sid" "$cls" "$url" >> "$LOG" 2>/dev/null || true
+echo "opened ($cls) → $url"
