@@ -1,0 +1,6 @@
+[Unit]
+Description=Force recent Claude transcripts to durable storage (crash data-loss guard)
+
+[Service]
+Type=oneshot
+ExecStart=%h/.claude/bin/claude-transcript-sync

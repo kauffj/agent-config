@@ -50,3 +50,4 @@ spawned-windows.log
 
 __pycache__/
 *.pyc
+projects-backup/

@@ -13,10 +13,19 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from _claude_sessions_lib import CLAUDE_DIR, live_sessions  # noqa: E402
+from _claude_sessions_lib import CLAUDE_DIR, boot_epoch, live_sessions  # noqa: E402
 
 OUT = os.path.join(CLAUDE_DIR, "sessions-snapshot.json")
 PREV = os.path.join(CLAUDE_DIR, "sessions-snapshot.prev.json")
+BOOT_GRACE = 15 * 60  # seconds after boot during which the snapshot may not shrink
+
+
+def _existing_count():
+    try:
+        with open(OUT) as f:
+            return len(json.load(f).get("sessions", []))
+    except (OSError, ValueError):
+        return 0
 
 
 def main():
@@ -25,6 +34,20 @@ def main():
         key=lambda s: (s.get("cwd") or "", s["sessionId"]),
     )
     data = {"capturedAt": int(time.time()), "sessions": sessions}
+
+    # Crash recovery hinges on the pre-shutdown snapshot surviving the reboot.
+    # Right after boot, sessions haven't been reopened yet, so a plain overwrite
+    # would replace the real set with a near-empty one (and rotate away .prev
+    # too). For the first BOOT_GRACE seconds, refuse to let the snapshot shrink;
+    # it grows back to honest state as sessions are restored. Safe because
+    # restore is on-demand — a preserved larger set is never reopened uninvited.
+    btime = boot_epoch()
+    if (btime is not None and (int(time.time()) - btime) < BOOT_GRACE
+            and len(sessions) < _existing_count()):
+        if "-v" in sys.argv or "--verbose" in sys.argv:
+            print(f"boot grace: keeping existing snapshot "
+                  f"({_existing_count()} session(s)) over current {len(sessions)}")
+        return
 
     if os.path.exists(OUT):
         try:

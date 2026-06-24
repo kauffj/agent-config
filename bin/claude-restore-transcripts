@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+"""Restore Claude transcripts that vanished from the live tree but survive in backup.
+
+Counterpart to `claude-transcript-sync`. After an unclean shutdown, a transcript
+the kernel hadn't flushed can be rolled back out of ~/.claude/projects/ entirely.
+The backup tree (~/.claude/projects-backup/, kept current + fsynced by the sync
+timer) still holds a near-complete copy. This copies any .jsonl present in backup
+but MISSING (or smaller) in live back into place, so `claude --resume` can find it
+again.
+
+  claude-restore-transcripts            # restore missing/truncated transcripts
+  claude-restore-transcripts --dry-run  # list what would be restored, do nothing
+"""
+import os
+import shutil
+import sys
+
+HOME = os.path.expanduser("~")
+LIVE = os.path.join(HOME, ".claude", "projects")
+BACKUP = os.path.join(HOME, ".claude", "projects-backup")
+
+
+def main():
+    dry = "--dry-run" in sys.argv
+    if not os.path.isdir(BACKUP):
+        sys.exit(f"No backup tree at {BACKUP} (is the claude-transcript-sync timer running?)")
+
+    restored = 0
+    for root, _dirs, files in os.walk(BACKUP):
+        for fn in files:
+            if not fn.endswith(".jsonl"):
+                continue
+            bpath = os.path.join(root, fn)
+            rel = os.path.relpath(bpath, BACKUP)
+            lpath = os.path.join(LIVE, rel)
+            try:
+                bsz = os.path.getsize(bpath)
+            except OSError:
+                continue
+            # Restore when live is absent, or live is smaller than backup (truncated tail).
+            reason = None
+            if not os.path.exists(lpath):
+                reason = "missing"
+            else:
+                try:
+                    if os.path.getsize(lpath) < bsz:
+                        reason = "truncated"
+                except OSError:
+                    reason = "unreadable"
+            if not reason:
+                continue
+            print(f"{'would restore' if dry else 'restoring'} [{reason}] {rel} ({bsz} bytes)")
+            if not dry:
+                os.makedirs(os.path.dirname(lpath), exist_ok=True)
+                shutil.copyfile(bpath, lpath)
+            restored += 1
+
+    if restored == 0:
+        print("Nothing to restore — live transcripts are all present and current.")
+    elif dry:
+        print(f"({restored} transcript(s) would be restored — dry run, nothing written)")
+    else:
+        print(f"Restored {restored} transcript(s) into {LIVE}.")
+
+
+if __name__ == "__main__":
+    main()

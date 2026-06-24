@@ -11,6 +11,9 @@ Usage:
   claude-resume-all --dry-run    # show what would open, launch nothing
   claude-resume-all --yes        # skip the confirmation prompt for large restores
   claude-resume-all --snapshot PATH   # restore from a specific snapshot (e.g. the .prev backup)
+  claude-resume-all --from-transcripts [N]   # ignore the snapshot; reconstruct the
+                                             # N (default 12) most-recently-active
+                                             # sessions from transcript files
 """
 import json
 import os
@@ -20,7 +23,9 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from _claude_sessions_lib import CLAUDE_DIR, live_sessions  # noqa: E402
+from _claude_sessions_lib import (  # noqa: E402
+    CLAUDE_DIR, live_sessions, recent_transcript_sessions,
+)
 
 SNAP = os.path.join(CLAUDE_DIR, "sessions-snapshot.json")
 STAGGER = 2.0          # seconds between launches (DBus ordering + avoid boot thrash)
@@ -59,8 +64,19 @@ def main():
             sys.exit("--snapshot requires a path")
         snap_path = argv[i + 1]
 
-    sessions = load_snapshot(snap_path)
     live = set(live_sessions())
+
+    if "--from-transcripts" in argv:
+        i = argv.index("--from-transcripts")
+        limit = 12
+        if i + 1 < len(argv) and argv[i + 1].isdigit():
+            limit = int(argv[i + 1])
+        # Pull extra, then exclude live ones, so the live session(s) don't
+        # crowd out genuine candidates from the N most-recent slots.
+        sessions = recent_transcript_sessions(limit=limit + len(live) + 4,
+                                              exclude=live)[:limit]
+    else:
+        sessions = load_snapshot(snap_path)
 
     todo, skipped = [], 0
     for s in sessions:

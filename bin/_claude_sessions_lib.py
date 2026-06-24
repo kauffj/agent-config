@@ -222,3 +222,58 @@ def live_sessions():
             sessions.setdefault(sid, {"sessionId": sid, "cwd": cwd, "pid": None,
                                       "status": None, "source": "heuristic"})
     return sessions
+
+
+def boot_epoch():
+    """Wall-clock epoch seconds of the last system boot, or None."""
+    return _boot_epoch()
+
+
+def _transcript_cwd(path):
+    """The cwd recorded in a transcript (scans the first lines), or None."""
+    try:
+        with open(path) as f:
+            for _ in range(30):
+                line = f.readline()
+                if not line:
+                    break
+                try:
+                    cwd = json.loads(line).get("cwd")
+                except ValueError:
+                    continue
+                if cwd:
+                    return cwd
+    except OSError:
+        pass
+    return None
+
+
+def recent_transcript_sessions(limit=12, exclude=()):
+    """Reconstruct likely-open sessions from transcript files, most-recently
+    active first. Used as a fallback when no usable snapshot survives (e.g. it
+    was overwritten post-boot). Returns a list of
+    {sessionId, cwd, status, source} dicts. Subagent/workflow transcripts and
+    ids in `exclude` are skipped; the real cwd is read from each transcript so
+    the resulting `claude --resume` lands in the right directory."""
+    exclude = set(exclude)
+    rows = []
+    for path in glob.glob(os.path.join(PROJECTS_DIR, "**", "*.jsonl"), recursive=True):
+        if os.sep + "subagents" + os.sep in path:
+            continue
+        sid = os.path.basename(path)[:-6]
+        if sid in exclude:
+            continue
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            continue
+        cwd = _transcript_cwd(path)
+        if not cwd or not os.path.isdir(cwd):
+            continue
+        rows.append((mtime, sid, cwd))
+    rows.sort(reverse=True)
+    out = []
+    for _, sid, cwd in rows[:limit]:
+        out.append({"sessionId": sid, "cwd": cwd,
+                    "status": "reconstructed", "source": "transcripts"})
+    return out

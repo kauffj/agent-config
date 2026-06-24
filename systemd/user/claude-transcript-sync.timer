@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically fsync + back up live Claude transcripts
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=20
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

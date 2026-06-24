@@ -1,0 +1,114 @@
+#!/usr/bin/env python3
+"""Force recently-written Claude transcripts to durable storage.
+
+The data-loss problem: Claude appends session transcripts to ~/.claude/projects/
+**/*.jsonl, but the kernel may hold those writes in the page cache for up to
+vm.dirty_expire_centisecs (default 30s) before flushing. On an unclean shutdown
+(battery death, hard freeze) ext4's default data=ordered journals metadata but
+not data, so the unflushed tail — and even whole just-created files — get rolled
+back on reboot. Result: entire sessions vanish.
+
+This closes the window two ways, every time it runs (systemd-user timer, ~20s):
+  1. fsync() each transcript touched in the last few minutes, so the LIVE file
+     itself is durable — a later freeze can lose at most one interval of writes.
+  2. Copy each into a parallel backup tree (and fsync the copy), so even if a
+     live file is truncated mid-append, a near-complete copy survives for
+     `claude-resume`/recovery to fall back to.
+
+Pure stdlib, no deps. Safe to run concurrently with active sessions (fsync and
+read-copy never mutate the originals).
+"""
+import os
+import shutil
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+LIVE = os.path.join(HOME, ".claude", "projects")
+BACKUP = os.path.join(HOME, ".claude", "projects-backup")
+WINDOW = 300  # seconds; only touch files modified this recently (keeps each run cheap)
+
+
+def fsync_path(path):
+    """Flush a single file's data to the underlying device."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        os.fsync(fd)
+        return True
+    finally:
+        os.close(fd)
+
+
+def fsync_dir(path):
+    """Flush a directory entry so a freshly-created file's *name* is durable too."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def main():
+    verbose = "-v" in sys.argv or "--verbose" in sys.argv
+    now = time.time()
+    synced = copied = 0
+    touched_backup_dirs = set()
+
+    for root, _dirs, files in os.walk(LIVE):
+        for fn in files:
+            if not fn.endswith(".jsonl"):
+                continue
+            src = os.path.join(root, fn)
+            try:
+                st = os.stat(src)
+            except OSError:
+                continue
+            if now - st.st_mtime > WINDOW:
+                continue  # untouched recently; already durable from a prior run
+
+            # 1) make the live file itself durable
+            if fsync_path(src):
+                synced += 1
+
+            # 2) mirror to the backup tree, but only when the source is newer/bigger
+            rel = os.path.relpath(src, LIVE)
+            dst = os.path.join(BACKUP, rel)
+            try:
+                dst_st = os.stat(dst)
+                fresh = (st.st_mtime > dst_st.st_mtime) or (st.st_size != dst_st.st_size)
+            except OSError:
+                fresh = True
+            if fresh:
+                dst_dir = os.path.dirname(dst)
+                os.makedirs(dst_dir, exist_ok=True)
+                tmp = dst + ".tmp"
+                try:
+                    shutil.copyfile(src, tmp)
+                    fsync_path(tmp)
+                    os.replace(tmp, dst)
+                    copied += 1
+                    touched_backup_dirs.add(dst_dir)
+                except OSError:
+                    try:
+                        os.path.exists(tmp) and os.remove(tmp)
+                    except OSError:
+                        pass
+
+    for d in touched_backup_dirs:
+        fsync_dir(d)
+
+    if verbose:
+        print(f"fsynced {synced} live transcript(s); refreshed {copied} backup copy(ies) "
+              f"-> {BACKUP}")
+
+
+if __name__ == "__main__":
+    main()
