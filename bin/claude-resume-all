@@ -15,6 +15,7 @@ Usage:
                                              # N (default 12) most-recently-active
                                              # sessions from transcript files
 """
+import glob
 import json
 import os
 import shlex
@@ -28,8 +29,9 @@ from _claude_sessions_lib import (  # noqa: E402
 )
 
 SNAP = os.path.join(CLAUDE_DIR, "sessions-snapshot.json")
-STAGGER = 2.0          # seconds between launches (DBus ordering + avoid boot thrash)
 CONFIRM_OVER = 10      # prompt before opening more than this many tabs
+STARTUP_TIMEOUT = 15   # seconds to wait for a launched session to actually come up
+POLL = 0.6             # seconds between liveness polls
 
 
 def load_snapshot(path):
@@ -49,6 +51,33 @@ def tilix_cmd(cwd, sid, new_window):
     )
     base = ["tilix"] if new_window else ["tilix", "-a", "app-new-session"]
     return base + ["--working-directory", cwd, "-e", "bash", "-lic", inner]
+
+
+def sid_running(sid):
+    """True once a live `claude` process carries this session id in its argv.
+    Our launch runs `claude --resume <sid>`, so the id shows up in /proc almost
+    as soon as the process execs — a direct readiness+success signal, far more
+    reliable than a fixed sleep."""
+    for pdir in glob.glob("/proc/[0-9]*"):
+        try:
+            with open(os.path.join(pdir, "cmdline"), "rb") as f:
+                parts = [p.decode("utf-8", "replace") for p in f.read().split(b"\0") if p]
+        except OSError:
+            continue
+        if not parts or os.path.basename(parts[0]) != "claude":
+            continue
+        if sid in parts:
+            return True
+    return False
+
+
+def wait_running(sid, timeout=STARTUP_TIMEOUT):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if sid_running(sid):
+            return True
+        time.sleep(POLL)
+    return False
 
 
 def main():
@@ -128,12 +157,35 @@ def main():
             for j, sid in enumerate(groups[cwd]):
                 launches.append((cwd, sid, j == 0))
 
-    for cwd, sid, new_window in launches:
+    def launch(cwd, sid, new_window):
         subprocess.Popen(
             tilix_cmd(cwd, sid, new_window),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
-        time.sleep(STAGGER)
+
+    # Launch sequentially, confirming each session is actually up before the next.
+    # This both paces correctly (the tilix server is guaranteed ready before we
+    # attach the next tab to it — the old blind sleep raced and dropped tabs) and
+    # lets us retry + report genuine failures instead of firing and hoping.
+    opened, failed = [], []
+    for cwd, sid, new_window in launches:
+        launch(cwd, sid, new_window)
+        if wait_running(sid):
+            opened.append(sid)
+            continue
+        # Lost the race or crashed on start — retry once as its own fresh window
+        # (an extra window beats a missing session).
+        launch(cwd, sid, True)
+        if wait_running(sid):
+            opened.append(sid)
+        else:
+            failed.append((cwd, sid))
+
+    print(f"Opened {len(opened)}/{len(launches)} session(s).")
+    if failed:
+        print(f"Could not open {len(failed)} — resume manually:")
+        for cwd, sid in failed:
+            print(f"  (cd {shlex.quote(cwd)} && claude --resume {sid})")
 
 
 if __name__ == "__main__":
