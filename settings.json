@@ -99,6 +99,10 @@
           {
             "type": "command",
             "command": "~/.claude/hooks/tab-title.sh '●'"
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/fsync-transcript.sh"
           }
         ]
       }
@@ -177,6 +181,7 @@
   },
   "terminalTitleFromRename": true,
   "effortLevel": "high",
+  "tui": "default",
   "skipDangerousModePermissionPrompt": true,
   "skipWorkflowUsageWarning": true
 }
