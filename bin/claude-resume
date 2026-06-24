@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Reopen previously-live Claude sessions as WezTerm tabs (post-restart).
+
+Reads the last snapshot (bin/claude-snapshot writes it every 60s) and spawns a
+WezTerm tab running `claude --resume <sid>` for each session that isn't already
+live. The Tilix equivalent was bin/claude-resume-all; this is the WezTerm flavor.
+Run from inside WezTerm (it uses `wezterm cli spawn`).
+
+  claude-resume            reopen all non-live snapshot sessions as tabs
+  claude-resume --dry-run  print what would be spawned, do nothing
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from _claude_sessions_lib import live_sessions, CLAUDE_DIR  # noqa: E402
+
+SNAP = os.path.join(CLAUDE_DIR, "sessions-snapshot.json")
+
+
+def main():
+    dry = "--dry-run" in sys.argv
+    try:
+        with open(SNAP) as f:
+            snap = json.load(f)
+    except (OSError, ValueError):
+        print("no readable snapshot at %s" % SNAP)
+        sys.exit(1)
+
+    live = set(live_sessions())
+    todo = [s for s in snap.get("sessions", [])
+            if s.get("sessionId") and s.get("cwd") and s["sessionId"] not in live]
+    if not todo:
+        print("nothing to resume (snapshot sessions already live, or snapshot empty)")
+        return
+    if not dry and not shutil.which("wezterm"):
+        print("wezterm not on PATH — run this from inside WezTerm")
+        sys.exit(1)
+
+    for s in todo:
+        sid, cwd = s["sessionId"], s["cwd"]
+        if dry:
+            print("would spawn  %s  %s" % (sid[:8], cwd))
+            continue
+        r = subprocess.run(
+            ["wezterm", "cli", "spawn", "--cwd", cwd, "--",
+             "bash", "-lic", "claude --resume %s; exec bash" % sid],
+            capture_output=True, text=True)
+        ok = r.returncode == 0
+        print("%s %s  %s%s" % ("spawned" if ok else "FAILED ", sid[:8], cwd,
+                               "" if ok else "  :: " + r.stderr.strip()))
+
+
+if __name__ == "__main__":
+    main()
