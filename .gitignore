@@ -43,6 +43,7 @@ sessions-snapshot.prev.json
 # Fleet control plane runtime state (written by hooks, not source)
 state/
 meta/
+fleet/
 sound-off
 sound-off-*
 spawned-windows.log
