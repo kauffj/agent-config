@@ -16,14 +16,8 @@ branch=$(git -C "$current_dir" symbolic-ref --short HEAD 2>/dev/null || git -C "
 rel_dir="${current_dir#"$project_dir"}"
 rel_dir="${rel_dir:-/}"
 
-# Update tab title as side effect
-label_file="/tmp/.tab-label-$(echo "$project_dir" | md5sum | cut -c1-8)"
-if [[ -f "$label_file" ]]; then
-    label=$(< "$label_file")
-else
-    label="$branch"
-fi
-printf '\e]0;%s %s\a' "$label" "$project" >&2
+# The tab title is owned entirely by hooks/tab-title.sh (which also handles the
+# idle marker and per-tab uniqueness); the statusline no longer writes it.
 
 # Format cost
 cost_str=""

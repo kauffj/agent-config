@@ -30,16 +30,23 @@ if [[ "$(jq -r '.stop_hook_active // false' <<<"$INPUT")" == "true" ]]; then
 fi
 
 CWD=$(jq -r '.cwd // empty' <<<"$INPUT")
+session_id=$(jq -r '.session_id // empty' <<<"$INPUT")
 project="${CWD##*/}"
 
-# Label: manual override file > git branch > project name
-label_file="/tmp/.tab-label-$(echo "$CWD" | md5sum | cut -c1-8)"
-if [[ -f "$label_file" ]]; then
+# Label resolution. Multiple tabs in the same repo on the same branch would
+# otherwise collapse to an identical "project branch" title, so:
+#   1. A manual per-tab name (keyed by session) wins and is shown verbatim —
+#      set one with:  echo my-name > /tmp/.tab-label-$CLAUDE_CODE_SESSION_ID
+#   2. Otherwise use the git branch plus a short session-id tag, which keeps
+#      same-repo/same-branch tabs distinguishable automatically.
+label_file="/tmp/.tab-label-${session_id}"
+if [[ -n "$session_id" && -f "$label_file" ]]; then
     label=$(< "$label_file")
 else
-    label=$(git -C "$CWD" symbolic-ref --short HEAD 2>/dev/null)
+    branch=$(git -C "$CWD" symbolic-ref --short HEAD 2>/dev/null)
+    label="${branch:-$project}"
+    [[ -n "$session_id" ]] && label="$label ·${session_id:0:4}"
 fi
-label="${label:-$project}"
 
 title="$project $label"
 [[ -n "$marker" ]] && title="$title $marker"
