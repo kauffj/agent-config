@@ -61,7 +61,14 @@
       "Skill",
       "WebFetch",
       "WebSearch",
-      "Write"
+      "Write",
+      "mcp__playwright",
+      "mcp__google-docs",
+      "mcp__google-sheets",
+      "mcp__claude_ai_Gmail",
+      "mcp__claude_ai_Google_Calendar",
+      "mcp__claude_ai_Google_Drive",
+      "mcp__team"
     ],
     "defaultMode": "dontAsk"
   },
@@ -75,7 +82,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/tab-title.sh ''"
+            "command": "~/.claude/hooks/session-state.sh"
           },
           {
             "type": "command",
@@ -98,7 +105,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/tab-title.sh '●'"
+            "command": "~/.claude/hooks/session-state.sh"
           },
           {
             "type": "command",
@@ -112,7 +119,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/tab-title.sh ''"
+            "command": "~/.claude/hooks/session-state.sh"
           }
         ]
       }
