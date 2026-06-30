@@ -82,8 +82,8 @@ if [[ "$status" == "waiting" && "$prev_status" != "waiting" && -n "$snd" ]]; the
   fi
 fi
 
-# Tab title + marker (OSC 0 via terminalSequence). Marker is a SUFFIX because
-# Tilix left-trims long titles; '●' = waiting on you.
+# Tab title + marker (OSC 0 via terminalSequence). Marker is a SUFFIX so it
+# survives title truncation; '●' = waiting on you.
 project="${cwd##*/}"
 label_file="/tmp/.tab-label-$session_id"
 if [[ -f "$label_file" ]]; then

@@ -3,7 +3,7 @@
 
 Run periodically (systemd-user timer, every 60s). Writes the current live set to
 ~/.claude/sessions-snapshot.json so that after any shutdown — intentional, battery,
-or crash — there is a durable record of which sessions were open, for `claude-resume-all`
+or crash — there is a durable record of which sessions were open, for `claude-resume`
 to bring back. The snapshot reflects honest current state (it may be empty if nothing
 is running); restore is on-demand, so a stale set is never re-opened uninvited.
 """
