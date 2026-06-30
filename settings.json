@@ -72,7 +72,7 @@
     ],
     "defaultMode": "dontAsk"
   },
-  "model": "sonnet",
+  "model": "opus",
   "enabledMcpjsonServers": [
     "team"
   ],
