@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """Reopen previously-live Claude sessions as WezTerm tabs (post-restart).
 
-The canonical, default restore command (WezTerm). Takes the resume set —
-the snapshot bin/claude-snapshot writes every 60s, unioned with any pre-crash
-sessions preserved in sessions-recovery.json, minus sessions already live or
-whose transcript is gone — and spawns a WezTerm tab running `claude --resume
-<sid>` for each. Run from inside WezTerm (it uses `wezterm cli spawn`). The
-Tilix flavor is the legacy bin/claude-resume-all.
+The canonical restore command. Takes the resume set — the snapshot
+bin/claude-snapshot writes every 60s, unioned with any pre-crash sessions
+preserved in sessions-recovery.json, minus sessions already live or whose
+transcript is gone — and spawns a WezTerm tab running `claude --resume <sid>`
+for each. Run from inside WezTerm (it uses `wezterm cli spawn`).
 
-  claude-resume            reopen all non-live resume-set sessions as tabs
-  claude-resume --dry-run  print what would be spawned, do nothing
+  claude-resume                       reopen all non-live resume-set sessions as tabs
+  claude-resume --dry-run             print what would be spawned, do nothing
+  claude-resume --snapshot PATH       restore from a specific snapshot (e.g. the
+                                      .prev backup) instead of the live one
+  claude-resume --from-transcripts [N]
+                                      ignore the snapshot; reconstruct the N
+                                      (default 12) most-recently-active sessions
+                                      from transcript files — the fallback for
+                                      when no snapshot survived the reboot
 """
 import os
 import shutil
@@ -17,18 +23,46 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from _claude_sessions_lib import resume_set, clear_recovery  # noqa: E402
+from _claude_sessions_lib import (  # noqa: E402
+    clear_recovery, live_sessions, recent_transcript_sessions, resume_set,
+)
 
 
 def main():
-    dry = "--dry-run" in sys.argv
-    todo = resume_set()
+    argv = sys.argv[1:]
+    dry = "--dry-run" in argv
+
+    # The default source is the post-crash restore the recovery file is for, so
+    # only it consumes the recovery point. Explicit --snapshot/--from-transcripts
+    # runs are ad-hoc and leave the recovery file untouched.
+    clear_after = True
+    if "--from-transcripts" in argv:
+        clear_after = False
+        i = argv.index("--from-transcripts")
+        limit = 12
+        if i + 1 < len(argv) and argv[i + 1].isdigit():
+            limit = int(argv[i + 1])
+        live = set(live_sessions())
+        # Pull extra, then exclude live ones, so a live session doesn't crowd
+        # genuine candidates out of the N most-recent slots.
+        todo = [{"sessionId": s["sessionId"], "cwd": s["cwd"]}
+                for s in recent_transcript_sessions(limit=limit + len(live) + 4,
+                                                    exclude=live)[:limit]
+                if os.path.isdir(s["cwd"])]
+    elif "--snapshot" in argv:
+        clear_after = False
+        i = argv.index("--snapshot")
+        if i + 1 >= len(argv):
+            sys.exit("--snapshot requires a path")
+        todo = resume_set(snap_path=argv[i + 1])
+    else:
+        todo = resume_set()
+
     if not todo:
         print("nothing to resume (resume-set sessions already live, or none on disk)")
         return
     if not dry and not shutil.which("wezterm"):
-        print("wezterm not on PATH — run this from inside WezTerm "
-              "(or use claude-resume-all for tilix)")
+        print("wezterm not on PATH — run this from inside WezTerm")
         sys.exit(1)
 
     spawned = 0
@@ -48,7 +82,7 @@ def main():
 
     # Consume the recovery point once we've actually brought everything back, so
     # the next run doesn't re-suggest the same set. Keep it if any spawn failed.
-    if not dry and spawned == len(todo):
+    if clear_after and not dry and spawned == len(todo):
         clear_recovery()
 
 
