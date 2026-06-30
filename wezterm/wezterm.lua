@@ -24,13 +24,35 @@ local HOME = wezterm.home_dir
 -- missing family. The non-fancy tab bar honors explicit per-tab fg/bg colors.
 -- ---------------------------------------------------------------------------
 config.color_scheme = 'Tokyo Night'          -- bundled; swap freely
-config.scrollback_lines = 50000
+config.scrollback_lines = 100000
 config.use_fancy_tab_bar = false
 config.hide_tab_bar_if_only_one_tab = false
 config.tab_bar_at_bottom = false
 config.tab_max_width = 40
-config.window_padding = { left = 4, right = 4, top = 2, bottom = 2 }
 config.audible_bell = 'Disabled'             -- waiting-sound is driven by hooks, not the bell
+
+-- Grabbable scrollbar (the original garble-relief trial). Right padding leaves
+-- room for the thumb; keep it big enough to grab.
+config.enable_scroll_bar = true
+config.min_scroll_bar_height = '1.5cell'
+config.window_padding = { left = 4, right = 16, top = 2, bottom = 2 }
+config.window_close_confirmation = 'NeverPrompt'
+
+-- Manual workspace save/restore via wezterm-sessions, pcall-guarded so a plugin
+-- or network hiccup can never break the terminal. Auto-save left OFF (an empty
+-- post-reboot window would otherwise clobber a good save before you restore).
+--   Alt+s save · Alt+r restore · Alt+l load/switch · Alt+a toggle auto-save
+local sess_ok, sessions = pcall(function()
+  return wezterm.plugin.require('https://github.com/abidibo/wezterm-sessions')
+end)
+if sess_ok and sessions then
+  sessions.apply_to_config(config, {
+    auto_save_interval_s = 30,             -- only used if you toggle auto-save on (Alt+a)
+    save_state_dir = 'default-user-owned', -- ~/.local/share/wezterm-sessions/state/
+  })
+else
+  wezterm.log_error('wezterm-sessions failed to load: ' .. tostring(sessions))
+end
 
 -- ---------------------------------------------------------------------------
 -- Live state cache: refreshed ~1/sec by update-status, read by format-tab-title.
@@ -75,12 +97,21 @@ local function trunc(s, n)
 end
 
 wezterm.on('format-tab-title', function(tab, tabs, panes, conf, hover, max_width)
-  local title = tab.active_pane and tab.active_pane.title or ('tab ' .. (tab.tab_index + 1))
-  title = string.format('%d %s', tab.tab_index + 1, title)
-  title = ' ' .. trunc(title, math.max(6, max_width - 2)) .. ' '
-
+  local idx = tab.tab_index + 1
   local st = tab.active_pane and pane_state[tostring(tab.active_pane.pane_id)] or nil
   local c = wait_colors(st)
+
+  -- Idle + inactive tabs render as just their number. By *asking* for little
+  -- width on the first pass, WezTerm frees that budget for the tabs that want
+  -- more (the active tab + any waiting/escalating ones), so those stay legible.
+  if not tab.is_active and not c then
+    return string.format(' %d ', idx)
+  end
+
+  local title = tab.active_pane and tab.active_pane.title or ('tab ' .. idx)
+  title = string.format('%d %s', idx, title)
+  title = ' ' .. trunc(title, math.max(6, max_width - 2)) .. ' '
+
   if c then
     return {
       { Background = { Color = c.bg } },
@@ -89,7 +120,7 @@ wezterm.on('format-tab-title', function(tab, tabs, panes, conf, hover, max_width
       { Text = title },
     }
   end
-  return title   -- working / unknown -> default tab styling
+  return title   -- active, working/unknown -> default tab styling, full title
 end)
 
 -- ---------------------------------------------------------------------------
@@ -195,6 +226,14 @@ config.keys = {
   { key = 'Space', mods = 'CTRL|SHIFT', action = wezterm.action_callback(session_picker) },
   { key = 'o',     mods = 'CTRL|SHIFT', action = act.ShowLauncherArgs { flags = 'FUZZY|WORKSPACES' } },
   { key = 'g',     mods = 'CTRL|SHIFT', action = wezterm.action_callback(launch_family) },
+  -- Reorder the active tab. Left/Right shift it one slot; Home/End send it to the ends.
+  { key = 'LeftArrow',  mods = 'CTRL|SHIFT', action = act.MoveTabRelative(-1) },
+  { key = 'RightArrow', mods = 'CTRL|SHIFT', action = act.MoveTabRelative(1) },
+  { key = 'Home',       mods = 'CTRL|SHIFT', action = act.MoveTab(0) },
+  { key = 'End',        mods = 'CTRL|SHIFT', action = wezterm.action_callback(function(win, _)
+      local tabs = win:mux_window():tabs()
+      win:perform_action(act.MoveTab(#tabs - 1), win:active_pane())
+    end) },
 }
 
 return config

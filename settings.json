@@ -2,7 +2,8 @@
   "env": {
     "HICKEY_PRINCIPLES": "$HOME/.claude/hickey-principles.md",
     "UI_PRINCIPLES": "$HOME/.claude/ui-design-principles.md",
-    "TEAM_OPS_REPO": "/home/you/projects/team-ops"
+    "TEAM_OPS_REPO": "/home/you/projects/team-ops",
+    "CLAUDE_CODE_NO_FLICKER": "1"
   },
   "attribution": {
     "commit": "",
@@ -61,7 +62,14 @@
       "Skill",
       "WebFetch",
       "WebSearch",
-      "Write"
+      "Write",
+      "mcp__playwright",
+      "mcp__google-docs",
+      "mcp__google-sheets",
+      "mcp__claude_ai_Gmail",
+      "mcp__claude_ai_Google_Calendar",
+      "mcp__claude_ai_Google_Drive",
+      "mcp__team"
     ],
     "defaultMode": "dontAsk"
   },
@@ -75,7 +83,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/tab-title.sh ''"
+            "command": "~/.claude/hooks/session-state.sh"
           },
           {
             "type": "command",
@@ -88,7 +96,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'POST-COMPACTION CONTEXT: Enter plan mode for non-trivial tasks. Update tasks/lessons.md after corrections. Verify before marking complete. Simplicity first — no premature abstractions. Check tasks/todo.md for current progress.'"
+            "command": "echo 'POST-COMPACTION CONTEXT: Enter plan mode for non-trivial tasks. Update tasks/lessons.md after corrections. Verify before marking complete. Simplicity first \u2014 no premature abstractions. Check tasks/todo.md for current progress.'"
           }
         ]
       }
@@ -98,7 +106,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/tab-title.sh '●'"
+            "command": "~/.claude/hooks/session-state.sh"
           },
           {
             "type": "command",
@@ -112,7 +120,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/tab-title.sh ''"
+            "command": "~/.claude/hooks/session-state.sh"
           }
         ]
       }
@@ -122,7 +130,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/tab-title.sh '●'"
+            "command": "~/.claude/hooks/session-state.sh"
           }
         ]
       }
@@ -141,7 +149,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/tab-title.sh ''"
+            "command": "~/.claude/hooks/session-state.sh"
           }
         ]
       }
@@ -159,11 +167,10 @@
     ],
     "Notification": [
       {
-        "matcher": "idle_prompt",
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/tab-title.sh '●'"
+            "command": "~/.claude/hooks/session-state.sh"
           }
         ]
       }
