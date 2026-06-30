@@ -4,10 +4,8 @@ Two jobs:
 1. **Durability** — make sure a hard reboot/freeze can't destroy session
    transcripts (it could, and did, on 2026-06-24).
 2. **Resurrection** — bring back the sessions that were open when the machine
-   shut down, as native terminal tabs, each resumed to its exact conversation.
-   **WezTerm is the default** (`claude-resume`, spawns tabs in the current
-   window); the Tilix flavor (`claude-resume-all`, one window per project) is
-   the legacy fallback for when you're not in WezTerm.
+   shut down, as WezTerm tabs (`claude-resume`), each resumed to its exact
+   conversation.
 
 ## Durability (the data-loss guard)
 
@@ -25,7 +23,7 @@ shrink the window system-wide.)
   ~20s per conversation. Older transcripts are already disk-durable, so they're skipped.
 - **`claude-restore-transcripts`** — restores any transcript that went missing or
   got truncated from the live tree, out of the backup. Run this first after a freeze,
-  then `claude-resume-all`. `--dry-run` to preview.
+  then `claude-resume`. `--dry-run` to preview.
 
 ## Resurrection (which sessions were open)
 
@@ -47,17 +45,15 @@ shrink the window system-wide.)
   guard. The resume commands union it into their set, so a session that vanished
   from the live snapshot is still reopened. It's archived to `backups/` once a
   restore brings everything back, and ignored after 12 h so it can't go stale.
-- **`claude-resume`** (default, WezTerm) — the on-demand restore command. Takes
-  the resume set (snapshot ∪ recovery, minus sessions already live or whose
-  transcript is gone) and spawns a `claude --resume <id>` tab per session via
-  `wezterm cli spawn`. Run it from inside WezTerm.
-- **`claude-resume-all`** (legacy, Tilix) — same resume set, but groups by project
-  and opens one tilix window per project. Launches sequentially and **verifies each
-  session actually comes up** (retrying once and reporting failures) — an earlier
-  version fired tabs at the tilix server faster than it could accept them and
-  silently dropped some. Use when you're not in WezTerm.
+- **`claude-resume`** — the on-demand restore command. Takes the resume set
+  (snapshot ∪ recovery, minus sessions already live or whose transcript is gone)
+  and spawns a `claude --resume <id>` tab per session via `wezterm cli spawn`.
+  Run it from inside WezTerm. `--snapshot PATH` restores from a specific snapshot
+  (e.g. the `.prev` backup); `--from-transcripts [N]` ignores the snapshot and
+  reconstructs the N most-recently-active sessions from transcript files — the
+  fallback for when no snapshot survived the reboot.
 
-Both skip any session whose transcript no longer exists, so a rolled-back id never
+It skips any session whose transcript no longer exists, so a rolled-back id never
 spawns a dead "No conversation found" tab — run `claude-restore-transcripts` first
 to pull survivors out of backup.
 
@@ -68,14 +64,9 @@ to pull survivors out of backup.
 claude-restore-transcripts        # put back any transcript that got rolled back
 claude-resume                     # reopen everything that isn't already running, as tabs
 claude-resume --dry-run           # show what it would open
-
-# legacy Tilix flavor (not in WezTerm):
-claude-resume-all                           # one window per project
-claude-resume-all --dry-run                 # show what it would open
-claude-resume-all --single-window           # all tabs in one window
-claude-resume-all --snapshot ~/.claude/sessions-snapshot.prev.json   # use the backup snapshot
-claude-resume-all --from-transcripts [N]    # ignore the snapshot; reconstruct the N
-                                            # most-recently-active sessions from transcripts
+claude-resume --snapshot ~/.claude/sessions-snapshot.prev.json   # use the backup snapshot
+claude-resume --from-transcripts [N]    # ignore the snapshot; reconstruct the N
+                                        # most-recently-active sessions from transcripts
 ```
 
 Large sessions show Claude's own "resume from summary vs full?" prompt per tab.
@@ -84,7 +75,7 @@ Large sessions show Claude's own "resume from summary vs full?" prompt per tab.
 
 ```sh
 # ~/.claude is a symlink to this repo; bin/ and systemd/user/ live here.
-ln -sf "$HOME/.claude/bin/claude-resume-all" "$HOME/.local/bin/claude-resume-all"
+ln -sf "$HOME/.claude/bin/claude-resume" "$HOME/.local/bin/claude-resume"
 for u in claude-snapshot claude-transcript-sync; do
   ln -sf "$HOME/.claude/systemd/user/$u.service" ~/.config/systemd/user/
   ln -sf "$HOME/.claude/systemd/user/$u.timer"   ~/.config/systemd/user/
