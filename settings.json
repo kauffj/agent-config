@@ -2,8 +2,7 @@
   "env": {
     "HICKEY_PRINCIPLES": "$HOME/.claude/hickey-principles.md",
     "UI_PRINCIPLES": "$HOME/.claude/ui-design-principles.md",
-    "TEAM_OPS_REPO": "/home/you/projects/team-ops",
-    "CLAUDE_CODE_NO_FLICKER": "1"
+    "TEAM_OPS_REPO": "/home/you/projects/team-ops"
   },
   "attribution": {
     "commit": "",
@@ -73,7 +72,7 @@
     ],
     "defaultMode": "dontAsk"
   },
-  "model": "opus",
+  "model": "sonnet",
   "enabledMcpjsonServers": [
     "team"
   ],
@@ -96,7 +95,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'POST-COMPACTION CONTEXT: Enter plan mode for non-trivial tasks. Update tasks/lessons.md after corrections. Verify before marking complete. Simplicity first \u2014 no premature abstractions. Check tasks/todo.md for current progress.'"
+            "command": "echo 'POST-COMPACTION CONTEXT: Enter plan mode for non-trivial tasks. Update tasks/lessons.md after corrections. Verify before marking complete. Simplicity first — no premature abstractions. Check tasks/todo.md for current progress.'"
           }
         ]
       }
