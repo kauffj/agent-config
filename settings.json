@@ -72,7 +72,7 @@
     ],
     "defaultMode": "dontAsk"
   },
-  "model": "opus",
+  "model": "best",
   "enabledMcpjsonServers": [
     "team"
   ],
