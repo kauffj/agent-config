@@ -65,6 +65,13 @@ end
 -- ---------------------------------------------------------------------------
 local pane_state = {}
 
+-- The wait gradient is normalized against a MOVING ceiling: max(WAIT_FLOOR_S, the
+-- longest current wait). So the reddest tab is always the most-neglected one
+-- relative to the rest, and nothing maxes out before the 2h floor when every wait
+-- is still recent. update-status recomputes wait_norm ~1/sec from pane_state.
+local WAIT_FLOOR_S = 7200            -- 2h: gradient never fully burns before this
+local wait_norm = WAIT_FLOOR_S
+
 local function read_json_file(path)
   local f = io.open(path, 'r')
   if not f then return nil end
@@ -85,6 +92,16 @@ wezterm.on('update-status', function(window, pane)
   end
   pane_state = fresh
 
+  -- Recompute the gradient ceiling: the longest active wait, floored at WAIT_FLOOR_S.
+  local now, longest = os.time(), 0
+  for _, s in pairs(fresh) do
+    if s.status == 'waiting' and s.since then
+      local a = now - s.since
+      if a > longest then longest = a end
+    end
+  end
+  wait_norm = math.max(WAIT_FLOOR_S, longest)
+
   -- Cache the tab-bar width (in cells) so format-tab-title can pad tabs to fill
   -- it. The bar width isn't passed to that event, and WezTerm's retro bar won't
   -- stretch tabs on its own (wezterm/wezterm#7702), so we size them ourselves.
@@ -95,13 +112,55 @@ wezterm.on('update-status', function(window, pane)
   end
 end)
 
--- Color escalates with wait age: yellow -> orange -> red(bold). Working = normal.
+-- Wait escalation is a continuous gradient over wait age, not hard steps. Stops
+-- run coolest (just started waiting) -> burning, and we interpolate between them
+-- for a granular ramp. {pos 0..1, r, g, b}.
+local WAIT_STOPS = {
+  { 0.00, 0x3d, 0x5a, 0x55 },  -- calm teal-grey: just asked, low urgency
+  { 0.22, 0x4f, 0x80, 0x57 },  -- green
+  { 0.42, 0x84, 0xa3, 0x44 },  -- green-yellow
+  { 0.58, 0xc2, 0xb3, 0x4a },  -- yellow
+  { 0.74, 0xd6, 0x8a, 0x2e },  -- orange
+  { 0.88, 0xcc, 0x52, 0x2e },  -- red-orange
+  { 1.00, 0x9c, 0x16, 0x16 },  -- deep red: burning
+}
+
+-- Ease-in exponent (>1) keeps the FIRST stretch slow ("slow start") before the
+-- ramp accelerates toward red. The ceiling it ramps against is the dynamic
+-- wait_norm (see above), not a fixed duration.
+local WAIT_GAMMA = 1.5
+
+local function lerp(a, b, f) return a + (b - a) * f end
+local function hex2(n) return string.format('%02x', math.min(255, math.max(0, math.floor(n + 0.5)))) end
+
+-- Interpolate the stops at position t (0..1) -> { bg, fg, bold }.
+local function gradient_at(t)
+  t = math.min(1, math.max(0, t))
+  local lo, hi = WAIT_STOPS[1], WAIT_STOPS[#WAIT_STOPS]
+  for i = 1, #WAIT_STOPS - 1 do
+    if t >= WAIT_STOPS[i][1] and t <= WAIT_STOPS[i + 1][1] then
+      lo, hi = WAIT_STOPS[i], WAIT_STOPS[i + 1]
+      break
+    end
+  end
+  local span = hi[1] - lo[1]
+  local f = span > 0 and (t - lo[1]) / span or 0
+  local r, g, b = lerp(lo[2], hi[2], f), lerp(lo[3], hi[3], f), lerp(lo[4], hi[4], f)
+  -- Perceived luminance picks readable text; hot/deep stops get white.
+  local lum = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+  return {
+    bg = '#' .. hex2(r) .. hex2(g) .. hex2(b),
+    fg = lum > 0.6 and '#1a1a1a' or '#ffffff',
+    bold = t >= 0.85,
+  }
+end
+
+-- Working = normal (nil). Waiting = a gradient color keyed on this tab's wait age
+-- relative to the current ceiling (longest wait, floored at 2h).
 local function wait_colors(st)
   if not st or st.status ~= 'waiting' or not st.since then return nil end
-  local age = os.time() - st.since
-  if age >= 600 then return { bg = '#cc2222', fg = '#ffffff', bold = true } end
-  if age >= 120 then return { bg = '#cc7722', fg = '#ffffff', bold = false } end
-  return { bg = '#b8a500', fg = '#1a1a1a', bold = false }
+  local age = math.max(0, os.time() - st.since)
+  return gradient_at((age / wait_norm) ^ WAIT_GAMMA)
 end
 
 local function trunc(s, n)
