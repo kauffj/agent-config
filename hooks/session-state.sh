@@ -14,7 +14,7 @@
 # Status is derived from the event, not passed as an arg, so every event wires to
 # this one script. Renderers (picker, statusline, tab bar) compute idle/urgency
 # *tiers* from the age of `since`; this hook records only the discrete state.
-# Supersedes hooks/tab-title.sh (folds in its label + subagent-guard logic).
+# Owns the tab title outright: the per-session label + subagent-guard logic.
 
 # Base dir via a variable so the runtime paths below (state/, sound-off flags)
 # aren't read as shipped-config references by lib/doctor.mjs, which flags any
