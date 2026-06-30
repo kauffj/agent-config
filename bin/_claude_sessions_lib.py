@@ -9,12 +9,18 @@ session id from the process argv (--resume / --session-id / -r).
 import glob
 import json
 import os
+import time
 from datetime import datetime
 
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.path.join(HOME, ".claude")
 REGISTRY_DIR = os.path.join(CLAUDE_DIR, "sessions")
 PROJECTS_DIR = os.path.join(CLAUDE_DIR, "projects")
+SNAPSHOT = os.path.join(CLAUDE_DIR, "sessions-snapshot.json")
+# Pre-crash high-water set, written by claude-snapshot on a "cliff" (mass session
+# death) and never clobbered by the timer's honest-state writes. The durable record
+# a freeze can't erase before you restore. See claude-snapshot and resume_set().
+RECOVERY_SNAP = os.path.join(CLAUDE_DIR, "sessions-recovery.json")
 
 
 def pid_alive(pid):
@@ -277,3 +283,65 @@ def recent_transcript_sessions(limit=12, exclude=()):
         out.append({"sessionId": sid, "cwd": cwd,
                     "status": "reconstructed", "source": "transcripts"})
     return out
+
+
+def transcript_exists(sid, cwd):
+    """True if cwd's transcript dir holds <sid>.jsonl — the file `claude --resume`
+    needs. A session whose transcript was rolled back by a freeze fails to resume
+    ('No conversation found'); filtering on this keeps such ids from spawning dead
+    tabs. Run claude-restore-transcripts first to pull any survivor out of backup."""
+    if not sid or not cwd:
+        return False
+    return os.path.isfile(os.path.join(_project_dir(cwd), sid + ".jsonl"))
+
+
+def _snap_meta(path):
+    try:
+        with open(path) as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def resume_set(snap_path=SNAPSHOT, recovery_max_age_h=12):
+    """Sessions to reopen after a restart, ready for `claude --resume`.
+
+    Unions the live snapshot with any pre-crash set preserved in the recovery
+    file (a freeze can wipe the live snapshot before you restore, so the recovery
+    file is the durable high-water record the snapshot timer is forbidden to
+    clobber). Deduped by id, snapshot first; excludes sessions that are already
+    live or whose transcript no longer exists on disk (so a rolled-back id never
+    spawns a dead 'No conversation found' tab). Returns [{sessionId, cwd}]."""
+    live = set(live_sessions())
+    sources = [_snap_meta(snap_path).get("sessions", [])]
+    rec = _snap_meta(RECOVERY_SNAP)
+    preserved = rec.get("preservedAt", 0)
+    if rec.get("sessions") and preserved and \
+            (time.time() - preserved) <= recovery_max_age_h * 3600:
+        sources.append(rec["sessions"])
+    out, seen = [], set()
+    for src in sources:
+        for s in src:
+            sid, cwd = s.get("sessionId"), s.get("cwd")
+            if not sid or not cwd or sid in seen or sid in live:
+                continue
+            if not (os.path.isdir(cwd) and transcript_exists(sid, cwd)):
+                continue
+            seen.add(sid)
+            out.append({"sessionId": sid, "cwd": cwd})
+    return out
+
+
+def clear_recovery():
+    """Consume the recovery file after a successful restore — archive (don't
+    delete) into backups/ so it can't re-suggest the same set on the next run."""
+    if not os.path.exists(RECOVERY_SNAP):
+        return
+    dest_dir = os.path.join(CLAUDE_DIR, "backups")
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        os.replace(RECOVERY_SNAP,
+                   os.path.join(dest_dir, "sessions-recovery.consumed.json"))
+    except OSError:
+        pass

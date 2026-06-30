@@ -1,45 +1,37 @@
 #!/usr/bin/env python3
 """Reopen previously-live Claude sessions as WezTerm tabs (post-restart).
 
-Reads the last snapshot (bin/claude-snapshot writes it every 60s) and spawns a
-WezTerm tab running `claude --resume <sid>` for each session that isn't already
-live. The Tilix equivalent was bin/claude-resume-all; this is the WezTerm flavor.
-Run from inside WezTerm (it uses `wezterm cli spawn`).
+The canonical, default restore command (WezTerm). Takes the resume set —
+the snapshot bin/claude-snapshot writes every 60s, unioned with any pre-crash
+sessions preserved in sessions-recovery.json, minus sessions already live or
+whose transcript is gone — and spawns a WezTerm tab running `claude --resume
+<sid>` for each. Run from inside WezTerm (it uses `wezterm cli spawn`). The
+Tilix flavor is the legacy bin/claude-resume-all.
 
-  claude-resume            reopen all non-live snapshot sessions as tabs
+  claude-resume            reopen all non-live resume-set sessions as tabs
   claude-resume --dry-run  print what would be spawned, do nothing
 """
-import json
 import os
 import shutil
 import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from _claude_sessions_lib import live_sessions, CLAUDE_DIR  # noqa: E402
-
-SNAP = os.path.join(CLAUDE_DIR, "sessions-snapshot.json")
+from _claude_sessions_lib import resume_set, clear_recovery  # noqa: E402
 
 
 def main():
     dry = "--dry-run" in sys.argv
-    try:
-        with open(SNAP) as f:
-            snap = json.load(f)
-    except (OSError, ValueError):
-        print("no readable snapshot at %s" % SNAP)
-        sys.exit(1)
-
-    live = set(live_sessions())
-    todo = [s for s in snap.get("sessions", [])
-            if s.get("sessionId") and s.get("cwd") and s["sessionId"] not in live]
+    todo = resume_set()
     if not todo:
-        print("nothing to resume (snapshot sessions already live, or snapshot empty)")
+        print("nothing to resume (resume-set sessions already live, or none on disk)")
         return
     if not dry and not shutil.which("wezterm"):
-        print("wezterm not on PATH — run this from inside WezTerm")
+        print("wezterm not on PATH — run this from inside WezTerm "
+              "(or use claude-resume-all for tilix)")
         sys.exit(1)
 
+    spawned = 0
     for s in todo:
         sid, cwd = s["sessionId"], s["cwd"]
         if dry:
@@ -50,8 +42,14 @@ def main():
              "bash", "-lic", "claude --resume %s; exec bash" % sid],
             capture_output=True, text=True)
         ok = r.returncode == 0
+        spawned += ok
         print("%s %s  %s%s" % ("spawned" if ok else "FAILED ", sid[:8], cwd,
                                "" if ok else "  :: " + r.stderr.strip()))
+
+    # Consume the recovery point once we've actually brought everything back, so
+    # the next run doesn't re-suggest the same set. Keep it if any spawn failed.
+    if not dry and spawned == len(todo):
+        clear_recovery()
 
 
 if __name__ == "__main__":

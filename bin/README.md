@@ -4,7 +4,10 @@ Two jobs:
 1. **Durability** — make sure a hard reboot/freeze can't destroy session
    transcripts (it could, and did, on 2026-06-24).
 2. **Resurrection** — bring back the sessions that were open when the machine
-   shut down, as native **tilix** tabs, each resumed to its exact conversation.
+   shut down, as native terminal tabs, each resumed to its exact conversation.
+   **WezTerm is the default** (`claude-resume`, spawns tabs in the current
+   window); the Tilix flavor (`claude-resume-all`, one window per project) is
+   the legacy fallback for when you're not in WezTerm.
 
 ## Durability (the data-loss guard)
 
@@ -34,20 +37,40 @@ shrink the window system-wide.)
   - **Boot-grace guard:** for the first 15 min after boot the snapshot may not
     *shrink* — so a post-boot run can't overwrite the pre-crash set before you
     restore it. (This was the second half of the 2026-06-24 failure.)
-- **`claude-resume-all`** — the on-demand restore command. Reads the latest snapshot,
-  skips sessions already running, groups the rest by project, and opens one tilix
-  window per project with each session a tab running `claude --resume <id>`. Launches
-  sequentially and **verifies each session actually comes up** (retrying once and
-  reporting failures) — an earlier version fired tabs at the tilix server faster than
-  it could accept them and silently dropped some.
+  - **Cliff guard:** boot grace only fires on a real *reboot*. A suspend-resume
+    freeze (or X/terminal crash) leaves boot time untouched, so the next tick
+    would overwrite the pre-freeze snapshot — it did, on 2026-06-30, costing a
+    session. When the live set drops by ≥3 between two ticks (a mass death,
+    unlike closing tabs one at a time), the pre-cliff set is copied to
+    `~/.claude/sessions-recovery.json`, which the timer **never** clobbers.
+- **`sessions-recovery.json`** — the durable high-water record from the cliff
+  guard. The resume commands union it into their set, so a session that vanished
+  from the live snapshot is still reopened. It's archived to `backups/` once a
+  restore brings everything back, and ignored after 12 h so it can't go stale.
+- **`claude-resume`** (default, WezTerm) — the on-demand restore command. Takes
+  the resume set (snapshot ∪ recovery, minus sessions already live or whose
+  transcript is gone) and spawns a `claude --resume <id>` tab per session via
+  `wezterm cli spawn`. Run it from inside WezTerm.
+- **`claude-resume-all`** (legacy, Tilix) — same resume set, but groups by project
+  and opens one tilix window per project. Launches sequentially and **verifies each
+  session actually comes up** (retrying once and reporting failures) — an earlier
+  version fired tabs at the tilix server faster than it could accept them and
+  silently dropped some. Use when you're not in WezTerm.
+
+Both skip any session whose transcript no longer exists, so a rolled-back id never
+spawns a dead "No conversation found" tab — run `claude-restore-transcripts` first
+to pull survivors out of backup.
 
 ## Usage
 
 ```sh
-# after a freeze:
+# after a freeze (from inside WezTerm):
 claude-restore-transcripts        # put back any transcript that got rolled back
-claude-resume-all                 # reopen everything that isn't already running
+claude-resume                     # reopen everything that isn't already running, as tabs
+claude-resume --dry-run           # show what it would open
 
+# legacy Tilix flavor (not in WezTerm):
+claude-resume-all                           # one window per project
 claude-resume-all --dry-run                 # show what it would open
 claude-resume-all --single-window           # all tabs in one window
 claude-resume-all --snapshot ~/.claude/sessions-snapshot.prev.json   # use the backup snapshot

@@ -13,19 +13,33 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from _claude_sessions_lib import CLAUDE_DIR, boot_epoch, live_sessions  # noqa: E402
+from _claude_sessions_lib import (  # noqa: E402
+    CLAUDE_DIR, RECOVERY_SNAP, boot_epoch, live_sessions,
+)
 
 OUT = os.path.join(CLAUDE_DIR, "sessions-snapshot.json")
 PREV = os.path.join(CLAUDE_DIR, "sessions-snapshot.prev.json")
 BOOT_GRACE = 15 * 60  # seconds after boot during which the snapshot may not shrink
+CLIFF_MIN_PREV = 3    # only a "cliff" if we previously tracked at least this many
+CLIFF_DROP = 3        # ...and lost at least this many between two 60s ticks
+RECOVERY_TTL = 12 * 60 * 60  # don't downgrade a recovery point newer than this
 
 
-def _existing_count():
+def _read(path):
     try:
-        with open(OUT) as f:
-            return len(json.load(f).get("sessions", []))
+        with open(path) as f:
+            return json.load(f)
     except (OSError, ValueError):
-        return 0
+        return None
+
+
+def _atomic_write(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 def main():
@@ -35,6 +49,33 @@ def main():
     )
     data = {"capturedAt": int(time.time()), "sessions": sessions}
 
+    existing = _read(OUT) or {}
+    prev_count = len(existing.get("sessions", []))
+    cur_count = len(sessions)
+
+    # Cliff guard. A freeze/crash/X-restart kills many sessions at once, between
+    # two ticks — unlike closing tabs one at a time. The boot-grace guard below
+    # only covers a real *reboot*; a suspend-resume freeze leaves boot time
+    # untouched, so without this the very next tick overwrites the pre-freeze
+    # snapshot (it did, on 2026-06-30 — cost a session). On a cliff, copy the
+    # pre-cliff set into a recovery file the timer never clobbers, so an
+    # on-demand resume still finds the sessions that died. The honest snapshot
+    # below still updates; restore is on-demand, so a stale recovery point is
+    # never reopened uninvited and is consumed (archived) on the next restore.
+    if prev_count >= CLIFF_MIN_PREV and (prev_count - cur_count) >= CLIFF_DROP:
+        rec = _read(RECOVERY_SNAP) or {}
+        rec_count = len(rec.get("sessions", []))
+        rec_age = int(time.time()) - rec.get("preservedAt", 0)
+        if prev_count > rec_count or rec_age > RECOVERY_TTL:
+            _atomic_write(RECOVERY_SNAP, {
+                "capturedAt": existing.get("capturedAt", int(time.time())),
+                "preservedAt": int(time.time()),
+                "sessions": existing.get("sessions", []),
+            })
+            if "-v" in sys.argv or "--verbose" in sys.argv:
+                print(f"cliff: preserved {prev_count} pre-crash session(s) "
+                      f"-> {RECOVERY_SNAP}")
+
     # Crash recovery hinges on the pre-shutdown snapshot surviving the reboot.
     # Right after boot, sessions haven't been reopened yet, so a plain overwrite
     # would replace the real set with a near-empty one (and rotate away .prev
@@ -43,10 +84,10 @@ def main():
     # restore is on-demand — a preserved larger set is never reopened uninvited.
     btime = boot_epoch()
     if (btime is not None and (int(time.time()) - btime) < BOOT_GRACE
-            and len(sessions) < _existing_count()):
+            and cur_count < prev_count):
         if "-v" in sys.argv or "--verbose" in sys.argv:
             print(f"boot grace: keeping existing snapshot "
-                  f"({_existing_count()} session(s)) over current {len(sessions)}")
+                  f"({prev_count} session(s)) over current {cur_count}")
         return
 
     if os.path.exists(OUT):
@@ -54,10 +95,7 @@ def main():
             os.replace(OUT, PREV)
         except OSError:
             pass
-    tmp = OUT + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, indent=2)
-    os.replace(tmp, OUT)
+    _atomic_write(OUT, data)
 
     if "-v" in sys.argv or "--verbose" in sys.argv:
         print(f"captured {len(sessions)} session(s) -> {OUT}")

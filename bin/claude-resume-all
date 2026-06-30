@@ -25,7 +25,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from _claude_sessions_lib import (  # noqa: E402
-    CLAUDE_DIR, live_sessions, recent_transcript_sessions,
+    CLAUDE_DIR, clear_recovery, live_sessions, recent_transcript_sessions,
+    resume_set,
 )
 
 SNAP = os.path.join(CLAUDE_DIR, "sessions-snapshot.json")
@@ -104,8 +105,11 @@ def main():
         # crowd out genuine candidates from the N most-recent slots.
         sessions = recent_transcript_sessions(limit=limit + len(live) + 4,
                                               exclude=live)[:limit]
-    else:
+    elif "--snapshot" in argv:
         sessions = load_snapshot(snap_path)
+    else:
+        # Default: snapshot ∪ pre-crash recovery set, dead transcripts dropped.
+        sessions = resume_set()
 
     todo, skipped = [], 0
     for s in sessions:
@@ -186,6 +190,13 @@ def main():
         print(f"Could not open {len(failed)} — resume manually:")
         for cwd, sid in failed:
             print(f"  (cd {shlex.quote(cwd)} && claude --resume {sid})")
+
+    # Consume the recovery point once everything's back (skip if any failed, so a
+    # retry can still see it). Only for the default source — explicit --snapshot/
+    # --from-transcripts runs aren't the post-crash restore the recovery file is for.
+    if not failed and not dry and "--snapshot" not in argv \
+            and "--from-transcripts" not in argv:
+        clear_recovery()
 
 
 if __name__ == "__main__":
