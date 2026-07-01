@@ -65,11 +65,27 @@ end
 -- ---------------------------------------------------------------------------
 local pane_state = {}
 
--- The wait gradient is normalized against a MOVING ceiling: max(WAIT_FLOOR_S, the
--- longest current wait). So the reddest tab is always the most-neglected one
--- relative to the rest, and nothing maxes out before the 2h floor when every wait
--- is still recent. update-status recomputes wait_norm ~1/sec from pane_state.
-local WAIT_FLOOR_S = 7200            -- 2h: gradient never fully burns before this
+-- Wait ages run on an AWAKE clock that freezes during suspend/downtime, so
+-- resuming the machine preserves each tab's color instead of inflating every wait
+-- by the time you were away. `awake` accumulates real seconds between
+-- update-status ticks but ignores any gap longer than AWAKE_GAP_CAP (a suspend or
+-- a clock jump). wait_awake_start[session_id] = the awake value when that session's
+-- current wait began; its age is `awake - start`. The gradient is then normalized
+-- against a MOVING ceiling, max(WAIT_FLOOR_S, longest current wait), so the reddest
+-- tab is always the most-neglected relative to the rest and nothing maxes before 2h.
+--
+-- Keyed by SESSION_ID (stable across restarts; pane ids are not) and persisted to
+-- WAIT_CACHE, so relative coloring survives a full REBOOT too: `awake` resumes from
+-- its saved value, freezing the reboot's downtime just like a suspend's. Best
+-- effort — a missing/garbled cache just means a calm fresh start.
+local WAIT_FLOOR_S  = 7200           -- 2h floor for the gradient ceiling
+local AWAKE_GAP_CAP = 120            -- inter-tick gap over this = suspend; not counted
+local WAIT_CACHE    = HOME .. '/.cache/wezterm-fleet-wait.json'
+local SAVE_EVERY    = 15             -- persist the awake clock at most this often (s)
+local awake = 0
+local awake_last = nil
+local last_save = 0
+local wait_awake_start = {}
 local wait_norm = WAIT_FLOOR_S
 
 local function read_json_file(path)
@@ -82,33 +98,92 @@ local function read_json_file(path)
   return nil
 end
 
+-- Restore the awake clock + per-session wait starts from the last run, so the wait
+-- gradient picks up where it left off after a reboot. Best-effort and guarded.
+do
+  local cached = read_json_file(WAIT_CACHE)
+  if cached then
+    awake = tonumber(cached.awake) or 0
+    last_save = awake
+    if type(cached.starts) == 'table' then wait_awake_start = cached.starts end
+  end
+end
+
+local function save_wait_cache()
+  local ok, body = pcall(wezterm.json_encode, { awake = awake, starts = wait_awake_start })
+  if not ok then return end
+  local f = io.open(WAIT_CACHE, 'w')
+  if f then f:write(body); f:close() end
+end
+
 wezterm.on('update-status', function(window, pane)
-  local fresh = {}
+  -- Advance the awake clock, freezing any gap big enough to be a suspend.
+  local now = os.time()
+  local delta = awake_last and (now - awake_last) or 0
+  if delta < 0 or delta > AWAKE_GAP_CAP then delta = 0 end
+  awake = awake + delta
+  awake_last = now
+
+  -- The set of pane ids that are actually OPEN right now (active pane of every tab
+  -- across all windows). The gradient ceiling is computed only over these, so
+  -- lingering orphan state files from dead sessions can't blow out the scale.
+  -- If the mux walk fails, `live` stays empty and we fall back to counting all.
+  local live = {}
+  pcall(function()
+    for _, w in ipairs(wezterm.mux.all_windows()) do
+      for _, t in ipairs(w:tabs()) do
+        local ap = t:active_pane()
+        if ap then live[tostring(ap:pane_id())] = true end
+      end
+    end
+  end)
+  local restrict = next(live) ~= nil
+
+  -- Rebuild pane_state (keyed by pane id, for render lookup), computing each
+  -- waiting session's downtime-free age and the longest OPEN wait (the ceiling).
+  -- Wait-starts are keyed by session_id so they survive pane-id churn across reboots.
+  local fresh, longest, seen = {}, 0, {}
   for _, path in ipairs(wezterm.glob(HOME .. '/.claude/state/*.json')) do
     local d = read_json_file(path)
     if d and d.wezterm_pane then
-      fresh[tostring(d.wezterm_pane)] = { status = d.status, since = d.since }
+      local pane_id = tostring(d.wezterm_pane)
+      local sid = tostring(d.session_id or d.since or pane_id)
+      local age = 0
+      if d.status == 'waiting' and d.since then
+        local w = wait_awake_start[sid]
+        if not w or w.since ~= d.since then        -- a new wait (or `since` changed)
+          -- Seed from the REAL wall age so an existing spread of waits keeps its
+          -- relative order on first sight (fresh start / reboot), instead of every
+          -- tab collapsing to age 0. From here the awake clock freezes downtime.
+          w = { since = d.since, start = awake - math.max(0, now - d.since) }
+          wait_awake_start[sid] = w
+        end
+        seen[sid] = true
+        age = math.max(0, awake - w.start)
+        if age > longest and (not restrict or live[pane_id]) then longest = age end
+      end
+      fresh[pane_id] = { status = d.status, since = d.since, age = age }
     end
   end
   pane_state = fresh
-
-  -- Recompute the gradient ceiling: the longest active wait, floored at WAIT_FLOOR_S.
-  local now, longest = os.time(), 0
-  for _, s in pairs(fresh) do
-    if s.status == 'waiting' and s.since then
-      local a = now - s.since
-      if a > longest then longest = a end
-    end
-  end
   wait_norm = math.max(WAIT_FLOOR_S, longest)
+
+  -- Forget awake-start for sessions no longer waiting; persist on the throttle.
+  for sid in pairs(wait_awake_start) do
+    if not seen[sid] then wait_awake_start[sid] = nil end
+  end
+  if awake - last_save >= SAVE_EVERY then
+    last_save = awake
+    save_wait_cache()
+  end
 
   -- Cache the tab-bar width (in cells) so format-tab-title can pad tabs to fill
   -- it. The bar width isn't passed to that event, and WezTerm's retro bar won't
   -- stretch tabs on its own (wezterm/wezterm#7702), so we size them ourselves.
   -- pane:get_dimensions().cols == window text width for unsplit tabs (ours).
-  local ok, d = pcall(function() return pane:get_dimensions() end)
-  if ok and d and d.cols and d.cols > 0 then
-    wezterm.GLOBAL.bar_cols = d.cols
+  local ok, dim = pcall(function() return pane:get_dimensions() end)
+  if ok and dim and dim.cols and dim.cols > 0 then
+    wezterm.GLOBAL.bar_cols = dim.cols
   end
 end)
 
@@ -125,10 +200,11 @@ local WAIT_STOPS = {
   { 1.00, 0x9c, 0x16, 0x16 },  -- deep red: burning
 }
 
--- Ease-in exponent (>1) keeps the FIRST stretch slow ("slow start") before the
--- ramp accelerates toward red. The ceiling it ramps against is the dynamic
--- wait_norm (see above), not a fixed duration.
-local WAIT_GAMMA = 1.5
+-- Ease-in exponent (>1) keeps the FIRST stretch slow ("slow start"). It's applied
+-- on top of a LOGARITHMIC age scale (see wait_colors) so that minutes, hours, and
+-- days each get their own slice of the gradient — otherwise a few days-old waits
+-- blow out a linear scale and crush every recent tab into the same calm color.
+local WAIT_GAMMA = 1.8
 
 local function lerp(a, b, f) return a + (b - a) * f end
 local function hex2(n) return string.format('%02x', math.min(255, math.max(0, math.floor(n + 0.5)))) end
@@ -155,12 +231,14 @@ local function gradient_at(t)
   }
 end
 
--- Working = normal (nil). Waiting = a gradient color keyed on this tab's wait age
--- relative to the current ceiling (longest wait, floored at 2h).
+-- Working = normal (nil). Waiting = a gradient on this tab's AWAKE wait age
+-- (precomputed in update-status, so downtime never counts) on a LOG scale relative
+-- to the current ceiling (longest wait, floored at 2h). Log scale spreads a
+-- minutes-to-days range across the palette instead of bunching it at the cool end.
 local function wait_colors(st)
-  if not st or st.status ~= 'waiting' or not st.since then return nil end
-  local age = math.max(0, os.time() - st.since)
-  return gradient_at((age / wait_norm) ^ WAIT_GAMMA)
+  if not st or st.status ~= 'waiting' or not st.age then return nil end
+  local frac = math.log(1 + st.age) / math.log(1 + wait_norm)
+  return gradient_at(frac ^ WAIT_GAMMA)
 end
 
 local function trunc(s, n)
@@ -224,7 +302,11 @@ wezterm.on('format-tab-title', function(tab, tabs, panes, conf, hover, max_width
   local idx = tab.tab_index + 1
   local pt = tab.active_pane and tab.active_pane.title or ''
   local st = tab.active_pane and pane_state[tostring(tab.active_pane.pane_id)] or nil
-  local c = wait_colors(st)
+  -- The pane's LIVE title is authoritative for waiting-vs-working (● suffix), so
+  -- we only trust a wait color when it's actually present. Pane ids get reused and
+  -- dead sessions' state files linger, so pane_state alone can hand a working tab a
+  -- stale wait color from a long-gone session that once held this pane id.
+  local c = pt:match('●%s*$') and wait_colors(st) or nil
 
   -- Divide the bar into shares so every tab's width sums to ~full width. Reserve
   -- a couple cols of safety so we undershoot (a tiny gap) rather than overshoot
