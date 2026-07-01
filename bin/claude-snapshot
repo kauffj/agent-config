@@ -7,6 +7,7 @@ or crash — there is a durable record of which sessions were open, for `claude-
 to bring back. The snapshot reflects honest current state (it may be empty if nothing
 is running); restore is on-demand, so a stale set is never re-opened uninvited.
 """
+import glob
 import json
 import os
 import sys
@@ -42,9 +43,34 @@ def _atomic_write(path, data):
     os.replace(tmp, path)
 
 
+def _reap_dead_state(live_ids):
+    """Piggyback dead-session-state cleanup on this 60s timer. A state file at
+    ~/.claude/state/<session_id>.json is garbage once its session is no longer
+    live — it otherwise skews the fleet tab bar's wait gradient and collides with
+    reused WezTerm pane ids. Session liveness (not pane liveness) is the right
+    signal: it catches orphans that never recorded a pane too. A session that
+    reappears regenerates its file on the next hook, so an over-eager reap
+    self-heals. Guarded, and never mass-deletes on an empty/failed liveness read,
+    so it can't disturb the snapshot below."""
+    if not live_ids:
+        return
+    try:
+        for f in glob.glob(os.path.join(CLAUDE_DIR, "state", "*.json")):
+            if os.path.basename(f)[:-5] not in live_ids:
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
 def main():
+    live = live_sessions()
+    _reap_dead_state(set(live))
+
     sessions = sorted(
-        live_sessions().values(),
+        live.values(),
         key=lambda s: (s.get("cwd") or "", s["sessionId"]),
     )
     data = {"capturedAt": int(time.time()), "sessions": sessions}
