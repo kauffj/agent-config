@@ -72,7 +72,7 @@
     ],
     "defaultMode": "dontAsk"
   },
-  "model": "best",
+  "model": "sonnet",
   "enabledMcpjsonServers": [
     "team"
   ],
@@ -189,5 +189,6 @@
   "effortLevel": "high",
   "tui": "default",
   "skipDangerousModePermissionPrompt": true,
-  "skipWorkflowUsageWarning": true
+  "skipWorkflowUsageWarning": true,
+  "agentPushNotifEnabled": true
 }
