@@ -432,10 +432,13 @@ local function session_picker(window, pane)
   local choices, pane_by_id, cwd_by_id = {}, {}, {}
   for _, r in ipairs(recs) do
     local grp = r.group and (' [' .. r.group .. ']') or ''
+    -- Topic (Claude's ai-title) is what tells two same-project/same-branch
+    -- sessions apart, so it's the last, widest column and also feeds fuzzy match.
+    local topic = (r.topic and r.topic ~= '') and ('  ' .. r.topic) or ''
     table.insert(choices, {
       id = r.session_id,
-      label = string.format('%s  %-28s %5s  %s%s', r.glyph or '·', r.label or r.session_id,
-        r.age_str or '', r.project or '', grp),
+      label = string.format('%s  %-20s %5s  %-15s%s%s', r.glyph or '·', r.label or r.session_id,
+        r.age_str or '', r.project or '', topic, grp),
     })
     pane_by_id[r.session_id] = r.wezterm_pane
     cwd_by_id[r.session_id] = r.cwd

@@ -12,13 +12,14 @@ Usage:
   claude-sessions --group    table grouped by `group`
 """
 import json
+import math
 import os
 import subprocess
 import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from _claude_sessions_lib import live_sessions, CLAUDE_DIR  # noqa: E402
+from _claude_sessions_lib import live_sessions, CLAUDE_DIR, _project_dir  # noqa: E402
 
 STATE_DIR = os.path.join(CLAUDE_DIR, "state")
 META_DIR = os.path.join(CLAUDE_DIR, "meta")
@@ -30,6 +31,30 @@ def _load(path):
             return json.load(f)
     except (OSError, ValueError):
         return {}
+
+
+def _topic(sid, cwd, limit=44):
+    """Claude Code's generated session title, so same-project/same-branch sessions
+    are distinguishable by what they're actually about. Read from the first
+    'ai-title' event in the transcript (set early, so we can stop there and keep
+    picker latency low). Empty string if the transcript has none yet."""
+    if not cwd:
+        return ""
+    path = os.path.join(_project_dir(cwd), sid + ".jsonl")
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if '"ai-title"' not in line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if ev.get("type") == "ai-title" and ev.get("aiTitle"):
+                    return ev["aiTitle"].strip()[:limit]
+    except OSError:
+        return ""
+    return ""
 
 
 def _git_branch(cwd):
@@ -54,14 +79,22 @@ def _label(sid, cwd, branch):
     return "%s ·%s" % (base, sid[:4])
 
 
-def _glyph(status, age):
-    if status == "waiting":
-        if age >= 600:
-            return "\U0001F534"   # 🔴  waiting >10m
-        if age >= 120:
-            return "\U0001F7E1"   # 🟡  waiting >2m
-        return "⏳"           # ⏳  waiting
-    return "·"               # ·   working
+def _glyph(status, age, ceiling):
+    """Graduated urgency, matching the tab bar's relative model instead of turning
+    everything red after 10 minutes: band a log-scaled fraction of `ceiling`
+    (= max(2h, longest current wait)) into green -> yellow -> orange -> red."""
+    if status != "waiting":
+        return "·"                    # · working
+    if age <= 0 or ceiling <= 1:
+        return "\U0001F7E2"           # 🟢
+    t = (math.log(1 + age) / math.log(1 + ceiling)) ** 1.8
+    if t >= 0.80:
+        return "\U0001F534"           # 🔴 red    — most neglected
+    if t >= 0.55:
+        return "\U0001F7E0"           # 🟠 orange
+    if t >= 0.30:
+        return "\U0001F7E1"           # 🟡 yellow
+    return "\U0001F7E2"               # 🟢 green   — recent
 
 
 def _age_str(age):
@@ -81,7 +114,7 @@ def _urgency(status, age, priority):
 def records():
     live = live_sessions()
     now = time.time()
-    out = []
+    out, maxwait = [], 0
     for sid, info in live.items():
         cwd = info.get("cwd") or ""
         st = _load(os.path.join(STATE_DIR, "%s.json" % sid))
@@ -89,6 +122,8 @@ def records():
         status = st.get("status") or "working"
         since = st.get("since")
         age = int(now - since) if since else 0
+        if status == "waiting" and age > maxwait:
+            maxwait = age
         priority = int(meta.get("priority", 0) or 0)
         branch = _git_branch(cwd)
         out.append({
@@ -97,18 +132,22 @@ def records():
             "project": os.path.basename(cwd) if cwd else "",
             "branch": branch,
             "label": meta.get("label") or _label(sid, cwd, branch),
+            "topic": _topic(sid, cwd),
             "pid": info.get("pid"),
             "source": info.get("source"),
             "status": status,
             "since": since,
             "age": age,
             "age_str": _age_str(age),
-            "glyph": _glyph(status, age),
+            "glyph": None,   # filled below, once the relative ceiling is known
             "group": meta.get("group"),
             "priority": priority,
             "wezterm_pane": st.get("wezterm_pane"),
             "urgency": _urgency(status, age, priority),
         })
+    ceiling = max(7200, maxwait)   # 2h floor, else the longest current wait
+    for r in out:
+        r["glyph"] = _glyph(r["status"], r["age"], ceiling)
     out.sort(key=lambda r: (-r["urgency"], r["project"]))
     return out
 
