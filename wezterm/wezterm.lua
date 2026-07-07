@@ -429,17 +429,27 @@ local function session_picker(window, pane)
   if not recs then window:toast_notification('fleet', err, nil, 4000); return end
   if #recs == 0 then window:toast_notification('fleet', 'no live sessions', nil, 3000); return end
 
+  -- Size the folder and label columns to their actual content (capped so one long
+  -- name can't blow out the row), so we use the width when it's there and stay
+  -- tight when it isn't — instead of truncating names that would have fit.
+  local fw, lw = 10, 6
+  for _, r in ipairs(recs) do
+    fw = math.max(fw, dispw(r.project or ''))
+    lw = math.max(lw, dispw(r.label or r.session_id or ''))
+  end
+  fw, lw = math.min(fw, 26), math.min(lw, 22)
+
   local choices, pane_by_id, cwd_by_id = {}, {}, {}
   for _, r in ipairs(recs) do
     local grp = r.group and (' [' .. r.group .. ']') or ''
     -- Columns are padded by DISPLAY width (fit/column_width), not bytes, so the
     -- 2-cell colored glyphs and the multibyte ·tags don't drift the alignment the
     -- way string.format's byte-based %-Ns padding does. Order leads with the FOLDER
-    -- (the real identity), then the branch/·tag, age, and finally the topic (widest,
-    -- untruncated) — which distinguishes same-project sessions and feeds fuzzy match.
+    -- (the real identity), then the branch/·tag, age, and finally the topic — kept
+    -- untruncated so it stays fully fuzzy-searchable and distinguishes siblings.
     local row = fit(r.glyph or '·', 2) .. ' '
-      .. fit(r.project or '', 16) .. ' '
-      .. fit(r.label or r.session_id, 14) .. ' '
+      .. fit(r.project or '', fw) .. ' '
+      .. fit(r.label or r.session_id, lw) .. ' '
       .. fit(r.age_str or '', 4) .. '  '
       .. (r.topic or '') .. grp
     table.insert(choices, { id = r.session_id, label = row })
