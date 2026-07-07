@@ -75,8 +75,12 @@ def _label(sid, cwd, branch):
             return open(lf).read().strip()
         except OSError:
             pass
-    base = branch or (os.path.basename(cwd) if cwd else sid[:8])
-    return "%s ·%s" % (base, sid[:4])
+    tag = "·%s" % sid[:4]
+    # main/master carry no signal — the folder is the real identity (its own
+    # column), so only lead with the branch when it's a meaningful feature branch.
+    if branch and branch.lower() not in ("main", "master"):
+        return "%s %s" % (branch, tag)
+    return tag
 
 
 def _glyph(status, age, ceiling):

@@ -432,14 +432,17 @@ local function session_picker(window, pane)
   local choices, pane_by_id, cwd_by_id = {}, {}, {}
   for _, r in ipairs(recs) do
     local grp = r.group and (' [' .. r.group .. ']') or ''
-    -- Topic (Claude's ai-title) is what tells two same-project/same-branch
-    -- sessions apart, so it's the last, widest column and also feeds fuzzy match.
-    local topic = (r.topic and r.topic ~= '') and ('  ' .. r.topic) or ''
-    table.insert(choices, {
-      id = r.session_id,
-      label = string.format('%s  %-20s %5s  %-15s%s%s', r.glyph or '·', r.label or r.session_id,
-        r.age_str or '', r.project or '', topic, grp),
-    })
+    -- Columns are padded by DISPLAY width (fit/column_width), not bytes, so the
+    -- 2-cell colored glyphs and the multibyte ·tags don't drift the alignment the
+    -- way string.format's byte-based %-Ns padding does. Order leads with the FOLDER
+    -- (the real identity), then the branch/·tag, age, and finally the topic (widest,
+    -- untruncated) — which distinguishes same-project sessions and feeds fuzzy match.
+    local row = fit(r.glyph or '·', 2) .. ' '
+      .. fit(r.project or '', 16) .. ' '
+      .. fit(r.label or r.session_id, 14) .. ' '
+      .. fit(r.age_str or '', 4) .. '  '
+      .. (r.topic or '') .. grp
+    table.insert(choices, { id = r.session_id, label = row })
     pane_by_id[r.session_id] = r.wezterm_pane
     cwd_by_id[r.session_id] = r.cwd
   end
