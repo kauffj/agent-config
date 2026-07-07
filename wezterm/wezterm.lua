@@ -181,9 +181,22 @@ wezterm.on('update-status', function(window, pane)
   -- it. The bar width isn't passed to that event, and WezTerm's retro bar won't
   -- stretch tabs on its own (wezterm/wezterm#7702), so we size them ourselves.
   -- pane:get_dimensions().cols == window text width for unsplit tabs (ours).
+  --
+  -- Two guards keep this from wobbling and jittering every tab:
+  --   * only the FOCUSED window sets it, so a second/background window (with a
+  --     different width) can't clobber the shared value frame to frame;
+  --   * HYSTERESIS — ignore changes of a single column, which is exactly the
+  --     scrollbar column blinking in/out as scrollback grows while you type. Only
+  --     a real resize (>1 col) updates it. This is the true fix for the jitter;
+  --     the proportional sizing just limited the blast radius when it slipped.
+  local focused = true
+  pcall(function() focused = window:is_focused() end)
   local ok, dim = pcall(function() return pane:get_dimensions() end)
-  if ok and dim and dim.cols and dim.cols > 0 then
-    wezterm.GLOBAL.bar_cols = dim.cols
+  if focused and ok and dim and dim.cols and dim.cols > 0 then
+    local cur = wezterm.GLOBAL.bar_cols or 0
+    if math.abs(dim.cols - cur) > 1 then
+      wezterm.GLOBAL.bar_cols = dim.cols
+    end
   end
 end)
 
@@ -262,11 +275,40 @@ local function status_glyph(t)
   return '·'
 end
 
--- Strip the status glyphs so the label spends its columns on real text. We keep
--- the full label (project included) — it truncates fine, and dropping the first
--- word mangles Claude's working-spinner titles, which are task text, not labels.
+-- Strip the status glyphs so the label spends its columns on real text.
 local function compact_label(t)
   return (t or ''):gsub('%s*●%s*$', ''):gsub('^%s*✳%s*', ''):gsub('^%s*%*%s*', '')
+end
+
+-- Branch names that carry no signal when every tab is on them.
+local DEFAULT_BRANCHES = { main = true, master = true }
+
+-- Build a label that spends its columns on what DISTINGUISHES this session from
+-- its siblings, and adapts to how much room the tab has:
+--   * working tabs -> the task text (already unique + informative)
+--   * otherwise the title is "project branch ·tag"; drop a default branch, and
+--     when the tab is tight LEAD with the distinguishing bit (feature branch,
+--     else the ·tag) so right-edge truncation can't eat it — instead of a
+--     repeated "project main" that truncates to a useless "fsp-a…".
+local SMART_TIGHT = 18
+local function smart_label(pt, target)
+  if pt:match('^%s*✳') or pt:match('^%s*%*') then
+    return compact_label(pt)                          -- working: task text
+  end
+  local base = compact_label(pt)
+  local project = base:match('^(%S+)') or base
+  local tag = base:match('·(%w+)')
+  local branch = base:gsub('^%S+%s*', ''):gsub('%s*·%w+%s*$', ''):gsub('%s+$', '')
+  if DEFAULT_BRANCHES[branch] or branch == project then branch = '' end
+
+  local distinct = branch ~= '' and branch or (tag and ('·' .. tag)) or ''
+  if target and target <= SMART_TIGHT and distinct ~= '' then
+    return distinct .. ' ' .. project                 -- tight: what differs, first
+  end
+  local parts = { project }
+  if branch ~= '' then parts[#parts + 1] = branch end
+  if tag then parts[#parts + 1] = '·' .. tag end
+  return table.concat(parts, ' ')
 end
 
 -- The clicked-into tab gets this highlight so it's unmistakable in the row.
@@ -308,19 +350,26 @@ wezterm.on('format-tab-title', function(tab, tabs, panes, conf, hover, max_width
   -- stale wait color from a long-gone session that once held this pane id.
   local c = pt:match('●%s*$') and wait_colors(st) or nil
 
-  -- Divide the bar into shares so every tab's width sums to ~full width. Reserve
-  -- a couple cols of safety so we undershoot (a tiny gap) rather than overshoot
-  -- (which would make WezTerm truncate the rightmost tab).
+  -- Proportional shares: the active tab gets ACTIVE_WEIGHT, every other tab 1.
+  -- CRUCIAL: we do NOT funnel the rounding remainder into the active tab. Doing
+  -- so amplified a 1-column wobble in the measured bar width (e.g. the scrollbar
+  -- column blinking in/out as scrollback changes) into a ~13-column active-tab
+  -- resize. Instead the leftover is spread +1 across the lowest-index tabs, so
+  -- any wobble moves at most one tab by one column — no visible jumping.
   local n = math.max(1, #tabs)
   local bar = (wezterm.GLOBAL.bar_cols or (n * 16)) - 1
   local cap = conf.tab_max_width or 64
-  local inactive_w = math.max(6, math.floor(bar / (n - 1 + ACTIVE_WEIGHT)))
-  local active_w = math.max(inactive_w, math.min(cap, bar - inactive_w * (n - 1)))
-  local target = math.min(cap, tab.is_active and active_w or inactive_w)
+  local unit = bar / (n - 1 + ACTIVE_WEIGHT)
+  local base = math.max(6, math.floor(unit))
+  local active_w = math.min(cap, math.floor(unit * ACTIVE_WEIGHT))
+  local leftover = math.max(0, bar - active_w - base * (n - 1))
+  local target = tab.is_active and active_w
+    or math.min(cap, base + (tab.tab_index < leftover and 1 or 0))
 
-  -- Active and waiting tabs show the full title; others a compact label. Glyph
-  -- sits right after the number so truncation (right edge) can't swallow it.
-  local label = (tab.is_active or c) and (pt ~= '' and pt or ('tab ' .. idx)) or compact_label(pt)
+  -- The active tab has the most room, so it shows the full title; every other tab
+  -- gets a distinguishing, width-adaptive label. Glyph sits right after the number
+  -- so truncation (right edge) can't swallow it.
+  local label = tab.is_active and (pt ~= '' and pt or ('tab ' .. idx)) or smart_label(pt, target)
   local text = fit(string.format(' %d %s %s ', idx, status_glyph(pt), label), target)
 
   -- Active wins the styling so "which tab am I in" is never ambiguous; a waiting
@@ -404,6 +453,58 @@ local function session_picker(window, pane)
 end
 
 -- ---------------------------------------------------------------------------
+-- Content search (CTRL+SHIFT+F): prompt for text, grep LIVE session transcripts
+-- via claude-search, then hand the matches to the same jump/resume flow as the
+-- picker. claude-search is the live-scoped sibling of the /find-session skill —
+-- and the picker can only jump to sessions that are actually open, which is
+-- exactly what claude-search scopes to. Results are ranked by match count.
+-- ---------------------------------------------------------------------------
+local function session_search(window, pane)
+  window:perform_action(act.PromptInputLine {
+    description = 'Find live session — transcript contains:',
+    action = wezterm.action_callback(function(win, p, line)
+      if not line or line == '' then return end       -- cancelled / empty
+      local ok, stdout, stderr = wezterm.run_child_process({ HOME .. '/.claude/bin/claude-search', line })
+      if not ok then
+        win:toast_notification('fleet', stderr or 'claude-search failed', nil, 4000); return
+      end
+      -- claude-search prints "count sid[:8] cwd"; join to the registry (full
+      -- session_id + pane + label) by 8-char prefix so we can jump/resume.
+      local recs = run_registry() or {}
+      local by_prefix = {}
+      for _, r in ipairs(recs) do by_prefix[tostring(r.session_id):sub(1, 8)] = r end
+
+      local choices, pane_by_id, cwd_by_id = {}, {}, {}
+      for l in stdout:gmatch('[^\n]+') do
+        local count, sid8, cwd = l:match('^%s*(%d+)%s+(%x+)%s+(.+)$')
+        if sid8 then
+          local r = by_prefix[sid8]
+          local id = r and r.session_id or sid8
+          table.insert(choices, {
+            id = id,
+            label = string.format('%3s×  %-28s %s', count, (r and r.label) or sid8, (r and r.project) or cwd),
+          })
+          pane_by_id[id] = r and r.wezterm_pane
+          cwd_by_id[id] = (r and r.cwd) or cwd
+        end
+      end
+      if #choices == 0 then
+        win:toast_notification('fleet', 'no live session matches "' .. line .. '"', nil, 3000); return
+      end
+      win:perform_action(act.InputSelector {
+        title = 'Fleet — search: ' .. line,
+        fuzzy = true,
+        choices = choices,
+        action = wezterm.action_callback(function(w2, p2, id)
+          if not id then return end
+          activate_or_resume(w2, p2, pane_by_id[id], id, cwd_by_id[id])
+        end),
+      }, p)
+    end),
+  }, pane)
+end
+
+-- ---------------------------------------------------------------------------
 -- launch-family (CTRL+SHIFT+G): spawn a saved cluster into its own workspace.
 -- ~/.claude/fleet/families.json = { "name": [ {cwd, label?, cmd?}, ... ], ... }
 -- ---------------------------------------------------------------------------
@@ -445,6 +546,7 @@ end
 -- ---------------------------------------------------------------------------
 config.keys = {
   { key = 'Space', mods = 'CTRL|SHIFT', action = wezterm.action_callback(session_picker) },
+  { key = 'f',     mods = 'CTRL|SHIFT', action = wezterm.action_callback(session_search) },
   { key = 'o',     mods = 'CTRL|SHIFT', action = act.ShowLauncherArgs { flags = 'FUZZY|WORKSPACES' } },
   { key = 'g',     mods = 'CTRL|SHIFT', action = wezterm.action_callback(launch_family) },
   -- Reorder the active tab. Left/Right shift it one slot; Home/End send it to the ends.
