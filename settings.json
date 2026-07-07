@@ -72,7 +72,7 @@
     ],
     "defaultMode": "dontAsk"
   },
-  "model": "sonnet",
+  "model": "fable",
   "enabledMcpjsonServers": [
     "team"
   ],
@@ -186,7 +186,7 @@
     "command": "~/.claude/statusline.sh"
   },
   "terminalTitleFromRename": true,
-  "effortLevel": "high",
+  "effortLevel": "xhigh",
   "tui": "default",
   "skipDangerousModePermissionPrompt": true,
   "skipWorkflowUsageWarning": true,
