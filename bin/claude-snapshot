@@ -65,9 +65,23 @@ def _reap_dead_state(live_ids):
         pass
 
 
+def _reopen_due():
+    """Piggyback scheduled-reopen on this 60s timer (see bin/claude-schedule): a
+    snoozed session whose reopen_at has passed is spawned back as a WezTerm tab.
+    Best-effort and self-contained (claude-schedule keeps entries whose spawn
+    fails, e.g. WezTerm not up), so it can never affect the snapshot below."""
+    script = os.path.join(os.path.dirname(os.path.realpath(__file__)), "claude-schedule")
+    try:
+        subprocess.run([script, "reopen-due"], timeout=20,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+
 def main():
     live = live_sessions()
     _reap_dead_state(set(live))
+    _reopen_due()
 
     sessions = sorted(
         live.values(),

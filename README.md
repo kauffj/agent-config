@@ -92,11 +92,31 @@ highlighted so the focused session is unmistakable.
 
 | Keys | Action |
 |------|--------|
-| `Ctrl+Shift+Space` | **Session picker** — fuzzy list of live sessions, sorted by urgency; Enter jumps to that tab (or resumes it if closed) |
+| `Ctrl+Shift+Space` | **Session picker** — fuzzy list of live (and snoozed) sessions, sorted by urgency; Enter jumps to that tab (or resumes it if closed/snoozed) |
 | `Ctrl+Shift+F` | **Content search** — type text, grep live transcripts, jump to the matching session |
+| `Ctrl+Shift+S` | **Snooze** — pick a time, close the tab now, and auto-reopen it then (resume early from the picker) |
 | `Ctrl+Shift+G` | **Launch family** — spawn a saved cluster of sessions (`~/.claude/fleet/families.json`) into its own workspace |
 | `Ctrl+Shift+←` / `→` | Move the active tab one slot left / right |
 | `Ctrl+Shift+Home` / `End` | Send the active tab to the first / last position |
+
+## Snooze: close now, reopen on schedule
+
+For long-running tasks that are blocked for days, `Ctrl+Shift+S` **closes the tab
+now and schedules it to reopen at a chosen time** (`1h`, `tomorrow 9am`, `3 days`,
+or a precise datetime). This is just a *scheduled resurrection*: closing ends the
+process but the transcript survives, and `claude --resume` brings the conversation
+back exactly.
+
+- **`bin/claude-schedule`** owns `~/.claude/scheduled.json` — `add` / `list` /
+  `cancel` / `reopen-due`. It parses the time, and `reopen-due` spawns any overdue
+  session back as a tab (the same `wezterm cli spawn … claude --resume` that
+  `claude-resume` uses), dropping entries that are already live and keeping ones
+  whose spawn fails so they retry.
+- **`bin/claude-snapshot`** calls `reopen-due` on its existing 60s tick, so a
+  reopen scheduled while the machine is asleep simply fires when it is next on —
+  no new timer, robust to suspend/reboot.
+- Snoozed sessions still appear in the **`Ctrl+Shift+Space` picker** marked
+  `⏰ reopens in Xh`; selecting one reopens it immediately and cancels the schedule.
 
 ## Renderer note
 

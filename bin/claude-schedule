@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""Snooze a session: close its tab now, reopen it at a scheduled time.
+
+Owns ~/.claude/scheduled.json — a list of {session_id, cwd, reopen_at, label,
+created_at}. "Snooze" is just a scheduled resurrection: the tab is closed (the
+transcript survives via the durability layer), and `reopen-due` — driven every
+60s by the claude-snapshot timer — spawns `claude --resume <sid>` when the time
+arrives. Robust to suspend/reboot: an overdue reopen fires on the next tick once
+the machine and WezTerm are back.
+
+  claude-schedule add --sid SID --cwd CWD --when "STR" [--label L]
+  claude-schedule list [--json]
+  claude-schedule cancel --sid SID
+  claude-schedule reopen-due [--dry-run]
+
+Time STR accepts: relative (2h, 30m, 3d, 1w, "3 days"), tomorrow [HH:MM],
+tonight, next week, a bare time of day (9am, 14:00 -> next occurrence), or ISO
+(YYYY-MM-DD [HH:MM]).
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from _claude_sessions_lib import CLAUDE_DIR, live_sessions  # noqa: E402
+
+SCHEDULED = os.path.join(CLAUDE_DIR, "scheduled.json")
+
+_UNITS = {
+    "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
+    "m": 60, "min": 60, "mins": 60, "minute": 60, "minutes": 60,
+    "h": 3600, "hr": 3600, "hrs": 3600, "hour": 3600, "hours": 3600,
+    "d": 86400, "day": 86400, "days": 86400,
+    "w": 604800, "wk": 604800, "week": 604800, "weeks": 604800,
+}
+
+
+def _parse_tod(s):
+    """'9am' / '9:30pm' / '14:00' / '9' -> (hour, minute). ValueError if not a time."""
+    s = s.strip().lower()
+    ampm = None
+    if s.endswith(("am", "pm")):
+        ampm, s = s[-2:], s[:-2].strip()
+    hh, _, mm = s.partition(":")
+    mm = mm or "0"
+    if not (hh.isdigit() and mm.isdigit()):
+        raise ValueError("bad time %r" % s)
+    h, m = int(hh), int(mm)
+    if ampm == "pm" and h < 12:
+        h += 12
+    if ampm == "am" and h == 12:
+        h = 0
+    if not (0 <= h <= 23 and 0 <= m <= 59):
+        raise ValueError("time out of range")
+    return h, m
+
+
+def parse_when(s, now=None):
+    """A human time expression -> absolute epoch (int)."""
+    now = now or dt.datetime.now()
+    s = " ".join(s.strip().lower().split())
+
+    mobj = re.fullmatch(r"(\d+)\s*([a-z]+)", s)
+    if mobj and mobj.group(2) in _UNITS:
+        return int(now.timestamp() + int(mobj.group(1)) * _UNITS[mobj.group(2)])
+
+    if s == "tonight":
+        cand = now.replace(hour=20, minute=0, second=0, microsecond=0)
+        if cand <= now:
+            cand += dt.timedelta(days=1)
+        return int(cand.timestamp())
+
+    if s == "next week":
+        return int((now + dt.timedelta(days=7)).timestamp())
+
+    if s == "tomorrow" or s.startswith("tomorrow "):
+        rest = s[len("tomorrow"):].strip()
+        h, m = _parse_tod(rest) if rest else (9, 0)
+        cand = (now + dt.timedelta(days=1)).replace(hour=h, minute=m, second=0, microsecond=0)
+        return int(cand.timestamp())
+
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return int(dt.datetime.strptime(s, fmt).timestamp())
+        except ValueError:
+            pass
+
+    try:
+        h, m = _parse_tod(s)
+        cand = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        if cand <= now:
+            cand += dt.timedelta(days=1)
+        return int(cand.timestamp())
+    except ValueError:
+        pass
+
+    raise ValueError("could not parse time: %r" % s)
+
+
+def _read():
+    try:
+        with open(SCHEDULED) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _write(entries):
+    tmp = SCHEDULED + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(entries, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, SCHEDULED)
+
+
+def _wakes_in(reopen_at, now):
+    d = int(reopen_at - now)
+    if d <= 0:
+        return "due"
+    if d < 3600:
+        return "%dm" % max(1, round(d / 60))
+    if d < 86400:
+        return "%dh" % round(d / 3600)
+    return "%dd" % round(d / 86400)
+
+
+def cmd_add(a):
+    when = parse_when(a.when)
+    entries = [e for e in _read() if e.get("session_id") != a.sid]
+    entries.append({
+        "session_id": a.sid,
+        "cwd": a.cwd,
+        "reopen_at": when,
+        "label": a.label or a.sid[:8],
+        "created_at": int(dt.datetime.now().timestamp()),
+    })
+    _write(entries)
+    print("scheduled %s -> %s" % (a.sid[:8], dt.datetime.fromtimestamp(when).strftime("%Y-%m-%d %H:%M")))
+
+
+def cmd_cancel(a):
+    entries = _read()
+    kept = [e for e in entries if e.get("session_id") != a.sid]
+    _write(kept)
+    print("cancelled %s" % a.sid[:8] if len(kept) != len(entries) else "no schedule for %s" % a.sid[:8])
+
+
+def cmd_list(a):
+    now = dt.datetime.now().timestamp()
+    entries = sorted(_read(), key=lambda e: e.get("reopen_at", 0))
+    if a.json:
+        for e in entries:
+            e["wakes_in"] = _wakes_in(e.get("reopen_at", 0), now)
+        print(json.dumps(entries))
+        return
+    if not entries:
+        print("no scheduled sessions")
+        return
+    for e in entries:
+        print("%5s  %-24s  %s" % (
+            _wakes_in(e.get("reopen_at", 0), now), e.get("label", ""),
+            dt.datetime.fromtimestamp(e.get("reopen_at", 0)).strftime("%Y-%m-%d %H:%M")))
+
+
+def cmd_reopen_due(a):
+    now = dt.datetime.now().timestamp()
+    entries = _read()
+    if not entries:
+        return
+    have_wezterm = shutil.which("wezterm") is not None
+    live = set(live_sessions())
+    kept, reopened = [], []
+    for e in entries:
+        sid, cwd = e.get("session_id"), e.get("cwd") or ""
+        if not sid or e.get("reopen_at", 0) > now:
+            kept.append(e)
+            continue
+        if sid in live:                      # already back (manual reopen) — drop it
+            continue
+        if a.dry_run:
+            print("would reopen %s  %s" % (sid[:8], cwd))
+            kept.append(e)
+            continue
+        if not have_wezterm:                 # WezTerm down — retry next tick
+            kept.append(e)
+            continue
+        r = subprocess.run(
+            ["wezterm", "cli", "spawn", "--cwd", cwd, "--",
+             "bash", "-lic", "claude --resume %s; exec bash" % sid],
+            capture_output=True, text=True)
+        if r.returncode == 0:
+            reopened.append(e)
+        else:
+            kept.append(e)                   # keep on failure (mirror claude-resume)
+    if len(kept) != len(entries):            # persist any change: reopened OR dropped-live
+        _write(kept)
+    for e in reopened:
+        _notify(e.get("label", "a session"))
+
+
+def _notify(label):
+    if shutil.which("notify-send"):
+        try:
+            subprocess.run(["notify-send", "Claude — tab reopened", "%s is back" % label],
+                           check=False)
+        except Exception:
+            pass
+
+
+def main():
+    p = argparse.ArgumentParser(prog="claude-schedule")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    pa = sub.add_parser("add"); pa.set_defaults(fn=cmd_add)
+    pa.add_argument("--sid", required=True)
+    pa.add_argument("--cwd", required=True)
+    pa.add_argument("--when", required=True)
+    pa.add_argument("--label", default="")
+
+    pc = sub.add_parser("cancel"); pc.set_defaults(fn=cmd_cancel)
+    pc.add_argument("--sid", required=True)
+
+    pl = sub.add_parser("list"); pl.set_defaults(fn=cmd_list)
+    pl.add_argument("--json", action="store_true")
+
+    pr = sub.add_parser("reopen-due"); pr.set_defaults(fn=cmd_reopen_due)
+    pr.add_argument("--dry-run", action="store_true")
+
+    args = p.parse_args()
+    args.fn(args)
+
+
+if __name__ == "__main__":
+    main()

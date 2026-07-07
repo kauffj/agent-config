@@ -427,7 +427,6 @@ end
 local function session_picker(window, pane)
   local recs, err = run_registry()
   if not recs then window:toast_notification('fleet', err, nil, 4000); return end
-  if #recs == 0 then window:toast_notification('fleet', 'no live sessions', nil, 3000); return end
 
   -- Size the folder and label columns to their actual content (capped so one long
   -- name can't blow out the row), so we use the width when it's there and stay
@@ -439,7 +438,7 @@ local function session_picker(window, pane)
   end
   fw, lw = math.min(fw, 26), math.min(lw, 22)
 
-  local choices, pane_by_id, cwd_by_id = {}, {}, {}
+  local choices, pane_by_id, cwd_by_id, seen_ids, scheduled_ids = {}, {}, {}, {}, {}
   for _, r in ipairs(recs) do
     local grp = r.group and (' [' .. r.group .. ']') or ''
     -- Columns are padded by DISPLAY width (fit/column_width), not bytes, so the
@@ -455,7 +454,32 @@ local function session_picker(window, pane)
     table.insert(choices, { id = r.session_id, label = row })
     pane_by_id[r.session_id] = r.wezterm_pane
     cwd_by_id[r.session_id] = r.cwd
+    seen_ids[r.session_id] = true
   end
+
+  -- Union in SNOOZED (closed, scheduled-to-reopen) sessions so you can reopen one
+  -- early. They have no live pane, so activate_or_resume resumes them; selecting
+  -- one also cancels its schedule. See bin/claude-schedule.
+  local sok, sched = wezterm.run_child_process({ HOME .. '/.claude/bin/claude-schedule', 'list', '--json' })
+  if sok and sched and sched ~= '' then
+    local okj, list = pcall(wezterm.json_parse, sched)
+    if okj and type(list) == 'table' then
+      for _, e in ipairs(list) do
+        local id = e.session_id
+        if id and not seen_ids[id] then
+          table.insert(choices, {
+            id = id,
+            label = fit('⏰', 2) .. ' ' .. fit(e.label or id, fw + lw + 1)
+              .. '  reopens in ' .. (e.wakes_in or '?'),
+          })
+          cwd_by_id[id] = e.cwd
+          scheduled_ids[id] = true
+        end
+      end
+    end
+  end
+
+  if #choices == 0 then window:toast_notification('fleet', 'no live or snoozed sessions', nil, 3000); return end
 
   window:perform_action(act.InputSelector {
     title = 'Fleet — sessions',
@@ -464,6 +488,9 @@ local function session_picker(window, pane)
     action = wezterm.action_callback(function(win, p, id)
       if not id then return end       -- cancelled
       activate_or_resume(win, p, pane_by_id[id], id, cwd_by_id[id])
+      if scheduled_ids[id] then
+        wezterm.run_child_process({ HOME .. '/.claude/bin/claude-schedule', 'cancel', '--sid', id })
+      end
     end),
   }, pane)
 end
@@ -557,12 +584,72 @@ local function launch_family(window, pane)
 end
 
 -- ---------------------------------------------------------------------------
+-- Snooze (CTRL+SHIFT+S): schedule the active tab's session to reopen at a chosen
+-- time, then close it. Reopen is driven by bin/claude-schedule via the snapshot
+-- timer; resume early from the session picker. Closing ends the process but the
+-- transcript survives, so `claude --resume` brings it back exactly.
+-- ---------------------------------------------------------------------------
+local function snooze_do(win, pane, rec, when)
+  local disp = ((rec.project or '') .. ' ' .. (rec.label or '')):gsub('^%s+', ''):gsub('%s+$', '')
+  local ok, _, stderr = wezterm.run_child_process({
+    HOME .. '/.claude/bin/claude-schedule', 'add',
+    '--sid', rec.session_id, '--cwd', rec.cwd or '',
+    '--when', when, '--label', disp ~= '' and disp or rec.session_id,
+  })
+  if not ok then
+    win:toast_notification('fleet', 'snooze failed: ' .. (stderr or ''), nil, 4000); return
+  end
+  win:toast_notification('fleet', 'snoozed ' .. disp, nil, 2500)
+  win:perform_action(act.CloseCurrentTab { confirm = false }, pane)
+end
+
+local SNOOZE_PRESETS = {
+  { id = '1h',           label = 'in 1 hour' },
+  { id = '4h',           label = 'in 4 hours' },
+  { id = 'tonight',      label = 'tonight (8pm)' },
+  { id = 'tomorrow 9am', label = 'tomorrow 9am' },
+  { id = '3d',           label = 'in 3 days' },
+  { id = '1w',           label = 'in 1 week' },
+  { id = '__custom__',   label = 'Custom…' },
+}
+
+local function session_snooze(window, pane)
+  local recs = run_registry() or {}
+  local pid = pane and tostring(pane:pane_id())
+  local rec
+  for _, r in ipairs(recs) do
+    if tostring(r.wezterm_pane) == pid then rec = r; break end
+  end
+  if not rec then
+    window:toast_notification('fleet', 'no Claude session in this tab', nil, 3000); return
+  end
+  window:perform_action(act.InputSelector {
+    title = 'Snooze — reopen this tab…',
+    choices = SNOOZE_PRESETS,
+    action = wezterm.action_callback(function(win, p, id)
+      if not id then return end
+      if id == '__custom__' then
+        win:perform_action(act.PromptInputLine {
+          description = 'Reopen when?  e.g. "tomorrow 14:00", "3 days", "2026-07-10 09:00"',
+          action = wezterm.action_callback(function(w2, p2, line)
+            if line and line ~= '' then snooze_do(w2, p2, rec, line) end
+          end),
+        }, p)
+      else
+        snooze_do(win, p, rec, id)
+      end
+    end),
+  }, pane)
+end
+
+-- ---------------------------------------------------------------------------
 -- Keys. Letters chosen to avoid clobbering core WezTerm defaults (T/W/C/V/N/P).
 -- Rebind freely. If 'Space' errors at load, use a letter or 'phys:Space'.
 -- ---------------------------------------------------------------------------
 config.keys = {
   { key = 'Space', mods = 'CTRL|SHIFT', action = wezterm.action_callback(session_picker) },
   { key = 'f',     mods = 'CTRL|SHIFT', action = wezterm.action_callback(session_search) },
+  { key = 's',     mods = 'CTRL|SHIFT', action = wezterm.action_callback(session_snooze) },
   { key = 'o',     mods = 'CTRL|SHIFT', action = act.ShowLauncherArgs { flags = 'FUZZY|WORKSPACES' } },
   { key = 'g',     mods = 'CTRL|SHIFT', action = wezterm.action_callback(launch_family) },
   -- Reorder the active tab. Left/Right shift it one slot; Home/End send it to the ends.
