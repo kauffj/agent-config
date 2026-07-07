@@ -1,0 +1,135 @@
+# claude-config — a WezTerm control plane for many Claude Code sessions
+
+This repo is a Claude Code configuration that turns a single WezTerm window into a
+**fleet dashboard**: every tab is one Claude Code session, colored by how long it
+has been waiting on you, labeled by what distinguishes it, and reachable through a
+fuzzy picker and a content search. The whole thing is installed by symlinking the
+repo to `~/.claude` (and `wezterm/wezterm.lua` to `~/.config/wezterm/`).
+
+It is Linux + systemd + WezTerm based.
+
+## The idea: two layers
+
+The visible tab bar is only a front-end. It renders a small, terminal-agnostic
+**data layer** that any tool could consume.
+
+```
+Claude Code hooks ──► ~/.claude/state/<session_id>.json   {status, since, wezterm_pane, cwd}
+        │                          ▲
+        │                 bin/claude-snapshot  (60s systemd timer)
+        │                   • snapshot live sessions for crash recovery
+        │                   • REAP state files whose session is dead
+        ▼                          │
+  bin/claude-sessions --json ──────┤        bin/claude-search <text>
+   (urgency-sorted registry)       │         (grep live transcripts)
+        │                          │                 │
+        └───────────────► wezterm/wezterm.lua ◄──────┘
+                          colors · labels · pickers
+```
+
+**Layer 1 — the data layer (works in any terminal).**
+
+- **`hooks/session-state.sh`** is wired into Claude Code's hooks (`SessionStart`,
+  `Stop`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `Notification`).
+  On each event it writes `~/.claude/state/<session_id>.json` with the session's
+  `status` (`working` / `waiting`), `since` (when that status last *changed* — it
+  only moves on a real transition, so "waiting 14m" stays truthful), `wezterm_pane`,
+  and `cwd`. It also sets the terminal tab title with a trailing `●` when the
+  session is waiting on you.
+- **`bin/claude-sessions --json`** joins those state files into an urgency-sorted
+  registry — the list the picker shows.
+- **`bin/claude-search <text>`** greps the transcripts of *live* sessions (ripgrep
+  if present, else grep) and returns the matches ranked by hit count. It is the
+  live-scoped sibling of the `/find-session` skill.
+- **`bin/claude-snapshot`** runs every 60 s from a systemd-user timer. It records
+  the live session set for crash recovery *and* reaps dead `state/` files —
+  a file whose session is no longer live is garbage that would otherwise skew the
+  tab colors and collide with reused WezTerm pane ids. (Reaping is safe: a live
+  session regenerates its file on its next hook, and it never mass-deletes on an
+  empty liveness read.)
+
+**Layer 2 — the WezTerm front-end (`wezterm/wezterm.lua`).**
+It reads the data layer every ~second and turns it into the tab bar described below.
+
+## What the tab bar does
+
+**Wait-color escalation.** A waiting tab warms from calm teal → green → yellow →
+orange → deep red as it waits. Details that make it readable:
+
+- **Continuous truecolor gradient**, interpolated across seven stops — not three
+  hard steps.
+- **Logarithmic age scale** so minutes, hours, and days each get their own band;
+  a few days-old sessions can't flatten everything recent into one color.
+- **Ease-in slow start** (`WAIT_GAMMA`) — a fresh wait stays calm for a while
+  before it climbs.
+- **Dynamic, relative ceiling** = `max(2h, the longest currently-open wait)`. The
+  reddest tab is always the most-neglected relative to the rest, and nothing maxes
+  out before two hours when every wait is recent. Only *open* tabs count toward the
+  ceiling, so lingering orphans don't blow out the scale.
+- **Downtime-frozen ages.** Wait age is measured on an "awake clock" that stops
+  during suspend and does not count powered-off time, and it is persisted to
+  `~/.cache/wezterm-fleet-wait.json`. So resuming the machine — or rebooting —
+  preserves each tab's color instead of inflating every wait by the time you were
+  away.
+- **Live-title gated.** The color only applies when the pane's live title still
+  shows the `●` marker, so a tab that has resumed working never keeps a stale
+  color from a dead session that once held its (reused) pane id.
+
+**Adaptive labels.** Each tab spends its columns on what *distinguishes* it:
+working tabs show their task text; otherwise the label drops default branch names
+(`main`/`master`), de-duplicates a project name that repeats the label, and — when
+the tab is tight — leads with the distinguishing bit (feature branch, else the
+session tag) so right-edge truncation can't eat it.
+
+**Stable, filled layout.** Tabs are sized by proportional shares (the active tab
+gets more) so the row fills the bar (WezTerm's retro tab bar won't stretch on its
+own). The measured bar width is stabilized with hysteresis (a one-column wobble —
+the scrollbar column blinking in and out as scrollback grows — is ignored) and a
+focused-window guard, so nothing jumps while you type. The active tab is
+highlighted so the focused session is unmistakable.
+
+## Keybindings
+
+| Keys | Action |
+|------|--------|
+| `Ctrl+Shift+Space` | **Session picker** — fuzzy list of live sessions, sorted by urgency; Enter jumps to that tab (or resumes it if closed) |
+| `Ctrl+Shift+F` | **Content search** — type text, grep live transcripts, jump to the matching session |
+| `Ctrl+Shift+G` | **Launch family** — spawn a saved cluster of sessions (`~/.claude/fleet/families.json`) into its own workspace |
+| `Ctrl+Shift+←` / `→` | Move the active tab one slot left / right |
+| `Ctrl+Shift+Home` / `End` | Send the active tab to the first / last position |
+
+## Renderer note
+
+The config runs Claude Code on the **classic renderer** (`"tui": "default"`, and
+`CLAUDE_CODE_NO_FLICKER` is *not* set). That keeps output in the terminal's primary
+scrollback, so WezTerm's scrollbar, mouse wheel, and native text selection all
+work. The tradeoff is that resizing the window re-wraps already-printed lines
+(inherent to primary-scrollback terminals); `Ctrl+L` forces a clean redraw. The
+fullscreen/alt-screen renderer resizes cleanly but has no scrollback — this config
+chooses the scrollbar.
+
+## Install
+
+Dependencies: WezTerm, `python3`, `jq`, and ideally `ripgrep` (grep is the fallback).
+
+```bash
+git clone <this repo> ~/projects/claude-config
+ln -s ~/projects/claude-config ~/.claude
+mkdir -p ~/.config/wezterm
+ln -s ~/.claude/wezterm/wezterm.lua ~/.config/wezterm/wezterm.lua
+mkdir -p ~/.claude/state
+```
+
+1. **Wire the hook** — copy the `hooks` block from `settings.json` so
+   `~/.claude/hooks/session-state.sh` runs on the session events listed above.
+2. **Enable the timer** — install the systemd-user unit that runs
+   `~/.claude/bin/claude-snapshot` every 60 s (see
+   `~/.config/systemd/user/claude-snapshot.{service,timer}`) and
+   `systemctl --user enable --now claude-snapshot.timer`.
+
+## Related
+
+`bin/README.md` documents the **durability & resurrection** layer — fsync'ing
+transcripts against unclean shutdowns (`claude-transcript-sync`,
+`claude-restore-transcripts`) and reopening the sessions that were live before a
+reboot (`claude-snapshot`, `claude-resume`).
