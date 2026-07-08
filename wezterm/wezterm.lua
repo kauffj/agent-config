@@ -407,6 +407,24 @@ end
 
 local function activate_or_resume(win, pane, paneid, sid, cwd)
   local mux_pane = paneid and wezterm.mux.get_pane(tonumber(paneid)) or nil
+  -- Guard against a stale/reused pane id. WezTerm recycles pane ids, so a closed
+  -- session's recorded pane can now belong to a DIFFERENT session — activating it
+  -- would land you on the wrong tab (or right where you are). Only trust the pane
+  -- if its cwd still matches the session's; otherwise treat it as gone and resume.
+  if mux_pane and cwd and cwd ~= '' then
+    local ok, p = pcall(function()
+      local url = mux_pane:get_current_working_dir()
+      if not url then return nil end
+      if type(url) == 'string' then return url end
+      return url.file_path or url.path or tostring(url)
+    end)
+    if ok and p then
+      p = p:gsub('^file://[^/]*', ''):gsub('/+$', '')
+      if p ~= cwd:gsub('/+$', '') then
+        mux_pane = nil   -- reused pane, wrong session -> resume instead
+      end
+    end
+  end
   if mux_pane then
     -- MuxPane:activate() focuses pane + its tab + window (recent WezTerm).
     -- pcall + tab-activate fallback keeps it working on older builds.
