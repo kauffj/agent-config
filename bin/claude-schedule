@@ -189,6 +189,14 @@ def _target_window():
         return None
 
 
+def _log(msg):
+    try:
+        with open(os.path.join(CLAUDE_DIR, "scheduled.log"), "a") as f:
+            f.write("%s  %s\n" % (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
 def cmd_reopen_due(a):
     now = dt.datetime.now().timestamp()
     entries = _read()
@@ -197,13 +205,14 @@ def cmd_reopen_due(a):
     have_wezterm = shutil.which("wezterm") is not None
     win = _target_window() if have_wezterm else None
     live = set(live_sessions())
-    kept, reopened = [], []
+    kept, reopened, dropped, failed = [], [], 0, 0
     for e in entries:
         sid, cwd = e.get("session_id"), e.get("cwd") or ""
         if not sid or e.get("reopen_at", 0) > now:
             kept.append(e)
             continue
         if sid in live:                      # already back (manual reopen) — drop it
+            dropped += 1
             continue
         if a.dry_run:
             print("would reopen %s  %s" % (sid[:8], cwd))
@@ -218,8 +227,14 @@ def cmd_reopen_due(a):
             capture_output=True, text=True)
         if r.returncode == 0:
             reopened.append(e)
+            _log("reopened %s (%s) win=%s" % (sid[:8], e.get("label", ""), win))
         else:
             kept.append(e)                   # keep on failure (mirror claude-resume)
+            failed += 1
+            _log("SPAWN FAILED %s rc=%s win=%s err=%s" % (sid[:8], r.returncode, win, r.stderr.strip()[:200]))
+    if not a.dry_run and (reopened or dropped or failed):
+        _log("run: entries=%d due-reopened=%d dropped-live=%d failed=%d wezterm=%s win=%s"
+             % (len(entries), len(reopened), dropped, failed, have_wezterm, win))
     if len(kept) != len(entries):            # persist any change: reopened OR dropped-live
         _write(kept)
     for e in reopened:

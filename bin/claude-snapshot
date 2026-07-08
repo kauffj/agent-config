@@ -10,6 +10,7 @@ is running); restore is on-demand, so a stale set is never re-opened uninvited.
 import glob
 import json
 import os
+import subprocess
 import sys
 import time
 
@@ -72,10 +73,17 @@ def _reopen_due():
     fails, e.g. WezTerm not up), so it can never affect the snapshot below."""
     script = os.path.join(os.path.dirname(os.path.realpath(__file__)), "claude-schedule")
     try:
-        subprocess.run([script, "reopen-due"], timeout=20,
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    except Exception:
-        pass
+        r = subprocess.run([script, "reopen-due"], timeout=20, capture_output=True, text=True)
+        if r.returncode != 0 or r.stderr.strip():
+            raise RuntimeError("rc=%s err=%s" % (r.returncode, r.stderr.strip()[:300]))
+    except Exception as e:
+        # Log rather than swallow — a silent failure here (e.g. a missing import)
+        # is exactly what let scheduled reopens quietly do nothing for a while.
+        try:
+            with open(os.path.join(CLAUDE_DIR, "scheduled.log"), "a") as f:
+                f.write("%s  _reopen_due FAILED: %r\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), e))
+        except Exception:
+            pass
 
 
 def main():

@@ -47,6 +47,8 @@ fleet/
 sound-off
 sound-off-*
 spawned-windows.log
+scheduled.json
+scheduled.log
 
 __pycache__/
 *.pyc
