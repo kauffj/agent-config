@@ -169,12 +169,33 @@ def cmd_list(a):
             dt.datetime.fromtimestamp(e.get("reopen_at", 0)).strftime("%Y-%m-%d %H:%M")))
 
 
+def _target_window():
+    """The WezTerm window to spawn reopened tabs into. Needed because this runs
+    headless from the snapshot timer (no $WEZTERM_PANE), and `wezterm cli spawn`
+    refuses without a pane/window to target. Pick the window with the most tabs —
+    the fleet window. None if WezTerm isn't reachable."""
+    try:
+        out = subprocess.run(["wezterm", "cli", "list", "--format", "json"],
+                             capture_output=True, text=True)
+        if out.returncode != 0:
+            return None
+        counts = {}
+        for p in json.loads(out.stdout):
+            wid = p.get("window_id")
+            if wid is not None:
+                counts[wid] = counts.get(wid, 0) + 1
+        return max(counts, key=counts.get) if counts else None
+    except Exception:
+        return None
+
+
 def cmd_reopen_due(a):
     now = dt.datetime.now().timestamp()
     entries = _read()
     if not entries:
         return
     have_wezterm = shutil.which("wezterm") is not None
+    win = _target_window() if have_wezterm else None
     live = set(live_sessions())
     kept, reopened = [], []
     for e in entries:
@@ -188,11 +209,11 @@ def cmd_reopen_due(a):
             print("would reopen %s  %s" % (sid[:8], cwd))
             kept.append(e)
             continue
-        if not have_wezterm:                 # WezTerm down — retry next tick
+        if not have_wezterm or win is None:  # WezTerm down / unreachable — retry next tick
             kept.append(e)
             continue
         r = subprocess.run(
-            ["wezterm", "cli", "spawn", "--cwd", cwd, "--",
+            ["wezterm", "cli", "spawn", "--window-id", str(win), "--cwd", cwd, "--",
              "bash", "-lic", "claude --resume %s; exec bash" % sid],
             capture_output=True, text=True)
         if r.returncode == 0:
