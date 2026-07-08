@@ -76,6 +76,7 @@
   "enabledMcpjsonServers": [
     "team"
   ],
+  "disableClaudeAiConnectors": true,
   "hooks": {
     "SessionStart": [
       {
