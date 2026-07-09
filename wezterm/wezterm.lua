@@ -406,7 +406,13 @@ local function run_registry()
 end
 
 local function activate_or_resume(win, pane, paneid, sid, cwd)
-  local mux_pane = paneid and wezterm.mux.get_pane(tonumber(paneid)) or nil
+  -- get_pane RAISES on a closed/unknown pane id (e.g. a snoozed tab), so pcall it
+  -- and treat a miss as "gone" -> fall through to resume, instead of erroring out.
+  local mux_pane = nil
+  if paneid then
+    local ok, p = pcall(wezterm.mux.get_pane, tonumber(paneid))
+    if ok then mux_pane = p end
+  end
   -- Guard against a stale/reused pane id. WezTerm recycles pane ids, so a closed
   -- session's recorded pane can now belong to a DIFFERENT session — activating it
   -- would land you on the wrong tab (or right where you are). Only trust the pane
