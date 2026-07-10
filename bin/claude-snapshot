@@ -44,20 +44,44 @@ def _atomic_write(path, data):
     os.replace(tmp, path)
 
 
-def _reap_dead_state(live_ids):
+def _restorable_ids():
+    """Session ids `claude-resume` could still bring back: the current snapshot
+    plus a fresh recovery point (the same sources as resume_set(), minus its
+    liveness/transcript filtering, which doesn't matter for reaping)."""
+    ids = set()
+    for path, ttl in ((OUT, None), (RECOVERY_SNAP, RECOVERY_TTL)):
+        d = _read(path) or {}
+        if ttl is not None and (time.time() - d.get("preservedAt", 0)) > ttl:
+            continue
+        for s in d.get("sessions", []):
+            if s.get("sessionId"):
+                ids.add(s["sessionId"])
+    return ids
+
+
+def _reap_dead_state(live_ids, keep_ids=frozenset()):
     """Piggyback dead-session-state cleanup on this 60s timer. A state file at
-    ~/.claude/state/<session_id>.json is garbage once its session is no longer
-    live — it otherwise skews the fleet tab bar's wait gradient and collides with
-    reused WezTerm pane ids. Session liveness (not pane liveness) is the right
-    signal: it catches orphans that never recorded a pane too. A session that
-    reappears regenerates its file on the next hook, so an over-eager reap
-    self-heals. Guarded, and never mass-deletes on an empty/failed liveness read,
-    so it can't disturb the snapshot below."""
+    ~/.claude/state/<session_id>.json is garbage once its session is neither
+    live nor still restorable (keep_ids: the snapshot/recovery set that
+    claude-resume reads) — it otherwise skews the fleet tab bar's wait gradient
+    and collides with reused WezTerm pane ids. Liveness alone is the wrong
+    signal in the post-crash window: after the 2026-07-10 overheat reboot, the
+    first hand-opened session made live_ids non-empty and the reap deleted the
+    15 pre-crash state files one tick before claude-resume ran, so every
+    resumed session restarted its `since` — wiping the idleness history the
+    files had carried through the crash. Sparing restorable ids rides on the
+    boot-grace and cliff guards below, which keep exactly those sessions in
+    the snapshot/recovery files until they're brought back (or age out). A
+    session that reappears regenerates its file on the next hook, so an
+    over-eager reap self-heals — but only its `status`, not its wait history.
+    Guarded, and never mass-deletes on an empty/failed liveness read, so it
+    can't disturb the snapshot below."""
     if not live_ids:
         return
+    keep = set(live_ids) | set(keep_ids)
     try:
         for f in glob.glob(os.path.join(CLAUDE_DIR, "state", "*.json")):
-            if os.path.basename(f)[:-5] not in live_ids:
+            if os.path.basename(f)[:-5] not in keep:
                 try:
                     os.remove(f)
                 except OSError:
@@ -88,7 +112,7 @@ def _reopen_due():
 
 def main():
     live = live_sessions()
-    _reap_dead_state(set(live))
+    _reap_dead_state(set(live), _restorable_ids())
     _reopen_due()
 
     sessions = sorted(
