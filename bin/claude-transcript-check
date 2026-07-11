@@ -19,11 +19,16 @@ has silently lost its tail:
 Exit status: 0 if clean, 1 if anything is flagged (usable from a timer/hook).
 Nothing is ever modified.
 
-Usage:  claude-transcript-check [-v]
+Usage:  claude-transcript-check [-v] [--notify]
+  --notify  desktop-notify only when a RECOVERABLE truncation exists (backup >
+            live) — the actionable, restore-now case. Historical truncations
+            whose backup was already lost don't nag. Meant for a systemd timer.
 """
 import glob
 import json
 import os
+import shutil
+import subprocess
 import sys
 import time
 
@@ -89,9 +94,25 @@ def human_dt(epoch):
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(epoch)) if epoch else "?"
 
 
+def _notify(recoverable):
+    """Best-effort desktop alert for recoverable truncations (backup still fuller)."""
+    if not recoverable or not shutil.which("notify-send"):
+        return
+    try:
+        subprocess.run(
+            ["notify-send", "-u", "critical", "Claude — transcript truncated",
+             "%d transcript(s) truncated but recoverable. Run "
+             "claude-restore-transcripts." % recoverable],
+            check=False)
+    except Exception:
+        pass
+
+
 def main():
     verbose = "-v" in sys.argv or "--verbose" in sys.argv
+    notify = "--notify" in sys.argv
     flagged = []
+    recoverable = 0
     checked = 0
 
     for path in glob.glob(os.path.join(LIVE, "*", "*.jsonl")):
@@ -114,6 +135,7 @@ def main():
         bpath = os.path.join(BACKUP, rel)
         try:
             if os.path.getsize(bpath) > os.path.getsize(path):
+                recoverable += 1
                 flagged.append(
                     "BACKUP-LARGER   %s\n    live %d B < backup %d B — run "
                     "claude-restore-transcripts" % (rel, os.path.getsize(path),
@@ -123,8 +145,11 @@ def main():
 
     for line in flagged:
         print(line)
+    if notify:
+        _notify(recoverable)
     if flagged:
-        print("\n%d transcript(s) flagged of %d checked." % (len(flagged), checked))
+        print("\n%d transcript(s) flagged of %d checked (%d recoverable)."
+              % (len(flagged), checked, recoverable))
         return 1
     if verbose:
         print("OK — %d transcripts checked, none truncated." % checked)

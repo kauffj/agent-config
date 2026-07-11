@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodically check Claude transcripts for silent truncation
+
+[Timer]
+# Truncations cluster a few minutes after an (unclean) reboot, when sessions are
+# resumed — so fire soon after boot, then keep watch on a slow cadence. The sync
+# shrink-guard already preserves the backup, so this only needs to ALERT, not race.
+OnBootSec=4min
+OnUnitActiveSec=15min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

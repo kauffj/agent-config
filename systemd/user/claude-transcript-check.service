@@ -1,0 +1,9 @@
+[Unit]
+Description=Check Claude transcripts for silent truncation
+
+[Service]
+Type=oneshot
+ExecStart=%h/.claude/bin/claude-transcript-check --notify
+# The check exits 1 when it flags a transcript (useful as a CLI signal); that's a
+# normal outcome for the timer, not a service failure.
+SuccessExitStatus=1
