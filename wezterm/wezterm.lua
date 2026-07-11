@@ -611,8 +611,32 @@ end
 -- Snooze (CTRL+SHIFT+S): schedule the active tab's session to reopen at a chosen
 -- time, then close it. Reopen is driven by bin/claude-schedule via the snapshot
 -- timer; resume early from the session picker. Closing ends the process but the
--- transcript survives, so `claude --resume` brings it back exactly.
+-- transcript survives, so `claude --resume` brings it back exactly — provided the
+-- transcript is actually on disk, which is why we fsync it BEFORE closing (below).
 -- ---------------------------------------------------------------------------
+
+-- Flush the session's transcript(s) to disk before closing the tab. Closing sends
+-- the process SIGHUP; if the kernel is still holding the last append in the page
+-- cache, an ill-timed shutdown afterward could roll it back. An idle session (the
+-- normal snooze case) has already flushed via the Stop hook, so this is mostly
+-- belt-and-suspenders — but it makes snooze durable by construction rather than by
+-- timing. (It cannot save content a mid-turn session hasn't written yet.)
+local FSYNC_PY = [[
+import os, sys
+try:
+    fd = os.open(sys.argv[1], os.O_RDONLY)
+    os.fsync(fd)
+    os.close(fd)
+except OSError:
+    pass
+]]
+local function fsync_transcript(sid)
+  if not sid or sid == '' then return end
+  for _, p in ipairs(wezterm.glob(HOME .. '/.claude/projects/*/' .. sid .. '.jsonl')) do
+    pcall(wezterm.run_child_process, { 'python3', '-c', FSYNC_PY, p })
+  end
+end
+
 local function snooze_do(win, pane, rec, when)
   local disp = ((rec.project or '') .. ' ' .. (rec.label or '')):gsub('^%s+', ''):gsub('%s+$', '')
   local ok, _, stderr = wezterm.run_child_process({
@@ -624,6 +648,7 @@ local function snooze_do(win, pane, rec, when)
     win:toast_notification('fleet', 'snooze failed: ' .. (stderr or ''), nil, 4000); return
   end
   win:toast_notification('fleet', 'snoozed ' .. disp, nil, 2500)
+  fsync_transcript(rec.session_id)   -- make the transcript durable before we close
   win:perform_action(act.CloseCurrentTab { confirm = false }, pane)
 end
 
@@ -654,7 +679,7 @@ local function session_snooze(window, pane)
       if not id then return end
       if id == '__custom__' then
         win:perform_action(act.PromptInputLine {
-          description = 'Reopen when?  e.g. "tomorrow 14:00", "3 days", "2026-07-10 09:00"',
+          description = 'Reopen when?  e.g. "tomorrow 14:00", "monday morning", "3 days", "2026-07-10 09:00"',
           action = wezterm.action_callback(function(w2, p2, line)
             if line and line ~= '' then snooze_do(w2, p2, rec, line) end
           end),
