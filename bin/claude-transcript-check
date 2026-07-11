@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Flag Claude transcripts that look truncated — read-only integrity check.
+
+A transcript should be the most-recent record of its session. Two signals say it
+has silently lost its tail:
+
+  1. ACTIVITY AFTER LAST MESSAGE. A session writes tool results and subagent
+     transcripts into <session-id>/{tool-results,subagents}/ *as it works*, and
+     logs each into the .jsonl. So the transcript's last message timestamp should
+     never lag its own activity dir by much. When it lags by hours/days, the
+     session kept working after the transcript stopped growing — i.e. the tail was
+     truncated. (This is the signal that caught the 8a30c539 loss: subagents dated
+     07-06 under a transcript that ended 06-29.)
+
+  2. BACKUP LARGER THAN LIVE. If ~/.claude/projects-backup/<rel> is bigger than the
+     live file, the live file was truncated and the backup still holds more —
+     recoverable right now via `claude-restore-transcripts`.
+
+Exit status: 0 if clean, 1 if anything is flagged (usable from a timer/hook).
+Nothing is ever modified.
+
+Usage:  claude-transcript-check [-v]
+"""
+import glob
+import json
+import os
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+LIVE = os.path.join(HOME, ".claude", "projects")
+BACKUP = os.path.join(HOME, ".claude", "projects-backup")
+LAG_THRESHOLD = 3600            # activity newer than last message by > this = suspect
+TAIL_BYTES = 512 * 1024         # read this much of the file's end to find last ts
+ACTIVITY_SUBDIRS = ("subagents", "tool-results")
+
+
+def last_message_epoch(path):
+    """Newest .timestamp in the transcript, as epoch seconds (None if unknown)."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            if size > TAIL_BYTES:
+                f.seek(size - TAIL_BYTES)
+                f.readline()            # drop the partial first line
+            tail = f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+    newest = None
+    for line in tail.splitlines():
+        line = line.strip()
+        if not line or '"timestamp"' not in line:
+            continue
+        try:
+            ts = json.loads(line).get("timestamp")
+        except ValueError:
+            continue
+        if not ts:
+            continue
+        try:
+            from datetime import datetime
+            e = datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            continue
+        if newest is None or e > newest:
+            newest = e
+    return newest
+
+
+def newest_activity_mtime(session_dir):
+    """Most-recent mtime among the session's tool-results / subagents files."""
+    newest = None
+    for sub in ACTIVITY_SUBDIRS:
+        d = os.path.join(session_dir, sub)
+        if not os.path.isdir(d):
+            continue
+        for root, _dirs, files in os.walk(d):
+            for fn in files:
+                try:
+                    m = os.path.getmtime(os.path.join(root, fn))
+                except OSError:
+                    continue
+                if newest is None or m > newest:
+                    newest = m
+    return newest
+
+
+def human_dt(epoch):
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(epoch)) if epoch else "?"
+
+
+def main():
+    verbose = "-v" in sys.argv or "--verbose" in sys.argv
+    flagged = []
+    checked = 0
+
+    for path in glob.glob(os.path.join(LIVE, "*", "*.jsonl")):
+        checked += 1
+        rel = os.path.relpath(path, LIVE)
+        sid = os.path.basename(path)[:-6]                     # strip ".jsonl"
+        session_dir = os.path.join(os.path.dirname(path), sid)
+
+        # Signal 1: activity after last logged message.
+        act = newest_activity_mtime(session_dir)
+        if act is not None:
+            last = last_message_epoch(path)
+            if last is not None and (act - last) > LAG_THRESHOLD:
+                flagged.append(
+                    "TRUNCATED-TAIL  %s\n    last message %s, but activity through %s "
+                    "(+%.1fh after)" % (rel, human_dt(last), human_dt(act),
+                                        (act - last) / 3600.0))
+
+        # Signal 2: backup larger than live (restorable now).
+        bpath = os.path.join(BACKUP, rel)
+        try:
+            if os.path.getsize(bpath) > os.path.getsize(path):
+                flagged.append(
+                    "BACKUP-LARGER   %s\n    live %d B < backup %d B — run "
+                    "claude-restore-transcripts" % (rel, os.path.getsize(path),
+                                                    os.path.getsize(bpath)))
+        except OSError:
+            pass
+
+    for line in flagged:
+        print(line)
+    if flagged:
+        print("\n%d transcript(s) flagged of %d checked." % (len(flagged), checked))
+        return 1
+    if verbose:
+        print("OK — %d transcripts checked, none truncated." % checked)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
