@@ -27,6 +27,19 @@ HOME = os.path.expanduser("~")
 LIVE = os.path.join(HOME, ".claude", "projects")
 BACKUP = os.path.join(HOME, ".claude", "projects-backup")
 WINDOW = 300  # seconds; only touch files modified this recently (keeps each run cheap)
+SHRINK_LOG = os.path.join(HOME, ".claude", "transcript-shrink.log")
+
+
+def _log_shrink(rel, live_sz, bak_sz):
+    """Record a refused mirror. Loud on purpose: a shrinking transcript means the
+    live file lost content, and the backup we just protected is the only copy."""
+    try:
+        with open(SHRINK_LOG, "a") as f:
+            f.write("%s  REFUSED mirror (live shrank): live=%d backup=%d lost=%d  %s\n"
+                    % (time.strftime("%Y-%m-%d %H:%M:%S"), live_sz, bak_sz,
+                       bak_sz - live_sz, rel))
+    except OSError:
+        pass
 
 
 def fsync_path(path):
@@ -78,11 +91,23 @@ def main():
             if fsync_path(src):
                 synced += 1
 
-            # 2) mirror to the backup tree, but only when the source is newer/bigger
+            # 2) mirror to the backup tree, but only when the source is newer/bigger.
+            #
+            # NEVER mirror a live file that has SHRUNK. A transcript only loses bytes
+            # when it has been truncated or rolled back, and the fuller backup is
+            # precisely the copy this tree exists to preserve. The old guard tested
+            # `st_size != dst_st.st_size`, so a truncated live file counted as "fresh"
+            # and overwrote the good backup within one 20s tick — destroying the only
+            # surviving copy (this is how ~a week of one session was lost). Refuse the
+            # mirror, keep the backup, and log it so `claude-restore-transcripts` (which
+            # restores when live < backup) can put it back.
             rel = os.path.relpath(src, LIVE)
             dst = os.path.join(BACKUP, rel)
             try:
                 dst_st = os.stat(dst)
+                if st.st_size < dst_st.st_size:
+                    _log_shrink(rel, st.st_size, dst_st.st_size)
+                    continue
                 fresh = (st.st_mtime > dst_st.st_mtime) or (st.st_size != dst_st.st_size)
             except OSError:
                 fresh = True
