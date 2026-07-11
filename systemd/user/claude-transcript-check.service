@@ -7,3 +7,9 @@ ExecStart=%h/.claude/bin/claude-transcript-check --notify
 # The check exits 1 when it flags a transcript (useful as a CLI signal); that's a
 # normal outcome for the timer, not a service failure.
 SuccessExitStatus=1
+# Auto-heal: after detecting, restore any truncated live file from its (now
+# shrink-protected) backup. Only acts when live < backup, so it's a no-op when
+# clean and can't disturb a healthy or actively-growing transcript. Runs on every
+# tick — crucially the 4-min-post-boot one, when resume-truncations happen. '-'
+# so a restore hiccup never marks the service failed.
+ExecStartPost=-%h/.claude/bin/claude-restore-transcripts

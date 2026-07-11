@@ -101,8 +101,7 @@ def _notify(recoverable):
     try:
         subprocess.run(
             ["notify-send", "-u", "critical", "Claude — transcript truncated",
-             "%d transcript(s) truncated but recoverable. Run "
-             "claude-restore-transcripts." % recoverable],
+             "%d transcript(s) truncated; restoring from backup." % recoverable],
             check=False)
     except Exception:
         pass
