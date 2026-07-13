@@ -13,9 +13,12 @@ the machine and WezTerm are back.
   claude-schedule cancel --sid SID
   claude-schedule reopen-due [--dry-run]
 
-Time STR accepts: relative (2h, 30m, 3d, 1w, "3 days"), tomorrow [HH:MM],
-tonight, next week, a bare time of day (9am, 14:00 -> next occurrence), or ISO
-(YYYY-MM-DD [HH:MM]).
+Time STR accepts: relative (2h, 30m, 3d, 1w, "3 days"), tomorrow, a weekday
+name ("monday", "next fri") — each with an optional part of day and/or time
+("monday morning at 9 am", "tomorrow evening") — tonight, next week, a bare
+time of day (9am, 14:00 -> next occurrence), or ISO (YYYY-MM-DD [HH:MM]).
+Anything else falls back to a headless `claude -p` call (validated, future-
+only), so free-form phrasing still works when the grammar misses.
 """
 import argparse
 import datetime as dt
@@ -60,6 +63,35 @@ def _parse_tod(s):
     return h, m
 
 
+_WEEKDAYS = {
+    "monday": 0, "mon": 0, "tuesday": 1, "tue": 1, "tues": 1,
+    "wednesday": 2, "wed": 2, "thursday": 3, "thu": 3, "thur": 3, "thurs": 3,
+    "friday": 4, "fri": 4, "saturday": 5, "sat": 5, "sunday": 6, "sun": 6,
+}
+_PARTS_OF_DAY = {
+    "morning": (9, 0), "noon": (12, 0), "midday": (12, 0),
+    "afternoon": (14, 0), "evening": (18, 0), "night": (20, 0),
+}
+
+
+def _tod_from_tokens(tokens):
+    """Tokens after a day word -> (hour, minute) or None if there are none.
+    Drops 'at'/'on' filler; a part-of-day word supplies the time only when no
+    explicit one is given ("monday morning at 9 am" -> 9:00). ValueError if
+    what remains isn't a time."""
+    explicit, default = [], None
+    for t in tokens:
+        if t in ("at", "on"):
+            continue
+        if t in _PARTS_OF_DAY:
+            default = _PARTS_OF_DAY[t]
+        else:
+            explicit.append(t)
+    if explicit:
+        return _parse_tod(" ".join(explicit))
+    return default
+
+
 def parse_when(s, now=None):
     """A human time expression -> absolute epoch (int)."""
     now = now or dt.datetime.now()
@@ -78,10 +110,23 @@ def parse_when(s, now=None):
     if s == "next week":
         return int((now + dt.timedelta(days=7)).timestamp())
 
-    if s == "tomorrow" or s.startswith("tomorrow "):
-        rest = s[len("tomorrow"):].strip()
-        h, m = _parse_tod(rest) if rest else (9, 0)
-        cand = (now + dt.timedelta(days=1)).replace(hour=h, minute=m, second=0, microsecond=0)
+    # tomorrow / weekday, with optional part of day and/or explicit time:
+    # "tomorrow", "tomorrow evening", "monday morning at 9 am", "next fri 14:00"
+    tokens = s.split()
+    nxt = tokens[0] == "next" and len(tokens) > 1
+    day = tokens[1] if nxt else tokens[0]
+    if day == "tomorrow" or day in _WEEKDAYS:
+        h, m = _tod_from_tokens(tokens[(2 if nxt else 1):]) or (9, 0)
+        if day == "tomorrow":
+            cand = now + dt.timedelta(days=1)
+        else:
+            ahead = (_WEEKDAYS[day] - now.weekday()) % 7
+            if nxt and ahead == 0:
+                ahead = 7
+            cand = now + dt.timedelta(days=ahead)
+        cand = cand.replace(hour=h, minute=m, second=0, microsecond=0)
+        if cand <= now:                      # today's weekday, time already past
+            cand += dt.timedelta(days=7)
         return int(cand.timestamp())
 
     for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
@@ -131,8 +176,48 @@ def _wakes_in(reopen_at, now):
     return "%dd" % round(d / 86400)
 
 
+def _llm_when(s, now):
+    """Fallback for phrases the grammar can't parse: ask a headless claude
+    (haiku — this path is rare and interactive, so speed beats depth) to
+    resolve the phrase against the current clock. Strictly validated: the
+    reply must be a lone parseable 'YYYY-MM-DD HH:MM' in the future, so a
+    hallucinated answer degrades to the normal parse error rather than a
+    silently wrong schedule — and the caller echoes the resolved time back
+    for eyeball verification. None on any failure (no CLI, offline, timeout,
+    bad reply); only `add` calls this, so the 60s reopen timer never blocks
+    on the network."""
+    if not shutil.which("claude"):
+        return None
+    prompt = (
+        "Current local time: %s (%s).\n"
+        "A user wants a terminal tab to reopen at: %r\n"
+        "Resolve that to an absolute local time; if ambiguous, pick the next "
+        "future occurrence. Reply with exactly one line and nothing else: "
+        "'YYYY-MM-DD HH:MM', or 'none' if it does not describe a time."
+        % (now.strftime("%Y-%m-%d %H:%M"), now.strftime("%A"), s))
+    try:
+        # --strict-mcp-config: don't boot MCP servers for a one-line answer
+        # (drops the call from ~9s to ~3s; wezterm blocks on this synchronously).
+        r = subprocess.run(["claude", "-p", prompt, "--model", "haiku",
+                            "--strict-mcp-config"],
+                           capture_output=True, text=True, timeout=30)
+        cand = (r.stdout or "").strip().splitlines()[-1].strip()
+        t = dt.datetime.strptime(cand, "%Y-%m-%d %H:%M")
+        return int(t.timestamp()) if t > now else None
+    except Exception:
+        return None
+
+
 def cmd_add(a):
-    when = parse_when(a.when)
+    # One clean line on a bad time, not a traceback — stderr lands verbatim in
+    # the WezTerm snooze toast, which only has room for the first line.
+    try:
+        when = parse_when(a.when)
+    except ValueError as e:
+        when = _llm_when(a.when, dt.datetime.now())
+        if when is None:
+            sys.exit("error: %s — try '2h', 'tomorrow 9am', 'monday morning', "
+                     "'2026-07-14 09:00'" % e)
     entries = [e for e in _read() if e.get("session_id") != a.sid]
     entries.append({
         "session_id": a.sid,

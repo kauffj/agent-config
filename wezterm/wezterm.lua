@@ -639,7 +639,7 @@ end
 
 local function snooze_do(win, pane, rec, when)
   local disp = ((rec.project or '') .. ' ' .. (rec.label or '')):gsub('^%s+', ''):gsub('%s+$', '')
-  local ok, _, stderr = wezterm.run_child_process({
+  local ok, stdout, stderr = wezterm.run_child_process({
     HOME .. '/.claude/bin/claude-schedule', 'add',
     '--sid', rec.session_id, '--cwd', rec.cwd or '',
     '--when', when, '--label', disp ~= '' and disp or rec.session_id,
@@ -647,7 +647,11 @@ local function snooze_do(win, pane, rec, when)
   if not ok then
     win:toast_notification('fleet', 'snooze failed: ' .. (stderr or ''), nil, 4000); return
   end
-  win:toast_notification('fleet', 'snoozed ' .. disp, nil, 2500)
+  -- Echo the resolved time ("scheduled <sid> -> 2026-07-13 09:00") back in the
+  -- toast: free-form phrases may have been interpreted by an LLM, so show what
+  -- was actually understood before the tab disappears.
+  local at = (stdout or ''):match('%-> *(%d[%d%- :]+%d)')
+  win:toast_notification('fleet', 'snoozed ' .. disp .. (at and (' — back ' .. at) or ''), nil, 2500)
   fsync_transcript(rec.session_id)   -- make the transcript durable before we close
   win:perform_action(act.CloseCurrentTab { confirm = false }, pane)
 end
