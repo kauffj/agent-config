@@ -63,6 +63,25 @@ else
   since="$now"
 fi
 
+# A resume/startup isn't fresh attention. When SessionStart can't inherit a
+# prior wait (state file long reaped, or the session died mid-work), seed
+# `since` from the transcript's last real turn — user/assistant entries carry
+# timestamps; the metadata a reopen appends doesn't — so an old session
+# reopened days later shows its true idle age, not a calm fresh tab.
+# SessionStart ONLY: a live session's on-disk transcript can lag minutes
+# behind (writes are buffered), so this signal is truthful just at reopen,
+# when the closed session's file is fully flushed.
+if [[ "$event" == "SessionStart" && "$since" == "$now" && -n "$cwd" ]]; then
+  tf="$CLAUDE_DIR/projects/${cwd//\//-}/$session_id.jsonl"
+  ts=$(tail -n 500 "$tf" 2>/dev/null \
+       | jq -r 'select(.timestamp and (.type=="user" or .type=="assistant")) | .timestamp' 2>/dev/null \
+       | tail -n 1)
+  if [[ -n "$ts" ]]; then
+    t=$(date -d "$ts" +%s 2>/dev/null)
+    [[ -n "$t" && "$t" -lt "$now" ]] && since="$t"
+  fi
+fi
+
 mkdir -p "$STATE_DIR"
 tmp="$state_file.$$"
 if jq -nc --arg sid "$session_id" --arg st "$status" \
