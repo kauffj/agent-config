@@ -57,6 +57,17 @@ It skips any session whose transcript no longer exists, so a rolled-back id neve
 spawns a dead "No conversation found" tab — run `claude-restore-transcripts` first
 to pull survivors out of backup.
 
+## Reading (the scrollback-mangle escape hatch)
+
+- **`claude-transcript`** — renders a session's transcript as clean text with
+  logical lines intact, so the *terminal* does the wrapping instead of Claude
+  Code's hard newlines (anthropics/claude-code#43113): output reflows on resize,
+  the scrollbar tracks it, selections copy as unbroken paragraphs. No session,
+  no tokens — it's a file formatter. `CTRL+SHIFT+H` in WezTerm opens the focused
+  pane's session in a new tab (Ctrl+D closes); or `claude-transcript [SIDPREFIX]`,
+  `--pane N`, `-p` to page in `less`. On-disk transcripts trail live output by a
+  few seconds — this is for re-reading, not tailing.
+
 ## Usage
 
 ```sh

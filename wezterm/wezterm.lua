@@ -705,6 +705,16 @@ config.keys = {
   { key = 's',     mods = 'CTRL|SHIFT', action = wezterm.action_callback(session_snooze) },
   { key = 'o',     mods = 'CTRL|SHIFT', action = act.ShowLauncherArgs { flags = 'FUZZY|WORKSPACES' } },
   { key = 'g',     mods = 'CTRL|SHIFT', action = wezterm.action_callback(launch_family) },
+  -- Readable history: open the focused pane's Claude session transcript in a
+  -- new tab, printed as logical lines so WezTerm does the wrapping — reflows on
+  -- resize, scrollbar gauges it, selections copy unbroken. The tab drops into a
+  -- shell after printing (Ctrl+D closes). See bin/claude-transcript.
+  { key = 'h',     mods = 'CTRL|SHIFT', action = wezterm.action_callback(function(win, pane)
+      win:perform_action(act.SpawnCommandInNewTab {
+        args = { HOME .. '/.claude/bin/claude-transcript',
+                 '--pane', tostring(pane:pane_id()), '--hold' },
+      }, pane)
+    end) },
   -- Reorder the active tab. Left/Right shift it one slot; Home/End send it to the ends.
   { key = 'LeftArrow',  mods = 'CTRL|SHIFT', action = act.MoveTabRelative(-1) },
   { key = 'RightArrow', mods = 'CTRL|SHIFT', action = act.MoveTabRelative(1) },

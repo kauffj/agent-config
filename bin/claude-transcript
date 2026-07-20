@@ -1,0 +1,201 @@
+#!/usr/bin/env python3
+"""Render a Claude session transcript as clean text for native terminal reading.
+
+Why: Claude Code's TUI prints prose with hard newlines at render-time width, so
+scrollback mangles permanently on resize and copied paragraphs come out as
+fragments (anthropics/claude-code#43113). The transcript JSONL stores the text
+*unwrapped*. This prints it with logical lines intact and lets the terminal do
+the wrapping — so the output reflows on resize, the scrollbar gauges/track it,
+and selections copy as unbroken paragraphs.
+
+  claude-transcript                 most recently active session
+  claude-transcript SID[PREFIX]     specific session (unique id prefix ok)
+  claude-transcript --pane N        session hosted in WezTerm pane N
+  claude-transcript -p              page in `less` instead of printing
+  claude-transcript --hold          after printing, exec $SHELL (keybinding tabs)
+
+Bound to CTRL+SHIFT+H in wezterm.lua: opens the focused pane's session in a new
+tab. On-disk transcripts trail the live conversation by a few seconds (see
+claude-transcript-sync) — this is for re-reading history, not tailing output.
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from _claude_sessions_lib import PROJECTS_DIR, _project_dir, live_sessions
+
+BOLD, DIM, CYAN, RESET = "\033[1m", "\033[2m", "\033[36m", "\033[0m"
+
+
+def all_transcripts():
+    for path in glob.glob(os.path.join(PROJECTS_DIR, "**", "*.jsonl"), recursive=True):
+        if os.sep + "subagents" + os.sep not in path:
+            yield path
+
+
+def newest_transcript():
+    return max(all_transcripts(), key=os.path.getmtime, default=None)
+
+
+def by_sid_prefix(prefix):
+    hits = [p for p in all_transcripts() if os.path.basename(p).startswith(prefix)]
+    if not hits:
+        sys.exit(f"claude-transcript: no transcript matches '{prefix}'")
+    return max(hits, key=os.path.getmtime)
+
+
+def by_pane(pane):
+    """The transcript of the live session whose process runs in WezTerm pane N.
+    Every process spawned in a pane inherits WEZTERM_PANE, including claude."""
+    want = f"WEZTERM_PANE={pane}".encode()
+    for sid, info in live_sessions().items():
+        pid = info.get("pid")
+        if not pid:
+            continue
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                env = f.read().split(b"\0")
+        except OSError:
+            continue
+        if want in env:
+            path = os.path.join(_project_dir(info["cwd"]), sid + ".jsonl")
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+CMD_RE = re.compile(r"<command-name>(.*?)</command-name>", re.S)
+ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.S)
+REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+
+
+def classify_user_text(t):
+    """('prompt'|'aside', text) for a user text block, or None to skip it."""
+    s = t.strip()
+    if not s:
+        return None
+    if "<command-name>" in s:
+        name, args = CMD_RE.search(s), ARGS_RE.search(s)
+        label = name.group(1).strip() if name else "command"
+        if args and args.group(1).strip():
+            label += " " + args.group(1).strip()
+        return ("aside", label)
+    if s.startswith("<local-command-stdout>"):
+        body = re.sub(r"</?local-command-stdout>", "", s).strip()
+        return ("aside", body.splitlines()[0][:110]) if body else None
+    if s.startswith(("[SYSTEM NOTIFICATION", "<task-notification>")):
+        m = re.search(r"<summary>(.*?)</summary>", s, re.S)
+        return ("aside", "background: " + (m.group(1).strip() if m else "task notification"))
+    if s.startswith("[Request interrupted"):
+        return ("aside", s.splitlines()[0])
+    s = REMINDER_RE.sub("", s).strip()
+    return ("prompt", s) if s else None
+
+
+def tool_label(block):
+    name = block.get("name", "tool")
+    inp = block.get("input") or {}
+    for key in ("description", "command", "skill", "file_path", "pattern",
+                "query", "url", "prompt"):
+        v = inp.get(key)
+        if isinstance(v, str) and v.strip():
+            v = " ".join(v.split())
+            return f"{name}: {v[:110]}" + ("…" if len(v) > 110 else "")
+    return name
+
+
+def hhmm(entry):
+    ts = entry.get("timestamp")
+    if not ts:
+        return "??:??"
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime("%H:%M")
+    except ValueError:
+        return "??:??"
+
+
+def render(path, color=True):
+    b, d, c, r = (BOLD, DIM, CYAN, RESET) if color else ("", "", "", "")
+    sid = os.path.basename(path)[:-6]
+    out = [f"{d}session {sid}\n{path}{r}\n"]
+    with open(path) as f:
+        for line in f:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if e.get("isSidechain") or e.get("isMeta"):
+                continue
+            kind = e.get("type")
+            if kind == "user":
+                content = (e.get("message") or {}).get("content")
+                texts = [content] if isinstance(content, str) else [
+                    blk.get("text", "") for blk in content or []
+                    if isinstance(blk, dict) and blk.get("type") == "text"]
+                for txt in texts:
+                    got = classify_user_text(txt)
+                    if not got:
+                        continue
+                    what, val = got
+                    if what == "prompt":
+                        out.append(f"\n{d}{'─' * 8} {hhmm(e)} {'─' * 44}{r}\n"
+                                   f"{c}{b}❯{r} {b}{val}{r}\n")
+                    else:
+                        out.append(f"{d}· {val}{r}\n")
+            elif kind == "assistant":
+                for blk in (e.get("message") or {}).get("content") or []:
+                    if not isinstance(blk, dict):
+                        continue
+                    if blk.get("type") == "text" and blk.get("text", "").strip():
+                        out.append("\n" + blk["text"].rstrip() + "\n")
+                    elif blk.get("type") == "tool_use":
+                        out.append(f"{d}⏺ {tool_label(blk)}{r}\n")
+    return "".join(out)
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("sid", nargs="?", help="session id or unique prefix")
+    ap.add_argument("--pane", type=int, help="resolve session from WezTerm pane id")
+    ap.add_argument("-p", "--pager", action="store_true", help="view in less")
+    ap.add_argument("--hold", action="store_true",
+                    help="exec $SHELL after printing (keeps a spawned tab open)")
+    args = ap.parse_args()
+
+    if args.pane is not None:
+        path = by_pane(args.pane)
+        if not path:
+            print(f"{DIM}(no live session found in pane {args.pane}; "
+                  f"showing most recent transcript){RESET}")
+            path = newest_transcript()
+    elif args.sid:
+        path = by_sid_prefix(args.sid)
+    else:
+        path = newest_transcript()
+    if not path:
+        sys.exit("claude-transcript: no transcripts found")
+
+    color = args.pager or args.hold or sys.stdout.isatty()
+    text = render(path, color=color and "NO_COLOR" not in os.environ)
+
+    if args.pager:
+        try:
+            subprocess.run(["less", "-R", "+G"], input=text.encode())
+        except FileNotFoundError:
+            sys.stdout.write(text)
+        return
+    sys.stdout.write(text)
+    if args.hold:
+        sys.stdout.flush()
+        shell = os.environ.get("SHELL", "bash")
+        os.execvp(shell, [shell])
+
+
+if __name__ == "__main__":
+    main()
