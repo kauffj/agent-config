@@ -6,7 +6,8 @@
 --
 -- Provides four things on top of WezTerm:
 --   1. Tab colors that ESCALATE the longer a session waits (format-tab-title).
---   2. A session PICKER decoupled from the tab strip (CTRL+SHIFT+Space).
+--   2. A session PICKER decoupled from the tab strip (CTRL+SHIFT+Space),
+--      including transcript-content search (its '🔍' row).
 --   3. A workspace switcher for task clusters (CTRL+SHIFT+O).
 --   4. launch-family: spawn a saved cluster of sessions at once (CTRL+SHIFT+G).
 --
@@ -396,6 +397,8 @@ end)
 -- ---------------------------------------------------------------------------
 -- Session picker (CTRL+SHIFT+Space). Reads the registry fresh, shows a fuzzy
 -- list sorted by urgency, jumps to the chosen session's pane (or resumes it).
+-- Fuzzy matching covers names/branches/topics; the trailing '🔍' row hands off
+-- to session_search for transcript-content grep.
 -- ---------------------------------------------------------------------------
 local function run_registry()
   local ok, stdout, stderr = wezterm.run_child_process({ HOME .. '/.claude/bin/claude-sessions', '--json' })
@@ -446,6 +449,57 @@ local function activate_or_resume(win, pane, paneid, sid, cwd)
   win:perform_action(
     act.SpawnCommandInNewTab { cwd = cwd, args = { 'bash', '-lic', 'claude --resume ' .. sid .. '; exec bash' } },
     pane)
+end
+
+-- Content search (the picker's '🔍 search transcripts…' row): prompt for text,
+-- grep LIVE session transcripts via claude-search, then hand the matches to
+-- the same jump/resume flow as the picker. claude-search is the live-scoped
+-- sibling of the /find-session skill — and the picker can only jump to
+-- sessions that are actually open, which is exactly what claude-search scopes
+-- to. Results are ranked by match count.
+local function session_search(window, pane)
+  window:perform_action(act.PromptInputLine {
+    description = 'Find live session — transcript contains:',
+    action = wezterm.action_callback(function(win, p, line)
+      if not line or line == '' then return end       -- cancelled / empty
+      local ok, stdout, stderr = wezterm.run_child_process({ HOME .. '/.claude/bin/claude-search', line })
+      if not ok then
+        win:toast_notification('fleet', stderr or 'claude-search failed', nil, 4000); return
+      end
+      -- claude-search prints "count sid[:8] cwd"; join to the registry (full
+      -- session_id + pane + label) by 8-char prefix so we can jump/resume.
+      local recs = run_registry() or {}
+      local by_prefix = {}
+      for _, r in ipairs(recs) do by_prefix[tostring(r.session_id):sub(1, 8)] = r end
+
+      local choices, pane_by_id, cwd_by_id = {}, {}, {}
+      for l in stdout:gmatch('[^\n]+') do
+        local count, sid8, cwd = l:match('^%s*(%d+)%s+(%x+)%s+(.+)$')
+        if sid8 then
+          local r = by_prefix[sid8]
+          local id = r and r.session_id or sid8
+          table.insert(choices, {
+            id = id,
+            label = string.format('%3s×  %-28s %s', count, (r and r.label) or sid8, (r and r.project) or cwd),
+          })
+          pane_by_id[id] = r and r.wezterm_pane
+          cwd_by_id[id] = (r and r.cwd) or cwd
+        end
+      end
+      if #choices == 0 then
+        win:toast_notification('fleet', 'no live session matches "' .. line .. '"', nil, 3000); return
+      end
+      win:perform_action(act.InputSelector {
+        title = 'Fleet — search: ' .. line,
+        fuzzy = true,
+        choices = choices,
+        action = wezterm.action_callback(function(w2, p2, id)
+          if not id then return end
+          activate_or_resume(w2, p2, pane_by_id[id], id, cwd_by_id[id])
+        end),
+      }, p)
+    end),
+  }, pane)
 end
 
 local function session_picker(window, pane)
@@ -505,68 +559,22 @@ local function session_picker(window, pane)
 
   if #choices == 0 then window:toast_notification('fleet', 'no live or snoozed sessions', nil, 3000); return end
 
+  -- Deeper search as a picker row (same pattern as snooze's 'Custom…'): the
+  -- rows above fuzzy-match on names/topics only, so offer the transcript-
+  -- content grep when the session you want isn't findable by label.
+  table.insert(choices, { id = '__search__', label = fit('🔍', 2) .. ' search transcripts…' })
+
   window:perform_action(act.InputSelector {
     title = 'Fleet — sessions',
     fuzzy = true,
     choices = choices,
     action = wezterm.action_callback(function(win, p, id)
       if not id then return end       -- cancelled
+      if id == '__search__' then return session_search(win, p) end
       activate_or_resume(win, p, pane_by_id[id], id, cwd_by_id[id])
       if scheduled_ids[id] then
         wezterm.run_child_process({ HOME .. '/.claude/bin/claude-schedule', 'cancel', '--sid', id })
       end
-    end),
-  }, pane)
-end
-
--- ---------------------------------------------------------------------------
--- Content search (CTRL+SHIFT+F): prompt for text, grep LIVE session transcripts
--- via claude-search, then hand the matches to the same jump/resume flow as the
--- picker. claude-search is the live-scoped sibling of the /find-session skill —
--- and the picker can only jump to sessions that are actually open, which is
--- exactly what claude-search scopes to. Results are ranked by match count.
--- ---------------------------------------------------------------------------
-local function session_search(window, pane)
-  window:perform_action(act.PromptInputLine {
-    description = 'Find live session — transcript contains:',
-    action = wezterm.action_callback(function(win, p, line)
-      if not line or line == '' then return end       -- cancelled / empty
-      local ok, stdout, stderr = wezterm.run_child_process({ HOME .. '/.claude/bin/claude-search', line })
-      if not ok then
-        win:toast_notification('fleet', stderr or 'claude-search failed', nil, 4000); return
-      end
-      -- claude-search prints "count sid[:8] cwd"; join to the registry (full
-      -- session_id + pane + label) by 8-char prefix so we can jump/resume.
-      local recs = run_registry() or {}
-      local by_prefix = {}
-      for _, r in ipairs(recs) do by_prefix[tostring(r.session_id):sub(1, 8)] = r end
-
-      local choices, pane_by_id, cwd_by_id = {}, {}, {}
-      for l in stdout:gmatch('[^\n]+') do
-        local count, sid8, cwd = l:match('^%s*(%d+)%s+(%x+)%s+(.+)$')
-        if sid8 then
-          local r = by_prefix[sid8]
-          local id = r and r.session_id or sid8
-          table.insert(choices, {
-            id = id,
-            label = string.format('%3s×  %-28s %s', count, (r and r.label) or sid8, (r and r.project) or cwd),
-          })
-          pane_by_id[id] = r and r.wezterm_pane
-          cwd_by_id[id] = (r and r.cwd) or cwd
-        end
-      end
-      if #choices == 0 then
-        win:toast_notification('fleet', 'no live session matches "' .. line .. '"', nil, 3000); return
-      end
-      win:perform_action(act.InputSelector {
-        title = 'Fleet — search: ' .. line,
-        fuzzy = true,
-        choices = choices,
-        action = wezterm.action_callback(function(w2, p2, id)
-          if not id then return end
-          activate_or_resume(w2, p2, pane_by_id[id], id, cwd_by_id[id])
-        end),
-      }, p)
     end),
   }, pane)
 end
@@ -701,7 +709,8 @@ end
 -- ---------------------------------------------------------------------------
 config.keys = {
   { key = 'Space', mods = 'CTRL|SHIFT', action = wezterm.action_callback(session_picker) },
-  { key = 'f',     mods = 'CTRL|SHIFT', action = wezterm.action_callback(session_search) },
+  -- CTRL+SHIFT+F deliberately unbound: transcript search lives in the picker
+  -- ('🔍' row), and F reverts to WezTerm's native scrollback search.
   { key = 's',     mods = 'CTRL|SHIFT', action = wezterm.action_callback(session_snooze) },
   { key = 'o',     mods = 'CTRL|SHIFT', action = act.ShowLauncherArgs { flags = 'FUZZY|WORKSPACES' } },
   { key = 'g',     mods = 'CTRL|SHIFT', action = wezterm.action_callback(launch_family) },

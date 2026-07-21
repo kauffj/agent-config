@@ -14,6 +14,7 @@ Usage:
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -33,28 +34,88 @@ def _load(path):
         return {}
 
 
+_CMD_RE = re.compile(r"<command-name>(.*?)</command-name>", re.S)
+_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.S)
+
+
+def _clip(s, limit):
+    return " ".join((s or "").split())[:limit]
+
+
+def _plain(txt):
+    """A human-typed line worth showing: not command/notification XML, not the
+    boilerplate the harness injects around skills and interrupted runs."""
+    txt = (txt or "").strip()
+    if (not txt or txt.startswith("<") or txt.startswith("Caveat:")
+            or txt.startswith("Base directory for this skill")
+            or txt.startswith("[Request interrupted")):
+        return ""
+    return txt
+
+
+def _user_text(ev):
+    c = (ev.get("message") or {}).get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        for b in c:
+            if isinstance(b, dict) and b.get("type") == "text":
+                return b.get("text") or ""
+    return ""
+
+
+def _founding_input(ev):
+    """The session's first substantive input, for sessions with no ai-title: a
+    slash-command invocation ('/plan migrate auth'), a human-typed prompt, or a
+    queued prompt. None if this event isn't one of those."""
+    t = ev.get("type")
+    if t == "user" and not ev.get("isMeta"):
+        txt = _user_text(ev)
+        m = _CMD_RE.search(txt)
+        if m:
+            args = _ARGS_RE.search(txt)
+            return ("%s %s" % (m.group(1).strip(),
+                               args.group(1).strip() if args else "")).strip()
+        return _plain(txt) or None
+    if t == "queue-operation" and ev.get("operation") == "enqueue":
+        return _plain(ev.get("content")) or None
+    return None
+
+
 def _topic(sid, cwd, limit=44):
     """Claude Code's generated session title, so same-project/same-branch sessions
     are distinguishable by what they're actually about. Read from the first
     'ai-title' event in the transcript (set early, so we can stop there and keep
-    picker latency low). Empty string if the transcript has none yet."""
+    picker latency low). Command-started sessions (/plan, /feature, ...) often
+    never get an ai-title, so fall back to the session's founding input — the
+    first slash-command invocation, human-typed prompt, or queued prompt. The
+    substring gates keep the scan cheap: once a fallback is banked, only
+    ai-title lines are parsed."""
     if not cwd:
         return ""
     path = os.path.join(_project_dir(cwd), sid + ".jsonl")
+    fallback = None
     try:
         with open(path, encoding="utf-8", errors="ignore") as f:
             for line in f:
-                if '"ai-title"' not in line:
-                    continue
-                try:
-                    ev = json.loads(line)
-                except ValueError:
-                    continue
-                if ev.get("type") == "ai-title" and ev.get("aiTitle"):
-                    return ev["aiTitle"].strip()[:limit]
+                if '"ai-title"' in line:
+                    try:
+                        ev = json.loads(line)
+                    except ValueError:
+                        continue
+                    if ev.get("type") == "ai-title" and ev.get("aiTitle"):
+                        return _clip(ev["aiTitle"], limit)
+                elif fallback is None and ('"user"' in line
+                                           or "command-name" in line
+                                           or "queue-operation" in line):
+                    try:
+                        ev = json.loads(line)
+                    except ValueError:
+                        continue
+                    fallback = _founding_input(ev)
     except OSError:
         return ""
-    return ""
+    return _clip(fallback, limit)
 
 
 def _git_branch(cwd):
