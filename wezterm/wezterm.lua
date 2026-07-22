@@ -148,22 +148,35 @@ wezterm.on('update-status', function(window, pane)
     local d = read_json_file(path)
     if d and d.wezterm_pane then
       local pane_id = tostring(d.wezterm_pane)
-      local sid = tostring(d.session_id or d.since or pane_id)
-      local age = 0
-      if d.status == 'waiting' and d.since then
-        local w = wait_awake_start[sid]
-        if not w or w.since ~= d.since then        -- a new wait (or `since` changed)
-          -- Seed from the REAL wall age so an existing spread of waits keeps its
-          -- relative order on first sight (fresh start / reboot), instead of every
-          -- tab collapsing to age 0. From here the awake clock freezes downtime.
-          w = { since = d.since, start = awake - math.max(0, now - d.since) }
-          wait_awake_start[sid] = w
+      local upd = tonumber(d.updated) or 0
+      -- Pane ids get reused and dead sessions' state files linger, so two files can
+      -- claim one pane. The live session keeps writing, so newest `updated` wins —
+      -- this is the stale-pane guard the old ●-in-title check used to provide.
+      local prev = fresh[pane_id]
+      if not prev or upd >= prev.updated then
+        local sid = tostring(d.session_id or d.since or pane_id)
+        local age = 0
+        if d.status == 'waiting' and d.since then
+          local w = wait_awake_start[sid]
+          if not w or w.since ~= d.since then      -- a new wait (or `since` changed)
+            -- Seed from the REAL wall age so an existing spread of waits keeps its
+            -- relative order on first sight (fresh start / reboot), instead of every
+            -- tab collapsing to age 0. From here the awake clock freezes downtime.
+            w = { since = d.since, start = awake - math.max(0, now - d.since) }
+            wait_awake_start[sid] = w
+          end
+          age = math.max(0, awake - w.start)
         end
-        seen[sid] = true
-        age = math.max(0, awake - w.start)
-        if age > longest and (not restrict or live[pane_id]) then longest = age end
+        fresh[pane_id] = { status = d.status, since = d.since, age = age, updated = upd, sid = sid }
       end
-      fresh[pane_id] = { status = d.status, since = d.since, age = age }
+    end
+  end
+  -- Ceiling + wait-start reaping over WINNERS only, so a dead duplicate for a reused
+  -- pane can't inflate the gradient ceiling or keep a stale wait-start alive.
+  for pane_id, e in pairs(fresh) do
+    if e.status == 'waiting' then
+      seen[e.sid] = true
+      if (not restrict or live[pane_id]) and e.age > longest then longest = e.age end
     end
   end
   pane_state = fresh
@@ -260,16 +273,19 @@ local function trunc(s, n)
   return s:sub(1, math.max(1, n - 1)) .. '…'
 end
 
--- A one-char status glyph derived from the pane title. session-state.sh appends
--- '●' (waiting on you) as a SUFFIX, and Claude Code prefixes a '✳'/'*' spinner
--- while working. We surface it right after the tab number so truncation (which
--- eats the right edge) can never swallow it. Idle/clean -> a dim dot.
+-- A one-char status glyph. The hook-owned STATE is authoritative (waiting -> '●',
+-- working -> '✳'); we fall back to parsing the title only when there's no state,
+-- because Claude Code rewrites the title ('✳ <task>') and can't be trusted to carry
+-- the '●' marker. Surfaced right after the tab number so right-edge truncation can
+-- never swallow it. Idle/clean/unknown -> a dim dot.
 --
 -- NOTE: '✳'/'●' are 3-byte UTF-8 chars and MUST be matched as whole literals,
 -- never inside a '[...]' class — a class matches individual bytes, which splits
 -- the glyph and yields invalid UTF-8 that WezTerm rejects (the tab then silently
 -- falls back to its default 'N:' rendering).
-local function status_glyph(t)
+local function status_glyph(st, t)
+  if st and st.status == 'waiting' then return '●' end
+  if st and st.status == 'working' then return '✳' end
   t = t or ''
   if t:match('●%s*$') then return '●' end
   if t:match('^%s*✳') or t:match('^%s*%*') then return '✳' end
@@ -345,11 +361,12 @@ wezterm.on('format-tab-title', function(tab, tabs, panes, conf, hover, max_width
   local idx = tab.tab_index + 1
   local pt = tab.active_pane and tab.active_pane.title or ''
   local st = tab.active_pane and pane_state[tostring(tab.active_pane.pane_id)] or nil
-  -- The pane's LIVE title is authoritative for waiting-vs-working (● suffix), so
-  -- we only trust a wait color when it's actually present. Pane ids get reused and
-  -- dead sessions' state files linger, so pane_state alone can hand a working tab a
-  -- stale wait color from a long-gone session that once held this pane id.
-  local c = pt:match('●%s*$') and wait_colors(st) or nil
+  -- Color comes from the hook-owned STATE FILE (via pane_state), not the live title.
+  -- Claude Code also writes the title ('✳ <task>'), so it can't be trusted to carry
+  -- the '●' waiting marker — half the waiting panes lose it and would render black.
+  -- The state file has a single writer (the hook), and update-status resolves
+  -- reused-pane collisions by newest `updated`, so pane_state is the authority.
+  local c = wait_colors(st)
 
   -- Proportional shares: the active tab gets ACTIVE_WEIGHT, every other tab 1.
   -- CRUCIAL: we do NOT funnel the rounding remainder into the active tab. Doing
@@ -371,7 +388,7 @@ wezterm.on('format-tab-title', function(tab, tabs, panes, conf, hover, max_width
   -- gets a distinguishing, width-adaptive label. Glyph sits right after the number
   -- so truncation (right edge) can't swallow it.
   local label = tab.is_active and (pt ~= '' and pt or ('tab ' .. idx)) or smart_label(pt, target)
-  local text = fit(string.format(' %d %s %s ', idx, status_glyph(pt), label), target)
+  local text = fit(string.format(' %d %s %s ', idx, status_glyph(st, pt), label), target)
 
   -- Active wins the styling so "which tab am I in" is never ambiguous; a waiting
   -- active tab is one you're already looking at, so its escalation color can wait.
