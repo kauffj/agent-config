@@ -73,7 +73,8 @@ def main():
             continue
         r = subprocess.run(
             ["wezterm", "cli", "spawn", "--cwd", cwd, "--",
-             "bash", "-lic", "claude --resume %s; exec bash" % sid],
+             "bash", "-lic",
+             "unset CLAUDE_CODE_CHILD_SESSION; claude --resume %s; exec bash" % sid],
             capture_output=True, text=True)
         ok = r.returncode == 0
         spawned += ok

@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""Auto-rescue dead-writer (LIVE-FROZEN) Claude sessions by driving /export.
+
+Lever B — the standing actor that ends the manual-export toil. Detection is the
+exact signal `claude-transcript-check` already computes (a live session whose
+transcript appender died: it keeps turning from memory but nothing new reaches
+the .jsonl). Here we ACT on it: inject `/export <path>` into each flagged, idle,
+tty-verified pane so its RAM-only history is dumped to ~/.claude/rescue/ before a
+crash or a `gdm` restart can take it. No human ever types /export again.
+
+Idempotent by design: a session is exported only when it has TURNED since its
+last export (state `since` advanced), so a still-frozen-but-quiet session is not
+re-dumped every tick. Growth is therefore bounded by real new activity; we keep
+only the latest few dumps per session.
+
+Safety — this types into your LIVE sessions, so it is conservative:
+  * only sessions the check flagged LIVE-FROZEN (rescuable; history still in RAM)
+  * only panes whose state is `waiting` (never mid-turn)
+  * only after hard-verifying the pane hosts THAT session's claude proc, by
+    matching the pane's tty to /proc/<pid>/fd/0 (no spraying a reused pane id)
+  * two-step send — type the command, then a SEPARATE Enter; a bundled '\r' is
+    swallowed by the paste and never submits
+  * verify the export file lands non-empty before claiming success
+
+Exit 0 always (an actor, not a check). --notify desktop-alerts ONLY the sessions
+it could not auto-rescue — those genuinely need a human; everything else is silent.
+"""
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+HOME = os.path.expanduser("~")
+BIN = os.path.join(HOME, ".claude", "bin")
+STATE = os.path.join(HOME, ".claude", "state")
+RESCUE_DIR = os.path.join(HOME, ".claude", "rescue")
+LEDGER = os.path.join(RESCUE_DIR, ".rescued.json")   # {sid: last exported `since`}
+KEEP_PER_SID = 3                                     # dumps to retain per session
+POLL_TICKS = 30                                      # ~12s for /export to render
+
+sys.path.insert(0, BIN)
+from _claude_sessions_lib import live_sessions  # noqa: E402
+
+
+def frozen_candidates():
+    """The sessions claude-transcript-check flags LIVE-FROZEN, each joined to its
+    live state (pane, status, cwd, since). Reusing the check keeps a single
+    source of truth for the (subtle) dead-writer detection."""
+    txt = subprocess.run([os.path.join(BIN, "claude-transcript-check")],
+                         capture_output=True, text=True).stdout
+    out = []
+    for rel, _pane in re.findall(r'LIVE-FROZEN\s+(\S+)[\s\S]*?\(pane (\S+)\)', txt):
+        sid = os.path.basename(rel)[:-6]
+        st = {}
+        try:
+            with open(os.path.join(STATE, sid + ".json")) as f:
+                st = json.load(f)
+        except (OSError, ValueError):
+            pass
+        out.append({
+            "sid": sid,
+            "pane": str(st.get("wezterm_pane", "")),
+            "status": st.get("status", "?"),
+            "cwd": st.get("cwd", "") or "",
+            "since": st.get("since"),
+            "proj": os.path.basename(st.get("cwd", "") or rel.split("/")[0]),
+        })
+    return out
+
+
+def pane_map():
+    try:
+        j = subprocess.run(["wezterm", "cli", "list", "--format", "json"],
+                           capture_output=True, text=True).stdout
+        panes = json.loads(j)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {}
+    m = {}
+    for p in panes:
+        cwd = p.get("cwd", "") or ""
+        path = ""
+        if cwd.startswith("file://"):
+            rest = cwd[len("file://"):]
+            slash = rest.find("/")
+            path = rest[slash:] if slash >= 0 else ""
+        m[str(p["pane_id"])] = {"tty": p.get("tty_name", ""), "cwd": path.rstrip("/")}
+    return m
+
+
+def proc_tty(pid):
+    try:
+        return os.readlink("/proc/%d/fd/0" % pid)
+    except (OSError, TypeError):
+        return None
+
+
+def pane_hosts_session(cand, panes, live):
+    """True only if we're certain the pane is this session's terminal."""
+    pane = cand["pane"]
+    if pane not in panes:
+        return False
+    pid = (live.get(cand["sid"]) or {}).get("pid")
+    tty = proc_tty(pid)
+    if tty and panes[pane]["tty"] and tty == panes[pane]["tty"]:
+        return True
+    # tty unavailable (rare) — fall back to cwd-basename agreement
+    return bool(panes[pane]["cwd"]) and os.path.basename(panes[pane]["cwd"]) == cand["proj"]
+
+
+def load_ledger():
+    try:
+        with open(LEDGER) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_ledger(d):
+    try:
+        with open(LEDGER, "w") as f:
+            json.dump(d, f)
+    except OSError:
+        pass
+
+
+def prune(sid8):
+    dumps = sorted(glob.glob(os.path.join(RESCUE_DIR, "*-%s.export.txt" % sid8)),
+                   key=os.path.getmtime, reverse=True)
+    for old in dumps[KEEP_PER_SID:]:
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+
+
+def export(cand):
+    """Drive `/export <path>` into the pane; return (path, bytes) — bytes 0 on
+    failure to land."""
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    out = os.path.join(RESCUE_DIR, "%s-%s-%s.export.txt" % (ts, cand["proj"], cand["sid"][:8]))
+    pane = cand["pane"]
+    subprocess.run(["wezterm", "cli", "send-text", "--pane-id", pane,
+                    "--no-paste", "/export %s" % out], check=False)
+    time.sleep(0.5)
+    subprocess.run(["wezterm", "cli", "send-text", "--pane-id", pane,
+                    "--no-paste", "\r"], check=False)
+    for _ in range(POLL_TICKS):
+        time.sleep(0.4)
+        if os.path.exists(out) and os.path.getsize(out) > 0:
+            return out, os.path.getsize(out)
+    return out, 0
+
+
+def notify(failed):
+    if not failed or not shutil.which("notify-send"):
+        return
+    where = ", ".join("%s (pane %s)" % (c["proj"], c["pane"]) for c in failed)
+    subprocess.run(
+        ["notify-send", "-u", "critical", "Claude — auto-rescue needs you",
+         "Couldn't auto-/export %d live session(s): %s. Check the pane and "
+         "/export it by hand." % (len(failed), where)], check=False)
+
+
+def main():
+    do_notify = "--notify" in sys.argv
+    verbose = "-v" in sys.argv or do_notify
+    os.makedirs(RESCUE_DIR, exist_ok=True)
+    live = live_sessions()
+    panes = pane_map()
+    ledger = load_ledger()
+
+    saved, failed, skipped = [], [], []
+    for c in frozen_candidates():
+        sid = c["sid"]
+        # dedupe: only export when the session has turned since we last saved it
+        prev = ledger.get(sid)
+        if c["since"] is not None and prev is not None and c["since"] <= prev:
+            skipped.append((c, "no new turns since last export"))
+            continue
+        if c["status"] != "waiting":
+            skipped.append((c, "busy (%s) — will retry next tick" % c["status"]))
+            continue
+        if not pane_hosts_session(c, panes, live):
+            skipped.append((c, "pane %s unverifiable" % c["pane"]))
+            continue
+        path, size = export(c)
+        if size:
+            saved.append((c, path, size))
+            if c["since"] is not None:
+                ledger[sid] = c["since"]
+            prune(sid[:8])
+        else:
+            failed.append(c)
+
+    save_ledger(ledger)
+    if do_notify:
+        notify(failed)
+    if verbose:
+        for c, path, size in saved:
+            print("SAVED   %-18s %s (%d B)" % (c["proj"], os.path.basename(path), size))
+        for c in failed:
+            print("FAILED  %-18s pane %s — export didn't land" % (c["proj"], c["pane"]))
+        for c, why in skipped:
+            print("skip    %-18s %s" % (c["proj"], why))
+        print("rescued %d, failed %d, skipped %d" % (len(saved), len(failed), len(skipped)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,14 @@
+[Unit]
+Description=Auto-rescue dead-writer Claude sessions by driving /export
+
+[Service]
+Type=oneshot
+# Drives `/export` into every live session whose transcript appender has died,
+# dumping its RAM-only history to ~/.claude/rescue/ before a crash can take it.
+# Idempotent (dedupes on the session's last-turn time); --notify alerts only the
+# sessions it could NOT auto-rescue.
+ExecStart=%h/.claude/bin/claude-rescue --notify
+# Log the marker-vs-dead-writer tally each tick, so the child-session hypothesis
+# gets a longitudinal record (does dead-writer stay concentrated in MARKED
+# sessions while clean ones stay healthy?). '-' so it never fails the unit.
+ExecStartPost=-%h/.claude/bin/claude-marker-audit --log

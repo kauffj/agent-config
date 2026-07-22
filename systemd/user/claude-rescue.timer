@@ -1,0 +1,15 @@
+[Unit]
+Description=Periodically auto-rescue dead-writer Claude sessions
+
+[Timer]
+# A transcript writer can die silently between ticks, and the un-persisted tail
+# dies with the process — so watch tighter than the 15-min integrity check.
+# claude-rescue dedupes on each session's last-turn time, so a quiet frozen
+# session is never re-exported; a short cadence only acts when there's genuinely
+# new history to save, so it isn't noisy.
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=20s
+
+[Install]
+WantedBy=timers.target

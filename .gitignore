@@ -53,3 +53,8 @@ scheduled.log
 __pycache__/
 *.pyc
 projects-backup/
+
+# Rescue exports (conversation content) + rescue runtime state — never source
+rescue/
+transcript-check.notified.json
+*-remote-session-terminals.txt

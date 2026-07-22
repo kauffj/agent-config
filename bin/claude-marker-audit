@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Test the hypothesis: are dead-writer sessions the ones launched with the
+CLAUDE_CODE_CHILD_SESSION marker?
+
+For every live claude session it records two facts and cross-tabulates them:
+  * MARKED   — the session's process env has CLAUDE_CODE_CHILD_SESSION set, i.e.
+               it was spawned as a "child session" (the leak fixed in claude-resume
+               / wezterm.lua on 2026-07-21).
+  * FROZEN   — claude-transcript-check flags it LIVE-FROZEN (dead writer).
+
+If the dead-writer bug is the child-session bug, FROZEN should concentrate almost
+entirely among MARKED sessions, and clean (unmarked) sessions should stay healthy.
+Run repeatedly over hours/days as clean sessions accumulate; --log appends a
+timestamped tally to ~/.claude/rescue/marker-audit.log for trend-tracking.
+"""
+import os, re, sys, json, subprocess, time
+
+HOME = os.path.expanduser("~")
+BIN = os.path.join(HOME, ".claude", "bin")
+sys.path.insert(0, BIN)
+from _claude_sessions_lib import live_sessions  # noqa: E402
+
+
+def frozen_sids():
+    txt = subprocess.run([os.path.join(BIN, "claude-transcript-check")],
+                         capture_output=True, text=True).stdout
+    return {os.path.basename(rel)[:-6]
+            for rel in re.findall(r'LIVE-FROZEN\s+(\S+)', txt)}
+
+
+def is_marked(pid):
+    try:
+        with open("/proc/%d/environ" % pid, "rb") as f:
+            return b"CLAUDE_CODE_CHILD_SESSION=" in f.read()
+    except (OSError, TypeError):
+        return None
+
+
+def main():
+    frozen = frozen_sids()
+    live = live_sessions()
+    rows, tally = [], {(True, True): 0, (True, False): 0,
+                       (False, True): 0, (False, False): 0}
+    for sid, info in live.items():
+        pid = info.get("pid")
+        marked = is_marked(pid)
+        if marked is None:
+            continue
+        fr = sid in frozen
+        tally[(marked, fr)] += 1
+        rows.append((sid[:8], "MARKED" if marked else "clean ",
+                     "FROZEN" if fr else "ok", os.path.basename(info.get("cwd", "") or "")))
+
+    rows.sort(key=lambda r: (r[1] != "MARKED", r[2] != "FROZEN"))
+    print("%-8s %-7s %-7s %s" % ("sid", "marker", "writer", "project"))
+    for r in rows:
+        print("%-8s %-7s %-7s %s" % r)
+
+    m_tot = tally[(True, True)] + tally[(True, False)]
+    c_tot = tally[(False, True)] + tally[(False, False)]
+    def rate(fr, tot): return "%d/%d (%.0f%%)" % (fr, tot, 100.0 * fr / tot) if tot else "0/0"
+    print("\nMARKED sessions frozen: %s" % rate(tally[(True, True)], m_tot))
+    print("clean  sessions frozen: %s" % rate(tally[(False, True)], c_tot))
+    print("(hypothesis holds if frozen concentrates in MARKED and clean stays ~0%%)")
+
+    if "--log" in sys.argv:
+        line = {"marked_total": m_tot, "marked_frozen": tally[(True, True)],
+                "clean_total": c_tot, "clean_frozen": tally[(False, True)]}
+        with open(os.path.join(HOME, ".claude", "rescue", "marker-audit.log"), "a") as f:
+            f.write("%d %s\n" % (int(time.time()), json.dumps(line)))
+
+
+if __name__ == "__main__":
+    main()

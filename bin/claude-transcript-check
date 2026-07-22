@@ -16,13 +16,28 @@ has silently lost its tail:
      live file, the live file was truncated and the backup still holds more —
      recoverable right now via `claude-restore-transcripts`.
 
+  3. LIVE SESSION, DEAD WRITER. Claude Code's transcript appender can die silently
+     mid-session (upstream bug, seen 12+ times since 2026-06): the session keeps
+     working from memory but nothing new reaches the .jsonl, and the history is
+     destroyed the moment the process exits. While the session is still ALIVE the
+     un-persisted turns are rescuable — run /export in its tab. Detected via the
+     session-state file our hooks maintain: `since` moves only on a real status
+     transition (a turn), so a turn stamped long after the transcript's last
+     message means the writer is dead. Requiring that turn to postdate the current
+     process's start keeps two look-alikes out: sessions merely reopened and idle
+     (reopen bumps `updated`/mtime but not `since`), and sessions whose missing
+     turns died with an earlier process — those are unrecoverable, reported as
+     TRUNCATED-TAIL, and never worth a nag. mtime is useless here: even a
+     dead-writer session still appends untimestamped metadata records.
+
 Exit status: 0 if clean, 1 if anything is flagged (usable from a timer/hook).
 Nothing is ever modified.
 
 Usage:  claude-transcript-check [-v] [--notify]
-  --notify  desktop-notify only when a RECOVERABLE truncation exists (backup >
-            live) — the actionable, restore-now case. Historical truncations
-            whose backup was already lost don't nag. Meant for a systemd timer.
+  --notify  desktop-notify only for the two ACT-NOW cases: a live session whose
+            writer died (/export it before it closes) and a recoverable
+            truncation (backup > live, restore imminent). Historical truncations
+            whose history is already gone don't nag. Meant for a systemd timer.
 """
 import glob
 import json
@@ -31,6 +46,9 @@ import shutil
 import subprocess
 import sys
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from _claude_sessions_lib import boot_epoch, live_sessions  # noqa: E402
 
 HOME = os.path.expanduser("~")
 LIVE = os.path.join(HOME, ".claude", "projects")
@@ -94,16 +112,75 @@ def human_dt(epoch):
     return time.strftime("%Y-%m-%d %H:%M", time.localtime(epoch)) if epoch else "?"
 
 
-def _notify(recoverable):
-    """Best-effort desktop alert for recoverable truncations (backup still fuller)."""
-    if not recoverable or not shutil.which("notify-send"):
+def session_state(sid):
+    """The state record hooks maintain for a live session, or {} if none."""
+    try:
+        with open(os.path.join(HOME, ".claude", "state", sid + ".json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def proc_start(pid):
+    """Wall-clock epoch when a pid started, or None."""
+    boot = boot_epoch()
+    if not pid or not boot:
+        return None
+    try:
+        with open("/proc/%d/stat" % pid) as f:
+            fields = f.read().rsplit(") ", 1)[1].split()
+        return boot + int(fields[19]) / os.sysconf("SC_CLK_TCK")
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _notify(recoverable, live_frozen):
+    """Best-effort desktop alerts, act-now cases only: live sessions to /export,
+    and recoverable truncations (backup still fuller)."""
+    if not shutil.which("notify-send"):
         return
     try:
-        subprocess.run(
-            ["notify-send", "-u", "critical", "Claude — transcript truncated",
-             "%d transcript(s) truncated; restoring from backup." % recoverable],
-            check=False)
+        if live_frozen:
+            where = ", ".join("%s (pane %s)" % (proj, pane or "?")
+                              for proj, pane in live_frozen)
+            subprocess.run(
+                ["notify-send", "-u", "critical", "Claude — session not saving",
+                 "%d live session(s) stopped writing their transcript. "
+                 "Run /export in: %s — BEFORE sleeping or closing them."
+                 % (len(live_frozen), where)],
+                check=False)
+        if recoverable:
+            subprocess.run(
+                ["notify-send", "-u", "critical", "Claude — transcript truncated",
+                 "%d transcript(s) truncated; restoring from backup." % recoverable],
+                check=False)
     except Exception:
+        pass
+
+
+NOTIFIED = os.path.join(HOME, ".claude", "transcript-check.notified.json")
+RENOTIFY = 4 * 3600     # re-alert for a still-frozen live session this often
+
+
+def _should_notify(sids):
+    """True when a session newly enters the frozen set, or the standing alert is
+    older than RENOTIFY — so the 15-min timer doesn't nag every tick, but an
+    unresolved frozen session isn't forgotten either."""
+    try:
+        with open(NOTIFIED) as f:
+            prev = json.load(f)
+    except (OSError, ValueError):
+        prev = {"sids": [], "at": 0}
+    if set(sids) - set(prev.get("sids", [])):
+        return True
+    return bool(sids) and time.time() - prev.get("at", 0) > RENOTIFY
+
+
+def _mark_notified(sids):
+    try:
+        with open(NOTIFIED, "w") as f:
+            json.dump({"sids": sids, "at": time.time()}, f)
+    except OSError:
         pass
 
 
@@ -111,24 +188,53 @@ def main():
     verbose = "-v" in sys.argv or "--verbose" in sys.argv
     notify = "--notify" in sys.argv
     flagged = []
+    live_frozen = []                # (sid, project, pane) — rescuable via /export
     recoverable = 0
     checked = 0
+    live = live_sessions()
 
     for path in glob.glob(os.path.join(LIVE, "*", "*.jsonl")):
         checked += 1
         rel = os.path.relpath(path, LIVE)
         sid = os.path.basename(path)[:-6]                     # strip ".jsonl"
         session_dir = os.path.join(os.path.dirname(path), sid)
+        state = session_state(sid) if sid in live else {}
 
-        # Signal 1: activity after last logged message.
+        since = state.get("since")
         act = newest_activity_mtime(session_dir)
-        if act is not None:
-            last = last_message_epoch(path)
-            if last is not None and (act - last) > LAG_THRESHOLD:
-                flagged.append(
-                    "TRUNCATED-TAIL  %s\n    last message %s, but activity through %s "
-                    "(+%.1fh after)" % (rel, human_dt(last), human_dt(act),
-                                        (act - last) / 3600.0))
+        last = last_message_epoch(path) if (since or act is not None) else None
+        stale = since and last and (since - last) > LAG_THRESHOLD
+
+        # Signal 3: a real turn (status transition) happened in the CURRENTLY
+        # RUNNING process after the transcript's last message — the writer is
+        # dead but the turns are still in memory; /export in that tab saves them.
+        pstart = proc_start(live[sid].get("pid")) if stale else None
+        if stale and pstart and since > pstart + 60:
+            proj = os.path.basename(state.get("cwd") or "") or rel.split(os.sep)[0]
+            pane = state.get("wezterm_pane")
+            live_frozen.append((sid, proj, pane))
+            flagged.append(
+                "LIVE-FROZEN     %s\n    last saved message %s but the running "
+                "session turned as recently as %s — memory-only; /export it NOW "
+                "(pane %s)" % (rel, human_dt(last), human_dt(since), pane or "?"))
+
+        # Signal 1: activity after last logged message. For a live session this
+        # can also be a long agent run mid-turn, hence no notification from it —
+        # the rescuable case always surfaces via signal 3 once the turn ends.
+        elif act is not None and last is not None and (act - last) > LAG_THRESHOLD:
+            flagged.append(
+                "TRUNCATED-TAIL  %s\n    last message %s, but activity through %s "
+                "(+%.1fh after)" % (rel, human_dt(last), human_dt(act),
+                                    (act - last) / 3600.0))
+
+        # Signal 3's unrecoverable cousin: state shows turns after the transcript
+        # stopped, but they happened in an EARLIER process — that history died
+        # with it. Record the loss; nothing to act on.
+        elif stale:
+            flagged.append(
+                "TRUNCATED-TAIL  %s\n    last message %s, but state shows turns "
+                "through %s — lost with an earlier process"
+                % (rel, human_dt(last), human_dt(since)))
 
         # Signal 2: backup larger than live (restorable now).
         bpath = os.path.join(BACKUP, rel)
@@ -145,10 +251,15 @@ def main():
     for line in flagged:
         print(line)
     if notify:
-        _notify(recoverable)
+        # Live-frozen sessions are now auto-handled by `claude-rescue`, which
+        # drives /export for them and only alerts on a genuine failure — so the
+        # check no longer nags them here. It still surfaces the recoverable
+        # backup-larger truncation, the one case with a different remedy.
+        _notify(recoverable, [])
     if flagged:
-        print("\n%d transcript(s) flagged of %d checked (%d recoverable)."
-              % (len(flagged), checked, recoverable))
+        print("\n%d transcript(s) flagged of %d checked (%d recoverable, "
+              "%d live-rescuable)." % (len(flagged), checked, recoverable,
+                                       len(live_frozen)))
         return 1
     if verbose:
         print("OK — %d transcripts checked, none truncated." % checked)

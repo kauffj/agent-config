@@ -464,7 +464,7 @@ local function activate_or_resume(win, pane, paneid, sid, cwd)
   end
   -- Live in the registry but no WezTerm pane (closed, or running elsewhere): resume.
   win:perform_action(
-    act.SpawnCommandInNewTab { cwd = cwd, args = { 'bash', '-lic', 'claude --resume ' .. sid .. '; exec bash' } },
+    act.SpawnCommandInNewTab { cwd = cwd, args = { 'bash', '-lic', 'unset CLAUDE_CODE_CHILD_SESSION; claude --resume ' .. sid .. '; exec bash' } },
     pane)
 end
 
@@ -621,11 +621,11 @@ local function launch_family(window, pane)
       local _, _, mux_win = wezterm.mux.spawn_window {
         workspace = id,
         cwd = first.cwd,
-        args = { 'bash', '-lic', (first.cmd or 'claude') .. '; exec bash' },
+        args = { 'bash', '-lic', 'unset CLAUDE_CODE_CHILD_SESSION; ' .. (first.cmd or 'claude') .. '; exec bash' },
       }
       for i = 2, #entries do
         local e = entries[i]
-        mux_win:spawn_tab { cwd = e.cwd, args = { 'bash', '-lic', (e.cmd or 'claude') .. '; exec bash' } }
+        mux_win:spawn_tab { cwd = e.cwd, args = { 'bash', '-lic', 'unset CLAUDE_CODE_CHILD_SESSION; ' .. (e.cmd or 'claude') .. '; exec bash' } }
       end
       win:perform_action(act.SwitchToWorkspace { name = id }, p)
     end),
@@ -724,8 +724,35 @@ end
 -- Keys. Letters chosen to avoid clobbering core WezTerm defaults (T/W/C/V/N/P).
 -- Rebind freely. If 'Space' errors at load, use a letter or 'phys:Space'.
 -- ---------------------------------------------------------------------------
+-- ---------------------------------------------------------------------------
+-- Persistent mux domain (durability). The pty host lives in wezterm-mux-server
+-- (a lingering systemd --user service), NOT in this GUI process — so a GUI/X/gdm
+-- death no longer cascades into every child `claude`. Defined but never
+-- auto-connected (no connect_automatically), so the running GUI picking this up
+-- on a config reload is a NO-OP: sessions only enter the mux when you spawn into
+-- it (CTRL+SHIFT+U) or, at full cutover, when you set config.default_domain.
+-- socket_path MUST match wezterm/mux-server.lua exactly.
+-- ---------------------------------------------------------------------------
+do
+  local runtime = os.getenv('XDG_RUNTIME_DIR') or (HOME .. '/.local/state')
+  config.unix_domains = { { name = 'mux', socket_path = runtime .. '/wezterm/muxsvr-sock' } }
+end
+
 config.keys = {
   { key = 'Space', mods = 'CTRL|SHIFT', action = wezterm.action_callback(session_picker) },
+  -- Durable session: open a new tab whose pty lives in the persistent mux, so it
+  -- survives a GUI/gdm restart. pcall-guarded — if the mux server is down it
+  -- toasts instead of erroring. Full cutover is config.default_domain = 'mux'.
+  { key = 'u',     mods = 'CTRL|SHIFT', action = wezterm.action_callback(function(win, pane)
+      local ok, err = pcall(function()
+        win:perform_action(act.SpawnCommandInNewTab {
+          domain = { DomainName = 'mux' }, args = { 'bash', '-l' },
+        }, pane)
+      end)
+      if not ok then
+        win:toast_notification('WezTerm', 'mux domain unavailable: ' .. tostring(err), nil, 4000)
+      end
+    end) },
   -- CTRL+SHIFT+F deliberately unbound: transcript search lives in the picker
   -- ('🔍' row), and F reverts to WezTerm's native scrollback search.
   { key = 's',     mods = 'CTRL|SHIFT', action = wezterm.action_callback(session_snooze) },
