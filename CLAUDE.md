@@ -36,6 +36,12 @@
 - Zero context switching required from the user
 - Go fix failing CI tests without being told how
 
+### 7. Papercuts
+- A papercut is anything annoying you notice that you aren’t fixing right now — because it’s out of scope, not worth stopping for, or environment/tooling friction (a dead-end tool call, a broken link, a missing helper script, misleading docs, a flaky command)
+- Append one line to `tasks/papercuts.md` at the repo root: `- YYYY-MM-DD — what you noticed, and what would fix or have avoided it`
+- Log it the moment you notice it, then keep working. Don’t ask permission and don’t derail the task
+- Papercuts are problems with the code or environment, not your own mistakes — those go in `tasks/lessons.md`
+
 
 ## Task Management
 

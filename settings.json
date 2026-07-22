@@ -72,7 +72,7 @@
     ],
     "defaultMode": "dontAsk"
   },
-  "model": "fable",
+  "model": "opus",
   "enabledMcpjsonServers": [
     "team"
   ],
