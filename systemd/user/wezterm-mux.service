@@ -1,0 +1,19 @@
+[Unit]
+Description=WezTerm persistent mux server (out-of-process pty host for Claude sessions)
+Documentation=https://wezterm.org/multiplexing.html
+# Ordered after the graphical session but NOT dependent on it — the whole point
+# is to outlive gdm/X. Linger (already enabled for this user) keeps the user
+# manager, and therefore this service, running across a gdm restart.
+After=default.target
+
+[Service]
+Type=simple
+# Foreground (no --daemonize) so systemd owns the process directly. Serves the
+# `mux` unix domain defined in the minimal server config; sessions spawned into
+# that domain survive a GUI/X/gdm death and are reattached by the next client.
+ExecStart=/usr/bin/wezterm-mux-server --config-file %h/.claude/wezterm/mux-server.lua
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target
