@@ -110,6 +110,128 @@ do
   end
 end
 
+-- ---------------------------------------------------------------------------
+-- Project acronyms: collision-free 1–2 char codes for every folder in ~/projects,
+-- so a tab can read as [acronym][n] (project code + which instance in that project).
+-- The code set is computed over ALL project dirs at once (a folder's code depends
+-- on what else exists), memoized, and rebuilt only when ~/projects changes.
+-- ---------------------------------------------------------------------------
+local PROJECTS    = HOME .. '/projects'
+local PROJ_PREFIX = PROJECTS .. '/'
+local ACR_ALPHA   = 'abcdefghijklmnopqrstuvwxyz'
+local ACR_DIGITS  = '0123456789'
+
+-- Ordered, de-duplicated candidate codes for one name (most→least preferred):
+-- the bare first letter, then first-letter + {true prefix, later-word initials,
+-- remaining chars, then every a-z/0-9} as the 2nd char — the tail guarantees a
+-- free 2-char code always exists (36 >> any first-letter cluster here).
+local function acr_candidates(name)
+  local n = name:lower()
+  local chars, initials = {}, {}
+  for w in n:gmatch('[a-z0-9]+') do
+    initials[#initials + 1] = w:sub(1, 1)
+    for i = 1, #w do chars[#chars + 1] = w:sub(i, i) end
+  end
+  if #chars == 0 then chars = { 'x' } end
+  local bi = 1
+  for i = 1, #chars do
+    local c = chars[i]
+    if c >= 'a' and c <= 'z' then bi = i; break end   -- prefer a letter as the base
+  end
+  local base = chars[bi]
+
+  local seconds = {}
+  if chars[bi + 1] then seconds[#seconds + 1] = chars[bi + 1] end   -- true prefix
+  for i = 2, #initials do seconds[#seconds + 1] = initials[i] end   -- later-word initials
+  for i = bi + 1, #chars do seconds[#seconds + 1] = chars[i] end    -- remaining scan chars
+  for i = 1, #ACR_ALPHA do seconds[#seconds + 1] = ACR_ALPHA:sub(i, i) end
+  for i = 1, #ACR_DIGITS do seconds[#seconds + 1] = ACR_DIGITS:sub(i, i) end
+
+  local out, seen = { base }, { [base] = true }
+  for _, s in ipairs(seconds) do
+    local code = base .. s
+    if not seen[code] then seen[code] = true; out[#out + 1] = code end
+  end
+  return out
+end
+
+-- Codes are STICKY: once a folder is assigned a code it keeps it forever, so a
+-- project's letters never change regardless of tabs OR of new folders appearing.
+-- The map is persisted to disk; a folder is only ever ADDED (taking a still-free
+-- code), never reassigned. On a cold start (empty cache) the first assignment pass
+-- reproduces the "shortest name wins the bare letter" table, then freezes it.
+local ACR_CACHE   = HOME .. '/.cache/wezterm-fleet-acronyms.json'
+local acronym_map = nil     -- nil = not loaded from disk yet
+local acronym_sig = nil
+
+local function save_acronyms()
+  local ok, body = pcall(wezterm.json_encode, acronym_map)
+  if not ok then return end
+  local f = io.open(ACR_CACHE, 'w')
+  if f then f:write(body); f:close() end
+end
+
+-- Assign codes to any folders that don't have one yet, without disturbing existing
+-- assignments. Runs only when ~/projects changes (gated by a subprocess-free glob
+-- signature), so the per-tick cost stays a glob + string compare.
+local function refresh_acronyms()
+  local entries = wezterm.glob(PROJECTS .. '/*')
+  table.sort(entries)
+  local sig = table.concat(entries, '\n')
+  if acronym_map and sig == acronym_sig then return end
+  if not acronym_map then                       -- first refresh: load sticky map
+    acronym_map = read_json_file(ACR_CACHE)
+    if type(acronym_map) ~= 'table' then acronym_map = {} end
+  end
+
+  local ok, stdout = wezterm.run_child_process({
+    'find', PROJECTS, '-maxdepth', '1', '-mindepth', '1',
+    '-type', 'd', '-not', '-name', '.*', '-printf', '%f\n' })
+  if not ok then return end                     -- keep last good map; retry on change
+  acronym_sig = sig
+
+  -- Reserve every code already handed out (across all remembered folders, even ones
+  -- since deleted — so a delete+recreate keeps its old code and nothing is reused).
+  local taken = {}
+  for _, code in pairs(acronym_map) do taken[code] = true end
+
+  -- New folders only, in (length, alpha) order so a cold start matches the batch
+  -- table; each takes its first still-free candidate. Existing codes are untouched.
+  local newones = {}
+  for line in stdout:gmatch('[^\n]+') do
+    if not acronym_map[line] then newones[#newones + 1] = line end
+  end
+  table.sort(newones, function(a, b)
+    if #a ~= #b then return #a < #b end
+    return a < b
+  end)
+  local dirty = false
+  for _, nm in ipairs(newones) do
+    for _, cand in ipairs(acr_candidates(nm)) do
+      if not taken[cand] then
+        taken[cand] = true; acronym_map[nm] = cand; dirty = true; break
+      end
+    end
+  end
+  if dirty then save_acronyms() end
+end
+
+-- Top-level ~/projects folder for a cwd (or nil if the session isn't under it).
+local function project_of(cwd)
+  if type(cwd) ~= 'string' or cwd:sub(1, #PROJ_PREFIX) ~= PROJ_PREFIX then return nil end
+  return cwd:sub(#PROJ_PREFIX + 1):match('^([^/]+)')
+end
+
+-- Display code for a cwd outside ~/projects (out of the collision-free scope):
+-- first 1–2 alnum of the basename, '~' for home. Best effort, not guaranteed unique.
+local function fallback_code(cwd)
+  if type(cwd) ~= 'string' or cwd == '' then return '?' end
+  if cwd == HOME then return '~' end
+  local a = cwd:gsub('/+$', ''):gsub('.*/', ''):lower():gsub('[^a-z0-9]', '')
+  if a == '' then return '?' end
+  return a:sub(1, 2)
+end
+
 local function save_wait_cache()
   local ok, body = pcall(wezterm.json_encode, { awake = awake, starts = wait_awake_start })
   if not ok then return end
@@ -118,6 +240,8 @@ local function save_wait_cache()
 end
 
 wezterm.on('update-status', function(window, pane)
+  refresh_acronyms()   -- cheap unless ~/projects changed
+
   -- Advance the awake clock, freezing any gap big enough to be a suspend.
   local now = os.time()
   local delta = awake_last and (now - awake_last) or 0
@@ -167,7 +291,13 @@ wezterm.on('update-status', function(window, pane)
           end
           age = math.max(0, awake - w.start)
         end
-        fresh[pane_id] = { status = d.status, since = d.since, age = age, updated = upd, sid = sid }
+        -- Project code + a per-folder group key (folder name, or the cwd for
+        -- non-project sessions) so instances in one folder can be numbered below.
+        local folder = project_of(d.cwd)
+        local fkey = folder or ('#' .. tostring(d.cwd or pane_id))
+        local acr = (folder and acronym_map[folder]) or fallback_code(d.cwd)
+        fresh[pane_id] = { status = d.status, since = d.since, age = age,
+                           updated = upd, sid = sid, fkey = fkey, acr = acr }
       end
     end
   end
@@ -179,6 +309,23 @@ wezterm.on('update-status', function(window, pane)
       if (not restrict or live[pane_id]) and e.age > longest then longest = e.age end
     end
   end
+
+  -- Per-folder instance number: 1-based rank among OPEN tabs sharing a folder,
+  -- ordered by pane id, so two sessions in one project read f1/f2 and a lone one
+  -- reads y1. Dead/lingering state files are excluded (same live-set as the ceiling).
+  local groups = {}
+  for pane_id, e in pairs(fresh) do
+    if (not restrict) or live[pane_id] then
+      local g = groups[e.fkey]
+      if not g then g = {}; groups[e.fkey] = g end
+      g[#g + 1] = pane_id
+    end
+  end
+  for _, ids in pairs(groups) do
+    table.sort(ids, function(a, b) return (tonumber(a) or 0) < (tonumber(b) or 0) end)
+    for i, pid in ipairs(ids) do fresh[pid].n = i end
+  end
+
   pane_state = fresh
   wait_norm = math.max(WAIT_FLOOR_S, longest)
 
@@ -331,9 +478,34 @@ end
 -- The clicked-into tab gets this highlight so it's unmistakable in the row.
 local ACTIVE = { bg = '#7aa2f7', fg = '#1a1b26' }   -- Tokyo Night blue / dark ink
 
--- The active tab is sized this many "shares" vs. one share per other tab, so it
--- stays the widest while the whole row still sums to the bar width.
-local ACTIVE_WEIGHT = 3.0
+-- Columns held back from the tab row for the '+' new-tab button (right edge) plus
+-- a margin, so the summed tab widths stay inside the window (the hard overflow limit).
+local TAB_BAR_RESERVE = 8
+
+-- CRITICAL WezTerm quirk: the retro tab bar EQUALIZES every tab to a uniform width
+-- (discarding our per-tab widths) once the COLORED (non-collapsed) tabs fill past
+-- ~this fraction of the window. So the real budget for shown tabs is this fraction,
+-- NOT the whole bar; collapsed dots fill the rest. Measured empirically: ~92% full
+-- equalizes, comfortably honored well below — 0.80 leaves margin. (Verified by
+-- screenshotting the live window and reading back rendered vs. requested widths.)
+local EQUALIZE_FRAC = 0.80
+
+-- How much width the ACTIVE tab may RESERVE for its label before the other tabs
+-- get their turn. Deliberately well under tab_max_width so a busy row spends its
+-- columns on code tabs instead of one fat active tab. When few tabs are open the
+-- active tab still absorbs the leftover (up to tab_max_width), so it fills nicely
+-- and shows more of its title — the reduction only bites once the row is contended.
+local ACTIVE_MAX_RESERVE = 30
+
+-- Overflow mode: when tabs don't all fit, the rightmost ones collapse to a thin
+-- sliver and the collapse boundary shows a ›N marker (N = how many are hidden;
+-- reach them via the picker, Ctrl+Shift+Space). These are the assumed rendered
+-- widths of a collapsed sliver and of that marker, reserved so the slivers WezTerm
+-- still draws can't squeeze the tabs that ARE shown.
+local COLLAPSE_W       = 4
+local OVERFLOW_MARKER_W = 3
+local COLLAPSE_BG = '#1a1b26'   -- tab-bar bg (Tokyo Night)
+local COLLAPSE_FG = '#565f89'   -- dim grey
 
 -- Left-pad-right (or truncate) `s` to exactly `target` display columns. The
 -- trailing padding is what makes the row reach the right edge; WezTerm keeps it
@@ -357,6 +529,96 @@ local function fit(s, target)
   return s
 end
 
+-- A tab's essential unit and its width: ` [acronym][n] [glyph] `. This is the hard
+-- floor — a tab is never sized (or truncated) below this. Works off any tab in the
+-- `tabs` list, so format-tab-title can budget across the whole row.
+local function tab_essential(t)
+  local p = t.active_pane
+  local st = p and pane_state[tostring(p.pane_id)] or nil
+  local glyph = status_glyph(st, p and p.title or '')
+  local tag = (st and st.acr and st.n) and (st.acr .. st.n) or tostring((t.tab_index or 0) + 1)
+  return dispw(' ' .. tag .. ' ' .. glyph .. ' '), tag, glyph
+end
+
+-- A stable label for a session's folder, from pane_state's group key: the project
+-- folder name, or the basename for a non-project cwd. Used as the active tab's
+-- fallback when its live title is momentarily empty (foreground Claude sessions).
+local function fkey_display(fk)
+  if not fk or fk == '' then return nil end
+  if fk:sub(1, 1) == '#' then
+    local b = fk:sub(2):gsub('/+$', ''):gsub('.*/', '')
+    return b ~= '' and b or nil
+  end
+  return fk
+end
+
+-- Cost of collapsing k tabs: one ›N marker cell plus a sliver for each of the rest.
+local function collapse_cost(k)
+  if k <= 0 then return 0 end
+  return OVERFLOW_MARKER_W + (k - 1) * COLLAPSE_W
+end
+
+-- Overflow layout over the whole row. The active tab always gets its full label
+-- (` [code][n] [icon] project/branch `, capped at tab_max_width); every other tab
+-- gets exactly its essential (` [code][n] [icon] `), allocated left→right; whatever
+-- no longer fits collapses off the right. Pure + deterministic — same result in
+-- every per-tab call, so the tabs agree on one layout. Returns:
+--   widths          -> { [tab_index] = width }  (absent key = collapsed)
+--   first_collapsed -> tab_index that carries the ›N marker (or nil)
+--   collapsed       -> how many tabs are hidden
+local function compute_tab_layout(tabs, bar, safe, cap)
+  local active_reserve, active_idx = 0, nil
+  for _, t in ipairs(tabs) do
+    if t.is_active then
+      local am, atag, ag = tab_essential(t)
+      local ap = t.active_pane
+      local ast = ap and pane_state[tostring(ap.pane_id)] or nil
+      local raw = (ap and ap.title ~= '' and ap.title) or fkey_display(ast and ast.fkey) or ('tab ' .. (t.tab_index + 1))
+      local alabel = smart_label(raw, nil)   -- drops a project==branch duplicate, etc.
+      active_reserve = math.min(ACTIVE_MAX_RESERVE, math.max(am, dispw(' ' .. atag .. ' ' .. ag .. ' ' .. alabel .. ' ')))
+      active_idx = t.tab_index
+    end
+  end
+
+  local ess = {}
+  for _, t in ipairs(tabs) do
+    if not t.is_active then
+      local w = tab_essential(t)
+      ess[#ess + 1] = { idx = t.tab_index, w = w }
+    end
+  end
+
+  -- Show a tab only while the COLORED total stays under `safe` (past which WezTerm
+  -- equalizes) AND the whole row (colored + collapsed dots + marker) stays under
+  -- `bar` (past which it overflows). The rest collapse to dots that fill toward the
+  -- right edge.
+  local widths = {}
+  local used = active_reserve
+  local shown = 0
+  for i, e in ipairs(ess) do
+    local remaining = #ess - i
+    if used + e.w <= safe and used + e.w + collapse_cost(remaining) <= bar then
+      used = used + e.w
+      widths[e.idx] = e.w
+      shown = shown + 1
+    else
+      break
+    end
+  end
+
+  local collapsed = #ess - shown
+  local first_collapsed = (collapsed > 0) and ess[shown + 1].idx or nil
+
+  -- The active tab absorbs slack, but only up to the colored-`safe` ceiling — never
+  -- past it, or the row would equalize. So it fills nicely when few tabs are open
+  -- and stays modest (near its reserve) when the row is busy.
+  if active_idx then
+    widths[active_idx] = math.min(cap, safe - (used - active_reserve))
+  end
+
+  return widths, first_collapsed, collapsed
+end
+
 wezterm.on('format-tab-title', function(tab, tabs, panes, conf, hover, max_width)
   local idx = tab.tab_index + 1
   local pt = tab.active_pane and tab.active_pane.title or ''
@@ -368,27 +630,42 @@ wezterm.on('format-tab-title', function(tab, tabs, panes, conf, hover, max_width
   -- reused-pane collisions by newest `updated`, so pane_state is the authority.
   local c = wait_colors(st)
 
-  -- Proportional shares: the active tab gets ACTIVE_WEIGHT, every other tab 1.
-  -- CRUCIAL: we do NOT funnel the rounding remainder into the active tab. Doing
-  -- so amplified a 1-column wobble in the measured bar width (e.g. the scrollbar
-  -- column blinking in/out as scrollback changes) into a ~13-column active-tab
-  -- resize. Instead the leftover is spread +1 across the lowest-index tabs, so
-  -- any wobble moves at most one tab by one column — no visible jumping.
-  local n = math.max(1, #tabs)
-  local bar = (wezterm.GLOBAL.bar_cols or (n * 16)) - 1
-  local cap = conf.tab_max_width or 64
-  local unit = bar / (n - 1 + ACTIVE_WEIGHT)
-  local base = math.max(6, math.floor(unit))
-  local active_w = math.min(cap, math.floor(unit * ACTIVE_WEIGHT))
-  local leftover = math.max(0, bar - active_w - base * (n - 1))
-  local target = tab.is_active and active_w
-    or math.min(cap, base + (tab.tab_index < leftover and 1 or 0))
+  -- [acronym][n] (project code + instance) replaces the bare tab number; a tab with
+  -- no Claude session (plain shell) keeps the sequential idx.
+  local _, tag, glyph = tab_essential(tab)
 
-  -- The active tab has the most room, so it shows the full title; every other tab
-  -- gets a distinguishing, width-adaptive label. Glyph sits right after the number
-  -- so truncation (right edge) can't swallow it.
-  local label = tab.is_active and (pt ~= '' and pt or ('tab ' .. idx)) or smart_label(pt, target)
-  local text = fit(string.format(' %d %s %s ', idx, status_glyph(st, pt), label), target)
+  -- Overflow layout (shared by every tab in the row): active gets its full label,
+  -- others get their essential left→right, the rest collapse off the right.
+  local n = math.max(1, #tabs)
+  local barcols = wezterm.GLOBAL.bar_cols or (n * 16)
+  local bar = barcols - TAB_BAR_RESERVE                 -- hard overflow limit
+  local safe = math.floor(barcols * EQUALIZE_FRAC)      -- colored anti-equalize limit
+  local cap = conf.tab_max_width or 64
+  local widths, first_collapsed, collapsed = compute_tab_layout(tabs, bar, safe, cap)
+  local target = widths[tab.tab_index]
+
+  -- Collapsed tab: the boundary one carries the ›N marker; the rest render as an
+  -- empty sliver. All remain reachable via the picker (Ctrl+Shift+Space).
+  if not target then
+    if tab.tab_index == first_collapsed then
+      return {
+        { Background = { Color = COLLAPSE_BG } },
+        { Foreground = { Color = COLLAPSE_FG } },
+        { Text = '›' .. collapsed },
+      }
+    end
+    return { { Background = { Color = COLLAPSE_BG } }, { Foreground = { Color = COLLAPSE_FG } }, { Text = '·' } }
+  end
+
+  -- Active shows its cleaned title (project/branch/task, de-duplicated); every other
+  -- tab is exactly its essential code+icon.
+  local text
+  if tab.is_active then
+    local raw = (pt ~= '' and pt) or fkey_display(st and st.fkey) or ('tab ' .. idx)
+    text = fit(string.format(' %s %s %s ', tag, glyph, smart_label(raw, nil)), target)
+  else
+    text = fit(' ' .. tag .. ' ' .. glyph .. ' ', target)
+  end
 
   -- Active wins the styling so "which tab am I in" is never ambiguous; a waiting
   -- active tab is one you're already looking at, so its escalation color can wait.
