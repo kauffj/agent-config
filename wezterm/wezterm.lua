@@ -111,6 +111,17 @@ do
 end
 
 -- ---------------------------------------------------------------------------
+-- Hidden sessions (CTRL+SHIFT+S → "keep running"): sid -> { notify, notified, label }.
+-- Kept in wezterm.GLOBAL, not a file, because it describes panes that live and die
+-- with THIS GUI process — it survives a config hot-reload (which wipes module-local
+-- tables) but not a restart, exactly like the panes it tracks. GLOBAL reads return a
+-- COPY, so every mutation reads the whole map, edits it, and writes it back.
+-- ---------------------------------------------------------------------------
+local HIDDEN_WS = '__hidden__'          -- background workspace where hidden panes park
+local function hidden_map() return wezterm.GLOBAL.hidden or {} end
+local function set_hidden_map(m) wezterm.GLOBAL.hidden = m end
+
+-- ---------------------------------------------------------------------------
 -- Project acronyms: collision-free 1–2 char codes for every folder in ~/projects,
 -- so a tab can read as [acronym][n] (project code + which instance in that project).
 -- The code set is computed over ALL project dirs at once (a folder's code depends
@@ -359,6 +370,32 @@ wezterm.on('update-status', function(window, pane)
       wezterm.GLOBAL.bar_cols = dim.cols
     end
   end
+
+  -- Hidden "until idle" watcher. A parked pane still writes its state file, so the
+  -- `fresh` scan above already holds its live status: ping once when it flips to
+  -- waiting, and GC any hidden record whose pane has since closed (dropped from the
+  -- `live` set). The single-threaded event loop makes this read-mutate-write atomic
+  -- across windows, so exactly ONE window's tick fires the toast even though every
+  -- window runs this — which is what we want, since it must also fire while WezTerm
+  -- is unfocused (not gated on `focused`). Fully pcall-guarded: a hiccup here must
+  -- never wedge the tab bar.
+  pcall(function()
+    local hid = wezterm.GLOBAL.hidden
+    if not (hid and next(hid)) then return end
+    local by_sid = {}
+    for pid, e in pairs(fresh) do by_sid[e.sid] = { status = e.status, pane = pid } end
+    local changed = false
+    for sid, h in pairs(hid) do
+      local st = by_sid[sid]
+      if not st or (restrict and not live[st.pane]) then
+        hid[sid] = nil; changed = true                          -- pane gone -> GC
+      elseif h.notify and not h.notified and st.status == 'waiting' then
+        h.notified = true; changed = true
+        window:toast_notification('fleet', (h.label or sid) .. ' is idle', nil, 4000)
+      end
+    end
+    if changed then wezterm.GLOBAL.hidden = hid end
+  end)
 end)
 
 -- Wait escalation is a continuous gradient over wait age, not hard steps. Stops
@@ -745,6 +782,32 @@ local function activate_or_resume(win, pane, paneid, sid, cwd)
     pane)
 end
 
+-- Resurface a hidden (still-running) session: pull its live pane out of the
+-- background workspace into a NEW window on the workspace you're on now, focus it,
+-- and clear its hidden record. move_to_new_window can only make a *new* window
+-- (moving into an existing one is CLI-only), so it comes back standalone. If the
+-- pane is gone (WezTerm restarted, tab manually closed), drop the record and fall
+-- through to the normal resume path. Distinct from activate_or_resume: this
+-- RELOCATES a known-live pane; that one FINDS-or-RESTARTS.
+local function resurface_hidden(win, pane, paneid, sid, cwd)
+  local m = hidden_map()
+  m[sid] = nil
+  set_hidden_map(m)
+  local mux_pane
+  if paneid then
+    local ok, p = pcall(wezterm.mux.get_pane, tonumber(paneid))
+    if ok then mux_pane = p end
+  end
+  if mux_pane then
+    local target = win:active_workspace()
+    if pcall(function()
+      mux_pane:move_to_new_window(target)
+      mux_pane:activate()
+    end) then return end
+  end
+  activate_or_resume(win, pane, paneid, sid, cwd)
+end
+
 -- Content search (the picker's '🔍 search transcripts…' row): prompt for text,
 -- grep LIVE session transcripts via claude-search, then hand the matches to
 -- the same jump/resume flow as the picker. claude-search is the live-scoped
@@ -789,7 +852,11 @@ local function session_search(window, pane)
         choices = choices,
         action = wezterm.action_callback(function(w2, p2, id)
           if not id then return end
-          activate_or_resume(w2, p2, pane_by_id[id], id, cwd_by_id[id])
+          if hidden_map()[id] then
+            resurface_hidden(w2, p2, pane_by_id[id], id, cwd_by_id[id])
+          else
+            activate_or_resume(w2, p2, pane_by_id[id], id, cwd_by_id[id])
+          end
         end),
       }, p)
     end),
@@ -799,6 +866,7 @@ end
 local function session_picker(window, pane)
   local recs, err = run_registry()
   if not recs then window:toast_notification('fleet', err, nil, 4000); return end
+  local hid = hidden_map()   -- sessions parked by "keep running" resurface, not jump-in-place
 
   -- Size the folder and label columns to their actual content (capped so one long
   -- name can't blow out the row), so we use the width when it's there and stay
@@ -823,6 +891,7 @@ local function session_picker(window, pane)
       .. fit(r.label or r.session_id, lw) .. ' '
       .. fit(r.age_str or '', 4) .. '  '
       .. (r.topic or '') .. grp
+      .. (hid[r.session_id] and '  💤 hidden' or '')
     table.insert(choices, { id = r.session_id, label = row })
     pane_by_id[r.session_id] = r.wezterm_pane
     cwd_by_id[r.session_id] = r.cwd
@@ -865,7 +934,11 @@ local function session_picker(window, pane)
     action = wezterm.action_callback(function(win, p, id)
       if not id then return end       -- cancelled
       if id == '__search__' then return session_search(win, p) end
-      activate_or_resume(win, p, pane_by_id[id], id, cwd_by_id[id])
+      if hidden_map()[id] then
+        resurface_hidden(win, p, pane_by_id[id], id, cwd_by_id[id])
+      else
+        activate_or_resume(win, p, pane_by_id[id], id, cwd_by_id[id])
+      end
       if scheduled_ids[id] then
         wezterm.run_child_process({ HOME .. '/.claude/bin/claude-schedule', 'cancel', '--sid', id })
       end
@@ -910,11 +983,17 @@ local function launch_family(window, pane)
 end
 
 -- ---------------------------------------------------------------------------
--- Snooze (CTRL+SHIFT+S): schedule the active tab's session to reopen at a chosen
--- time, then close it. Reopen is driven by bin/claude-schedule via the snapshot
--- timer; resume early from the session picker. Closing ends the process but the
--- transcript survives, so `claude --resume` brings it back exactly — provided the
--- transcript is actually on disk, which is why we fsync it BEFORE closing (below).
+-- Sleep this tab (CTRL+SHIFT+S): one flat picker (SLEEP_CHOICES) with three ways to
+-- park it — pick any in a single selection (1–9 quick-keys).
+--   • Kill & reopen — schedule a reopen (bin/claude-schedule) then CLOSE the tab.
+--     Ends the process, but the transcript survives so `claude --resume` brings it
+--     back exactly — which is why we fsync it BEFORE closing (below). Reopen fires
+--     via the snapshot timer; resume early from the session picker. Each preset time
+--     is its own row; "custom time…" chains one text prompt (free text only).
+--   • Keep running, hide — move the LIVE pane to the __hidden__ workspace; the
+--     process keeps running off-screen. Resurface from the picker (CTRL+SHIFT+␣).
+--   • Keep running, hide until idle — as above, plus a one-shot toast when it next
+--     goes idle (update-status watcher). See hide_do / resurface_hidden.
 -- ---------------------------------------------------------------------------
 
 -- Flush the session's transcript(s) to disk before closing the tab. Closing sends
@@ -958,15 +1037,66 @@ local function snooze_do(win, pane, rec, when)
   win:perform_action(act.CloseCurrentTab { confirm = false }, pane)
 end
 
+-- Keep running, hide (CTRL+SHIFT+S → option 2/3): move the LIVE pane into a
+-- background workspace so the process keeps churning off-screen, then switch back
+-- to where you were. move_to_new_window preserves the pane id, so the registry and
+-- the state hook keep resolving this session to its (now hidden) pane — it stays a
+-- normal live row in the picker, from which resurface_hidden brings it back.
+-- `notify` = ping once when it next goes idle (option A: no focus stealing).
+local function hide_do(win, pane, rec, notify)
+  local disp = ((rec.project or '') .. ' ' .. (rec.label or '')):gsub('^%s+', ''):gsub('%s+$', '')
+  if disp == '' then disp = rec.session_id end
+  -- Seed `notified` from the CURRENT status: if the session is already idle at hide
+  -- time, don't fire a pointless "is idle" ping a second later — only ping on its
+  -- next transition into idle. (pane_state is the same hook-owned status the tab bar
+  -- reads; a missing entry defaults to not-idle, i.e. ping on next wait.)
+  local pid = pane and tostring(pane:pane_id())
+  local cur = pid and pane_state[pid]
+  local already_idle = cur ~= nil and cur.status == 'waiting'
+  local return_ws = win:active_workspace()
+  local ok, err = pcall(function() pane:move_to_new_window(HIDDEN_WS) end)
+  if not ok then
+    win:toast_notification('fleet', 'hide failed: ' .. tostring(err), nil, 4000); return
+  end
+  local m = hidden_map()
+  m[rec.session_id] = { notify = notify and true or false, notified = already_idle, label = disp }
+  set_hidden_map(m)
+  -- Return to where we were. If hiding emptied this GUI window (the sole tab of a
+  -- sole window on the workspace), the move closed it and `win` is now stale — pcall
+  -- so a raised action can't strand us on __hidden__ (recover via Ctrl+Shift+O).
+  pcall(function()
+    win:perform_action(act.SwitchToWorkspace { name = return_ws }, pane)
+    win:toast_notification('fleet',
+      'hidden ' .. disp .. (notify and ' — will ping when idle' or ' — still running'),
+      nil, 2500)
+  end)
+end
+
 local SNOOZE_PRESETS = {
   { id = '1h',           label = 'in 1 hour' },
   { id = '4h',           label = 'in 4 hours' },
   { id = 'tonight',      label = 'tonight (8pm)' },
   { id = 'tomorrow 9am', label = 'tomorrow 9am' },
-  { id = '3d',           label = 'in 3 days' },
+  { id = 'monday 9am',   label = 'Monday at 9am' },
   { id = '1w',           label = 'in 1 week' },
   { id = '__custom__',   label = 'Custom…' },
 }
+
+-- Flat "Sleep this tab…" menu (CTRL+SHIFT+S): hide-until-idle first, then every
+-- kill-&-reopen time, then plain hide last — all ONE selection deep, no nested
+-- sub-menu. The `hide —` / `kill & reopen —` prefixes group them for the eye and for
+-- fuzzy typing; with fuzzy off (default), the leading 1–9 quick-keys select a row
+-- instantly, no Enter. Only a custom time still needs a follow-up text prompt (free
+-- text has nowhere to live in a selector). Reopen times come from SNOOZE_PRESETS so
+-- they stay defined in exactly one place.
+local SLEEP_CHOICES = {
+  { id = 'hide_idle', label = 'hide until idle — keep running' },
+}
+for _, p in ipairs(SNOOZE_PRESETS) do
+  local lbl = (p.id == '__custom__') and 'custom time…' or p.label
+  SLEEP_CHOICES[#SLEEP_CHOICES + 1] = { id = p.id, label = 'kill & reopen — ' .. lbl }
+end
+SLEEP_CHOICES[#SLEEP_CHOICES + 1] = { id = 'hide', label = 'hide — keep running' }
 
 local function session_snooze(window, pane)
   local recs = run_registry() or {}
@@ -979,11 +1109,13 @@ local function session_snooze(window, pane)
     window:toast_notification('fleet', 'no Claude session in this tab', nil, 3000); return
   end
   window:perform_action(act.InputSelector {
-    title = 'Snooze — reopen this tab…',
-    choices = SNOOZE_PRESETS,
+    title = 'Sleep this tab…',
+    choices = SLEEP_CHOICES,
     action = wezterm.action_callback(function(win, p, id)
-      if not id then return end
-      if id == '__custom__' then
+      if not id then return end                          -- cancelled
+      if id == 'hide' then hide_do(win, p, rec, false)
+      elseif id == 'hide_idle' then hide_do(win, p, rec, true)
+      elseif id == '__custom__' then
         win:perform_action(act.PromptInputLine {
           description = 'Reopen when?  e.g. "tomorrow 14:00", "monday morning", "3 days", "2026-07-10 09:00"',
           action = wezterm.action_callback(function(w2, p2, line)
@@ -991,7 +1123,7 @@ local function session_snooze(window, pane)
           end),
         }, p)
       else
-        snooze_do(win, p, rec, id)
+        snooze_do(win, p, rec, id)                       -- id is a preset time token
       end
     end),
   }, pane)
