@@ -52,6 +52,12 @@ If empty: "No features tracked. Use `/feature \"description\"` to start one." **
    ```bash
    node $HOME/.claude/lib/workspace.mjs get <NAME>
    ```
+   **Refuse to advance a finished pipeline.** If the record's `status` is `done`
+   (or the branch is already merged), do NOT jump to a step or re-run any agent —
+   a compacted resume can land here one step from re-implementing shipped work.
+   Say: "Feature '<name>' is already done (status=done, step <pipeline.step>,
+   branch `<branch>` merged). Nothing to resume — use `/feature list` to see it or
+   `/feature \"…\"` to start new work." **Stop.**
 2. If worktree is missing, let `/workspace resume` handle recreation:
    ```
    Invoke /workspace resume <NAME>
