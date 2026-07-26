@@ -88,3 +88,12 @@ the two copies drift.
 - **Adding or removing a site → update the SERVER.md inventory table in the same change.**
 - **Never commit a Claude Code transcript.** `/export` writes into the cwd; they contain
   connection strings and keys from the session.
+
+
+## Writing
+
+For any **longform I'll publish under my own name** — essays, articles, Substack posts, threads,
+arguments — invoke the **`writing`** skill first (process, preferences, and the Google Doc
+collaboration protocol live there; don't restate them). Core rule: **I write the words; you build
+the scaffold** — bullets and structure, never finished prose. `kauffj-voice` is for tweets and
+throwaway, not for ghostwriting signed work.
