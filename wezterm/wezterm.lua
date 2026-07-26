@@ -782,12 +782,14 @@ local function activate_or_resume(win, pane, paneid, sid, cwd)
     pane)
 end
 
--- Resurface a hidden (still-running) session: pull its live pane out of the
--- background workspace into a NEW window on the workspace you're on now, focus it,
--- and clear its hidden record. move_to_new_window can only make a *new* window
--- (moving into an existing one is CLI-only), so it comes back standalone. If the
--- pane is gone (WezTerm restarted, tab manually closed), drop the record and fall
--- through to the normal resume path. Distinct from activate_or_resume: this
+-- Resurface a hidden (still-running) session and clear its hidden record. Preferred
+-- path: reattach the live pane as a TAB in the window you're looking at now. The Lua
+-- pane API can only move a pane into a *new* window, but `wezterm cli
+-- move-pane-to-new-tab --window-id` can target an EXISTING one. If that CLI move
+-- fails (wezterm not on PATH, a cross-workspace refusal, any non-zero exit), fall
+-- back to move_to_new_window so the session still comes back — just standalone. If
+-- the pane is gone (WezTerm restarted, tab manually closed), drop the record and
+-- fall through to the normal resume path. Distinct from activate_or_resume: this
 -- RELOCATES a known-live pane; that one FINDS-or-RESTARTS.
 local function resurface_hidden(win, pane, paneid, sid, cwd)
   local m = hidden_map()
@@ -799,11 +801,21 @@ local function resurface_hidden(win, pane, paneid, sid, cwd)
     if ok then mux_pane = p end
   end
   if mux_pane then
-    local target = win:active_workspace()
-    if pcall(function()
-      mux_pane:move_to_new_window(target)
-      mux_pane:activate()
-    end) then return end
+    -- run_child_process returns success=false (it does NOT raise) on a non-zero
+    -- exit, and raises only if the binary is missing — so a reattach counts only
+    -- when the pcall did NOT raise AND the command reported success.
+    local ok, reattached = pcall(function()
+      return wezterm.run_child_process({
+        'wezterm', 'cli', 'move-pane-to-new-tab',
+        '--pane-id', tostring(paneid),
+        '--window-id', tostring(win:mux_window():window_id()),
+      })
+    end)
+    if not (ok and reattached) then
+      pcall(function() mux_pane:move_to_new_window(win:active_workspace()) end)  -- fallback: standalone window
+    end
+    pcall(function() mux_pane:activate() end)
+    return
   end
   activate_or_resume(win, pane, paneid, sid, cwd)
 end
