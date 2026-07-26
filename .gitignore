@@ -58,3 +58,6 @@ projects-backup/
 rescue/
 transcript-check.notified.json
 *-remote-session-terminals.txt
+
+# Chrome native-messaging host wrapper — generated per-machine, pins a version path
+chrome/
