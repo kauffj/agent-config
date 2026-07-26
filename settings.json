@@ -67,15 +67,11 @@
       "mcp__google-sheets",
       "mcp__claude_ai_Gmail",
       "mcp__claude_ai_Google_Calendar",
-      "mcp__claude_ai_Google_Drive",
-      "mcp__team"
+      "mcp__claude_ai_Google_Drive"
     ],
     "defaultMode": "dontAsk"
   },
   "model": "opus",
-  "enabledMcpjsonServers": [
-    "team"
-  ],
   "disableClaudeAiConnectors": true,
   "hooks": {
     "SessionStart": [
