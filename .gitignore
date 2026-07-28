@@ -1,6 +1,9 @@
 # Credentials & secrets
 .credentials.json
 
+# Real handwritten signature — forgeable asset, never push (SKILL.md documents restore path)
+skills/sign/signature.png
+
 # Session & history data
 history.jsonl
 session-env/
