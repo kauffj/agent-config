@@ -739,32 +739,33 @@ local function run_registry()
   return recs, nil
 end
 
-local function activate_or_resume(win, pane, paneid, sid, cwd)
-  -- get_pane RAISES on a closed/unknown pane id (e.g. a snoozed tab), so pcall it
-  -- and treat a miss as "gone" -> fall through to resume, instead of erroring out.
-  local mux_pane = nil
-  if paneid then
-    local ok, p = pcall(wezterm.mux.get_pane, tonumber(paneid))
-    if ok then mux_pane = p end
-  end
-  -- Guard against a stale/reused pane id. WezTerm recycles pane ids, so a closed
-  -- session's recorded pane can now belong to a DIFFERENT session — activating it
-  -- would land you on the wrong tab (or right where you are). Only trust the pane
-  -- if its cwd still matches the session's; otherwise treat it as gone and resume.
-  if mux_pane and cwd and cwd ~= '' then
-    local ok, p = pcall(function()
+-- The mux pane a session is REALLY on right now, or nil if it's gone. Two ways to
+-- miss: get_pane RAISES on a closed/unknown pane id (e.g. a snoozed tab), and
+-- WezTerm RECYCLES pane ids, so a closed session's recorded pane can now belong to
+-- a DIFFERENT session — trusting it would land you on the wrong tab (or right where
+-- you are). A cwd mismatch is what identifies that reuse. One definition, so the
+-- tab number the picker SHOWS and the pane it JUMPS to can never disagree.
+local function session_pane(paneid, cwd)
+  if not paneid then return nil end
+  local ok, mux_pane = pcall(wezterm.mux.get_pane, tonumber(paneid))
+  if not ok or not mux_pane then return nil end
+  if cwd and cwd ~= '' then
+    local okc, cur = pcall(function()
       local url = mux_pane:get_current_working_dir()
       if not url then return nil end
       if type(url) == 'string' then return url end
       return url.file_path or url.path or tostring(url)
     end)
-    if ok and p then
-      p = p:gsub('^file://[^/]*', ''):gsub('/+$', '')
-      if p ~= cwd:gsub('/+$', '') then
-        mux_pane = nil   -- reused pane, wrong session -> resume instead
-      end
+    if okc and cur then
+      cur = cur:gsub('^file://[^/]*', ''):gsub('/+$', '')
+      if cur ~= cwd:gsub('/+$', '') then return nil end   -- reused pane, wrong session
     end
   end
+  return mux_pane
+end
+
+local function activate_or_resume(win, pane, paneid, sid, cwd)
+  local mux_pane = session_pane(paneid, cwd)
   if mux_pane then
     -- MuxPane:activate() focuses pane + its tab + window (recent WezTerm).
     -- pcall + tab-activate fallback keeps it working on older builds.
@@ -890,6 +891,31 @@ local function session_picker(window, pane)
   end
   fw, lw = math.min(fw, 26), math.min(lw, 22)
 
+  -- Which tab each live pane sits in, so a row can lead with the number you'd press
+  -- to get there. Position within its window (0-based -> 1-based), matching both the
+  -- tab bar and ActivateTab. tabs_with_info carries the index explicitly; plain
+  -- tabs() doesn't document its ordering, and a confidently WRONG number is worse
+  -- than none — so on any failure the map stays empty and the column goes blank.
+  local tab_of_pane, tabw = {}, 1
+  pcall(function()
+    for _, w in ipairs(wezterm.mux.all_windows()) do
+      for _, e in ipairs(w:tabs_with_info()) do
+        local n = e.index + 1
+        tabw = math.max(tabw, #tostring(n))
+        for _, p in ipairs(e.tab:panes()) do tab_of_pane[tostring(p:pane_id())] = n end
+      end
+    end
+  end)
+
+  -- Right-aligned so the digits line up; blank (but still padded) for a session with
+  -- no open tab — snoozed, closed, or running under another mux.
+  local function tabcell(paneid, cwd)
+    local n = session_pane(paneid, cwd) and tab_of_pane[tostring(paneid)] or nil
+    local s = n and tostring(n) or ''
+    return string.rep(' ', tabw - #s) .. s .. ' '
+  end
+  local blankcell = string.rep(' ', tabw + 1)
+
   local choices, pane_by_id, cwd_by_id, seen_ids, scheduled_ids = {}, {}, {}, {}, {}
   for _, r in ipairs(recs) do
     local grp = r.group and (' [' .. r.group .. ']') or ''
@@ -898,7 +924,8 @@ local function session_picker(window, pane)
     -- way string.format's byte-based %-Ns padding does. Order leads with the FOLDER
     -- (the real identity), then the branch/·tag, age, and finally the topic — kept
     -- untruncated so it stays fully fuzzy-searchable and distinguishes siblings.
-    local row = fit(r.glyph or '·', 2) .. ' '
+    local row = tabcell(r.wezterm_pane, r.cwd)
+      .. fit(r.glyph or '·', 2) .. ' '
       .. fit(r.project or '', fw) .. ' '
       .. fit(r.label or r.session_id, lw) .. ' '
       .. fit(r.age_str or '', 4) .. '  '
@@ -922,7 +949,7 @@ local function session_picker(window, pane)
         if id and not seen_ids[id] then
           table.insert(choices, {
             id = id,
-            label = fit('⏰', 2) .. ' ' .. fit(e.label or id, fw + lw + 1)
+            label = blankcell .. fit('⏰', 2) .. ' ' .. fit(e.label or id, fw + lw + 1)
               .. '  reopens in ' .. (e.wakes_in or '?'),
           })
           cwd_by_id[id] = e.cwd
@@ -937,7 +964,7 @@ local function session_picker(window, pane)
   -- Deeper search as a picker row (same pattern as snooze's 'Custom…'): the
   -- rows above fuzzy-match on names/topics only, so offer the transcript-
   -- content grep when the session you want isn't findable by label.
-  table.insert(choices, { id = '__search__', label = fit('🔍', 2) .. ' search transcripts…' })
+  table.insert(choices, { id = '__search__', label = blankcell .. fit('🔍', 2) .. ' search transcripts…' })
 
   window:perform_action(act.InputSelector {
     title = 'Fleet — sessions',
