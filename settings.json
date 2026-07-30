@@ -2,7 +2,8 @@
   "env": {
     "HICKEY_PRINCIPLES": "$HOME/.claude/hickey-principles.md",
     "UI_PRINCIPLES": "$HOME/.claude/ui-design-principles.md",
-    "TEAM_OPS_REPO": "/home/you/projects/team-ops"
+    "TEAM_OPS_REPO": "/home/you/projects/team-ops",
+    "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1"
   },
   "attribution": {
     "commit": "",
@@ -62,6 +63,7 @@
       "WebFetch",
       "WebSearch",
       "Write",
+      "mcp__claude-in-chrome",
       "mcp__playwright",
       "mcp__google-docs",
       "mcp__google-sheets",
@@ -71,7 +73,7 @@
     ],
     "defaultMode": "dontAsk"
   },
-  "model": "opus",
+  "model": "fable",
   "disableClaudeAiConnectors": true,
   "hooks": {
     "SessionStart": [
@@ -84,6 +86,10 @@
           {
             "type": "command",
             "command": "node \"$HOME/.claude/lib/doctor.mjs\" || true"
+          },
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/inject-lessons.sh"
           }
         ]
       },
@@ -187,5 +193,6 @@
   "tui": "default",
   "skipDangerousModePermissionPrompt": true,
   "skipWorkflowUsageWarning": true,
+  "theme": "dark",
   "agentPushNotifEnabled": true
 }

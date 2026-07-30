@@ -1,28 +1,24 @@
 ## Workflow Orchestration
 
 ### 1. Plan Mode Default
-- Enter plan mode for ANY non-trivial task (3+ steps or architectural decisions)
+- Enter plan mode for any non-trivial task — architectural decisions, multi-file features, anything hard to reverse. Bug fixes are exempt (see 6)
+- Write detailed specs upfront to reduce ambiguity. Plan approval is the user’s checkpoint: after it, run autonomously to a finished result (see 8)
+- Track the plan in `tasks/todo.md` as checkable items; mark them off as you go and end with a short review section of what actually changed
 - If something goes sideways, STOP and re-plan immediately — don’t keep pushing
 - Use plan mode for verification steps, not just building
-- Write detailed specs upfront to reduce ambiguity
 
 ### 2. Subagent Strategy
-- Use subagents liberally to keep main context window clean
-- Offload research, exploration, and parallel analysis to subagents
-- For complex problems, throw more compute at it via subagents
-- One task per subagent for focused execution
+- Use subagents liberally — offload research, exploration, and parallel analysis to keep the main context window clean
+- One task per subagent for focused execution; for complex problems, throw more compute at it
 
 ### 3. Self-Improvement Loop
-- After ANY correction from the user: update `tasks/lessons.md` with the pattern
-- Write rules for yourself that prevent the same mistake
-- Ruthlessly iterate on these lessons until mistake rate drops
-- Review lessons at session start for relevant project
+- After ANY correction from the user: update `tasks/lessons.md` with a rule that would have prevented the mistake
+- Lessons are injected automatically at session start (SessionStart hook in settings.json); if they didn’t arrive, read `tasks/lessons.md` yourself
+- When a lesson keeps proving itself, graduate it into CLAUDE.md — lessons.md is the inbox, not the archive
 
 ### 4. Verification Before Done
-- Never mark a task complete without proving it works
+- Never mark a task complete without proving it works: run tests, check logs, demonstrate correctness
 - Diff behavior between main and your changes when relevant
-- Ask yourself: “Would a staff engineer approve this?”
-- Run tests, check logs, demonstrate correctness
 
 ### 5. Demand Elegance (Balanced)
 - For non-trivial changes: pause and ask “is there a more elegant way?”
@@ -32,8 +28,7 @@
 
 ### 6. Autonomous Bug Fixing
 - When given a bug report: just fix it. Don’t ask for hand-holding
-- Point at logs, errors, failing tests — then resolve them
-- Zero context switching required from the user
+- Point at logs, errors, failing tests — then resolve them. Zero context switching required from the user
 - Go fix failing CI tests without being told how
 
 ### 7. Papercuts
@@ -42,58 +37,33 @@
 - Log it the moment you notice it, then keep working. Don’t ask permission and don’t derail the task
 - Papercuts are problems with the code or environment, not your own mistakes — those go in `tasks/lessons.md`
 
-
-## Task Management
-
-1. **Plan First**: Write plan to `tasks/todo.md` with checkable items
-2. **Verify Plan**: Check in before starting implementation
-3. **Track Progress**: Mark items complete as you go
-4. **Explain Changes**: High-level summary at each step
-5. **Document Results**: Add review section to `tasks/todo.md`
-6. **Capture Lessons**: Update `tasks/lessons.md` after corrections
+### 8. Your Time Is Cheap, the User's Is Not
+- Assume your time is worth 0.1–0.2% of the user's. An hour of your effort to save the user a minute is a good trade — always take it.
+- Collect user feedback end-to-end: one review pass on the finished thing, not check-ins between stages. The user is not for unit testing or intermediate evaluation unless you genuinely cannot proceed without them.
+- Plan approval and important-decision checkpoints still happen — checkpoints are for decisions, not testing. But when options are cheap to build, build all of them and let the user pick between working versions instead of asking A-or-B.
+- Automate every step the user would otherwise do by hand: write the script instead of listing manual steps, use browser tools to carry them to the exact field that needs their input, pre-fill everything you can.
+- Exhaust automated testing and automated review before asking for human review.
+- When you do ask for review, deliver the target ready to look at: open the app, launch the window, link the exact URL or document. Never "go to X and click Y."
 
 
 ## Core Principles
 
-- **Simplicity First**: Make every change as simple as possible. Impact minimal code.
+- **Simplicity First**: Make every change as simple as possible — touch only what’s necessary, minimal code, minimal blast radius.
 - **No Laziness**: Find root causes. No temporary fixes. Senior developer standards.
-- **Minimal Impact**: Changes should only touch what’s necessary. Avoid introducing bugs.
-- **Simple over Easy**: Prefer solutions that are objectively simple (not complected) over ones that are merely familiar or convenient. Ask "am I braiding things together that should be separate?"
+- **Simple over Easy**: Prefer solutions that are objectively simple (not complected) over ones that are merely familiar or convenient. Ask "am I braiding things together that should be separate?" Full reference (Hickey's philosophy of simplicity, also grounds Data over Types): `~/.claude/hickey-principles.md` (aka `$HICKEY_PRINCIPLES`) — treat any "per hickey principles", "per hickey", or other use of "hickey" as pointing here.
 - **Data over Types**: Prefer plain data (maps, arrays) over custom classes when the structure is simple. Don’t create a wrapper when the underlying value carries the meaning.
-- **UI for Humans**: Show system status, speak the user’s language, give control and clear exits, be consistent, prevent errors before they happen. Every element must earn its place on screen. Full reference (Nielsen + Atomic Design): `~/.claude/ui-design-principles.md` (aka `ui-principles.md`, and `$UI_PRINCIPLES`) — treat any "per ui-principles.md" as pointing here.
+- **UI for Humans**: Show system status, speak the user’s language, give control and clear exits, be consistent, prevent errors before they happen. Every element must earn its place on screen. Full reference (Nielsen + Atomic Design): `~/.claude/ui-design-principles.md` (aka `ui-principles.md`, and `$UI_PRINCIPLES`) — treat any "per ui principles" or "per design principles" as pointing here.
 
 
 ## Deploys & Servers
 
-Every production site runs on one shared droplet. **`~/projects/server-config/SERVER.md`
-is the single reference** — read it before touching deploys, nginx, systemd, cron, DNS,
-or backups for any project. Point at it from a project CLAUDE.md; never restate it, or
-the two copies drift.
+Every production site runs on one shared droplet. **`~/projects/server-config/SERVER.md` is the single reference** — read it before touching deploys, nginx, systemd, cron, DNS, or backups for any project. Point at it from a project CLAUDE.md; never restate it, or the two copies drift.
 
-- **Deploying means pushing to GitHub `main`.** The standard is self-pull: the box
-  checks `main` every minute and deploys it, so a commit ships regardless of origin —
-  laptop, a PR merged in the web UI, another machine, an agent. Never build a deploy
-  path that makes one developer's push the only trigger. *Check the SERVER.md inventory
-  row before assuming a given site is on it yet* — sites still on a dual-pushurl `origin`
-  only deploy from that one machine.
-- **Never edit `server-config`'s `etc/ usr/ var/ home/ opt/ secrets/`** — one-way
-  live→repo mirror; your edit changes nothing and is reverted. Repo-root `*.md` and
-  `snapshot.sh` *are* source of truth. Pull before editing.
-- **Migrations run after the build, never before.** A commit that fails to build must
-  not have already changed the production schema.
-- **One copy of any deploy mechanism.** If adding a site means copying a script that
-  exists for another site, parameterize it instead — a per-site copy is how three
-  divergent deploy hooks happened here. Mechanism lives in
-  `server-config/templates/dynamic-site/`.
-- **Adding or removing a site → update the SERVER.md inventory table in the same change.**
-- **Never commit a Claude Code transcript.** `/export` writes into the cwd; they contain
-  connection strings and keys from the session.
+- **Pushing to GitHub `main` IS deploying.** The box self-pulls `main` every minute — a commit ships no matter where it came from. Know this before you push; check the SERVER.md inventory for sites not yet on self-pull.
+- **Never edit `server-config`'s `etc/ usr/ var/ home/ opt/ secrets/`** — one-way live→repo mirror; your edit is reverted. Repo-root `*.md` and `snapshot.sh` *are* source of truth.
+- **Never commit a Claude Code transcript.** `/export` writes into the cwd; transcripts contain connection strings and keys.
 
 
 ## Writing
 
-For any **longform I'll publish under my own name** — essays, articles, Substack posts, threads,
-arguments — invoke the **`writing`** skill first (process, preferences, and the Google Doc
-collaboration protocol live there; don't restate them). Core rule: **I write the words; you build
-the scaffold** — bullets and structure, never finished prose. `kauffj-voice` is for tweets and
-throwaway, not for ghostwriting signed work.
+For any **longform I'll publish under my own name** — essays, articles, Substack posts, threads, arguments — invoke the **`writing`** skill first (process, preferences, and the Google Doc collaboration protocol live there; don't restate them). Core rule: **I write the words; you build the scaffold** — bullets and structure, never finished prose. `kauffj-voice` is for tweets and throwaway, not for ghostwriting signed work.
