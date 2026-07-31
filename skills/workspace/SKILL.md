@@ -194,16 +194,29 @@ Returns non-zero if not found.
    ```bash
    git branch --list "<branch>"
    ```
-   - Branch exists → recreate worktree:
+   - Branch exists → recreate worktree **and restore its env file**. `$ENV_FILE`
+     (e.g. `.env.local`) is gitignored, so the recreated worktree does NOT get one
+     from the branch — without this every tool that reads it fails, e.g.
+     `drizzle-kit migrate` dies with `DATABASE_URL` undefined. Copy it from the
+     PRIMARY checkout (run these there, before `cd`), then re-apply the same
+     rewrites Create does — pointing at the workspace's EXISTING `dbName`:
      ```bash
      git worktree add "<worktreePath>" "<branch>"
-     cd "<worktreePath>" && $INSTALL_CMD
+     if [ -n "$ENV_FILE" ] && [ ! -f "<worktreePath>/$ENV_FILE" ]; then
+       cp "$ENV_FILE" "<worktreePath>/$ENV_FILE"
+       sed -i "s|^APP_URL=.*|APP_URL=http://localhost:$PORT|" "<worktreePath>/$ENV_FILE"
+       sed -i "s|^BASE_URL=.*|BASE_URL=http://localhost:$PORT|" "<worktreePath>/$ENV_FILE"
+       sed -i "s|^NEXTAUTH_URL=.*|NEXTAUTH_URL=http://localhost:$PORT|" "<worktreePath>/$ENV_FILE"
+       # Re-point at the EXISTING per-workspace DB only; never provision on resume.
+       [ -n "$DB_NAME" ] && node $HOME/.claude/lib/workspace.mjs rewrite-env-db "<worktreePath>/$ENV_FILE" "$DB_NAME" $DB_URL_VARS
+     fi
+     (cd "<worktreePath>" && $INSTALL_CMD)
      ```
    - Branch gone → say: "Both worktree and branch are gone for '<name>'. Consider `/workspace remove <name>`." **Stop.**
 
 4. Tell the user the workspace is ready. Callers read the record back with `node $HOME/.claude/lib/workspace.mjs get <NAME>`.
 
-   **Do not provision a database on resume.** The workspace's `dbName` already exists from Create and the recreated worktree's env (checked out from the branch) still carries the rewritten DB URL — never re-run `CREATE DATABASE`. If the worktree env somehow lacks the rewrite, re-apply it against the existing `dbName` only: `node $HOME/.claude/lib/workspace.mjs rewrite-env-db "<worktreePath>/<envFile>" "<dbName>" $DB_URL_VARS`.
+   **Do not provision a database on resume.** The workspace's `dbName` already exists from Create — never re-run `CREATE DATABASE`. The env file is restored in step 3 above (it is gitignored, so a recreated worktree never carries it from the branch), and that restore re-points the DB URL at the existing `dbName`. If the worktree env somehow lacks the rewrite, re-apply it against the existing `dbName` only: `node $HOME/.claude/lib/workspace.mjs rewrite-env-db "<worktreePath>/<envFile>" "<dbName>" $DB_URL_VARS`.
 
 ---
 

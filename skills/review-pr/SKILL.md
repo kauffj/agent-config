@@ -59,10 +59,20 @@ Use the file list from `gh pr view ... --json files`. Check out the PR locally i
 cd "$WORKTREE_PATH"
 DEFAULT_BRANCH=$(node $HOME/.claude/lib/project.mjs load | jq -r .defaultBranch)
 git fetch origin "$DEFAULT_BRANCH" --quiet
-CHANGED_FILES=$(git diff --name-only "origin/$DEFAULT_BRANCH"...HEAD)
+# Diff the merge-base against the WORKING TREE, not ...HEAD: a recovered or
+# in-progress worktree can hold extensive uncommitted work, and `...HEAD` sees
+# only commits — it reports an empty diff and the review silently reviews
+# nothing. Identical to the old behavior once everything is committed; adds
+# staged + unstaged changes, and unions in untracked files.
+BASE=$(git merge-base "origin/$DEFAULT_BRANCH" HEAD)
+CHANGED_FILES=$( { git diff --name-only "$BASE"; git ls-files --others --exclude-standard; } | sort -u )
 ```
 
-Read each file at its current worktree path. The diff is `git diff origin/$DEFAULT_BRANCH...HEAD`.
+Read each file at its current worktree path. The diff is `git diff "$BASE"`.
+
+If `CHANGED_FILES` comes back empty, say so and **stop** rather than reviewing
+nothing — an empty diff in worktree mode means the target is wrong, not that the
+code is clean.
 
 ### File-list mode
 
