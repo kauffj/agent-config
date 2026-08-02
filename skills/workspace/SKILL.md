@@ -119,16 +119,38 @@ Parse `--kind` (default `feature`), `--name` (default: derive from description),
    DB_ADMIN_URL=$(node -e 'const u=new URL(process.argv[1]); u.pathname="/postgres"; console.log(u.href)' "$PRIMARY_URL")
    ```
 
-   Provision the clone. If it fails (no `psql`, no `CREATEDB` privilege, or active connections to the template), **do not abort** — warn, fall back to the shared DB, and clear `DB_NAME`:
+   Provision the clone. Postgres refuses `TEMPLATE` while anything else is
+   connected to the template, and on a working machine something usually is (a
+   dev server on :3000 holds a pool against `$DB_TEMPLATE`). That is the common
+   case, not the exception — so terminate IDLE connections and retry once before
+   giving up. If it still fails (no `psql`, no `CREATEDB` privilege, an ACTIVE
+   query), **do not abort** — warn, fall back to the shared DB, and clear
+   `DB_NAME`:
    ```bash
-   if psql "$DB_ADMIN_URL" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$DB_NAME\" TEMPLATE \"$DB_TEMPLATE\""; then
+   create_db() {
+     psql "$DB_ADMIN_URL" -v ON_ERROR_STOP=1 \
+       -c "CREATE DATABASE \"$DB_NAME\" TEMPLATE \"$DB_TEMPLATE\""
+   }
+   if create_db; then
      node $HOME/.claude/lib/workspace.mjs rewrite-env-db "$WORKTREE_PATH/$ENV_FILE" "$DB_NAME" $DB_URL_VARS
    else
-     echo "WARN: DB provisioning failed — worktree will use the shared dev DB ($DB_TEMPLATE)."
-     DB_NAME=""
+     # Only state='idle' — never kill a running query, and never this session.
+     echo "NOTE: retrying after dropping idle connections to $DB_TEMPLATE…"
+     psql "$DB_ADMIN_URL" -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+       WHERE datname = '$DB_TEMPLATE' AND pid <> pg_backend_pid() AND state = 'idle'" >/dev/null 2>&1 || true
+     if create_db; then
+       node $HOME/.claude/lib/workspace.mjs rewrite-env-db "$WORKTREE_PATH/$ENV_FILE" "$DB_NAME" $DB_URL_VARS
+     else
+       echo "WARN: DB provisioning failed — worktree will use the shared dev DB ($DB_TEMPLATE)."
+       DB_NAME=""
+     fi
    fi
    ```
-   (If `psql` reports the template has active connections, the dev server is likely running on `$DB_TEMPLATE`. Stop it and retry, or proceed with `--db shared`.)
+   (Terminating an idle pool connection is safe — the dev server reconnects on
+   its next query. If it still fails, something holds an ACTIVE query against
+   `$DB_TEMPLATE`: stop that process and retry, or proceed with `--db shared`.
+   Falling back means the worktree shares the dev DB, so concurrent migrations
+   can collide — see the drizzle-cursor failure `npm run db:audit` catches.)
 
 7. **Install deps** in the worktree:
    ```bash
