@@ -1,0 +1,50 @@
+#!/bin/sh
+# BROWSER shim — open a URL in one account's isolated browser session.
+#
+# `claude auth login` hands its OAuth authorize URL to $BROWSER; claude-acct
+# points that here with CLAUDE_ACCT_BROWSER_PROFILE set, so each account
+# authorizes in a browser profile that is NOT signed into any other account's
+# claude.ai session. Without this, a second login inside the default profile
+# silently re-authorizes the account already signed in there — two config dirs,
+# one subscription, no round-robin.
+#
+# The profile persists, so it stays signed in as that account: it's also the
+# browser to use for Claude-in-Chrome work on that account (its
+# NativeMessagingHosts/ is wired up by claude-acct at setup).
+set -e
+
+profile="${CLAUDE_ACCT_BROWSER_PROFILE:?claude-acct-browser: CLAUDE_ACCT_BROWSER_PROFILE not set}"
+mkdir -p "$profile"
+
+# Bind this browser to the account that owns the profile. A native-messaging
+# host inherits the environment of the browser that spawned it, so exporting
+# CLAUDE_CONFIG_DIR here is the entire binding: Claude in Chrome then talks to
+# the same account the browser is signed in as. The manifest cannot do this —
+# Brave reads only its product-wide one and Claude Code rewrites that on every
+# --chrome session start, so a manifest binding is undone by the next session.
+# Drop the session variables of whatever Claude session opened us. The browser
+# hands its whole environment to every native-messaging host it spawns, so a
+# stray CLAUDECODE/CLAUDE_CODE_SESSION_ID would tell that host it is running
+# inside a session it has nothing to do with. Scrub by prefix, not by list, so
+# variables added by future Claude Code versions are covered too.
+for v in $(env | sed -n 's/^\(CLAUDE_CODE_[A-Za-z0-9_]*\)=.*/\1/p'); do
+    unset "$v"
+done
+unset CLAUDECODE CLAUDE_PID CLAUDE_EFFORT
+
+if [ -r "$profile/claude-config-dir" ]; then
+    CLAUDE_CONFIG_DIR=$(cat "$profile/claude-config-dir")
+    export CLAUDE_CONFIG_DIR
+fi
+
+for exe in brave-browser brave chromium google-chrome; do
+    if command -v "$exe" >/dev/null 2>&1; then
+        exec "$exe" --user-data-dir="$profile" \
+             --no-first-run --no-default-browser-check "$@"
+    fi
+done
+
+echo "claude-acct-browser: no Chromium-family browser found;" \
+     "falling back to xdg-open — the login will NOT be isolated," \
+     "so make sure you are signed out of claude.ai first." >&2
+exec xdg-open "$@"

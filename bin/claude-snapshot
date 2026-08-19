@@ -10,6 +10,7 @@ is running); restore is on-demand, so a stale set is never re-opened uninvited.
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -59,6 +60,10 @@ def _restorable_ids():
     return ids
 
 
+SESSION_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
 def _reap_dead_state(live_ids, keep_ids=frozenset()):
     """Piggyback dead-session-state cleanup on this 60s timer. A state file at
     ~/.claude/state/<session_id>.json is garbage once its session is neither
@@ -81,7 +86,12 @@ def _reap_dead_state(live_ids, keep_ids=frozenset()):
     keep = set(live_ids) | set(keep_ids)
     try:
         for f in glob.glob(os.path.join(CLAUDE_DIR, "state", "*.json")):
-            if os.path.basename(f)[:-5] not in keep:
+            name = os.path.basename(f)[:-5]
+            if not SESSION_ID_RE.match(name):
+                continue   # not ours: state/ also holds other tools' runtime
+                           # files (claude-acct's usage cache lived here and
+                           # was being reaped every tick, 2026-08-19)
+            if name not in keep:
                 try:
                     os.remove(f)
                 except OSError:

@@ -96,3 +96,116 @@ done
 
 Timers run within the user's graphical session (no `loginctl enable-linger` needed —
 recovery happens after you log back in anyway).
+
+---
+
+# Dual Max account picker
+
+- **`claude-acct`** (policy in `_claude_acct_lib.py`, tests in `test_claude_acct.py`) —
+  every interactive `claude` launch routes through it via the `claude()` function in
+  `~/.bash_aliases` and lands on whichever Max account has the most headroom.
+  Usage comes from the same endpoint `/usage` renders (`api/oauth/usage`), cached 60s
+  under an flock; `score = session% + max(0, weekly% − 80) × 20`, so the 5-hour window
+  decides normally and a weekly cap (incl. model-scoped, e.g. Fable) takes over near
+  its limit. Blocked accounts (an unreset limit ≥99%) are skipped; near-ties go to the
+  least-recently-launched; a per-launch bump makes burst spawns (claude-resume) alternate.
+  Tokens are never refreshed here — an idle account is judged from its last-good
+  snapshot with reset-aware decay. Any wrapper failure fails open to a plain launch.
+
+**Every launch first probes all accounts and prints one enumeration line** before
+exec'ing claude, e.g. `claude-acct: claudepersonal s84% w54% · claude s12% w41% → claude`
+(accounts are named by the subscription they log into — the email's local part).
+
+**Two working accounts are required.** With fewer — or with any configured account
+whose credentials are broken — no session starts: the wrapper runs
+`claude auth login` in the offending account's config dir (one flow at a time,
+machine-wide flock, so a claude-resume burst can't start ten), then continues.
+Where a login can't run (no tty), it exits with the command to run. Credential
+states are distinguished carefully: an expired *access* token is healthy (claude
+refreshes it at launch) and an unreachable API is healthy (offline laptops still
+work); only a 401/403 or a dead *refresh* token counts as broken.
+
+**Each account logs in through its own browser session.** `claude auth login`
+hands its OAuth URL to `$BROWSER`; the wrapper points that at
+`bin/claude-acct-browser`, which opens Brave on `~/.claude-browsers/<account>`.
+Without this, a second login inside the default profile just re-authorizes
+whoever is already signed into claude.ai there — two config dirs, one
+subscription, no round-robin. A login landing on an email another account
+already uses is rolled back (credentials dropped, that browser session moved
+aside) rather than kept.
+
+**Claude in Chrome is account-scoped** — verified 2026-08-18: with the extension
+connected, a session on `main` listed 2 browsers while a session on `alt` listed
+`[]`. So a browser session has to land where the extension actually is.
+`--chrome` (or `--browser`) restricts selection to browser-capable accounts
+rather than pinning one, so browser work balances again as soon as a second
+account qualifies.
+
+Capability is **detected from disk** — the extension present under
+`<user-data-dir>/*/Extensions/<id>` in that account's browser — with
+`"browser": true` in `accounts.json` as a manual override. No bookkeeping: the
+moment you install the extension in an account's profile, it joins the pool.
+
+The account binding is **the browser's environment**, not the manifest. A
+native-messaging host inherits the environment of the browser that spawned it
+(verified 2026-08-19: a live host carried `CLAUDE_ACCT_BROWSER_PROFILE` and
+`BROWSER` straight from its browser), so `claude-acct-browser` exports that
+profile's `CLAUDE_CONFIG_DIR` — recorded in `<user-data-dir>/claude-config-dir`
+— before exec'ing the browser, and every host it spawns lands on the right
+account. The shim also scrubs the `CLAUDE_CODE_*` variables of whatever session
+opened the browser, so a host never inherits a session identity that isn't its.
+
+Binding through the manifest instead does **not** survive, which is why it
+isn't used: Brave reads native-messaging manifests only from its product
+directory and ignores any inside a custom `--user-data-dir`, and Claude Code
+rewrites that product-wide manifest to its own shim on every `--chrome` session
+start (verified by reproduction) — so any manifest the wrapper asserts is undone
+by the next session that starts. `chrome/` is therefore not in the shared
+symlink set.
+
+Installing the extension is **not** enough. It registers with no account until a
+human opens it in that browser and signs in — the diagnostic is its storage
+under `<user-data-dir>/Default/Local Extension Settings/<id>`, which holds
+`accountUuid`/`connected` markers once activated. Capability therefore means
+installed **and** activated **and** that browser running; the SessionStart hook
+names whichever of the three is missing, and the exact click that fixes it.
+
+That same hook also warns when the account it landed on has a **model-scoped
+cap it routed around** — the picker chose this account for the launch model, so
+a mid-session `/model` switch can hit a wall the session would otherwise not see
+coming. It reads the cached snapshot only; a hook must never block a launch on
+the network.
+
+To give a second account a browser: `claude --acct-browser alt` opens its
+profile (with the extension page and claude.ai when the extension is missing);
+install the extension there and sign into claude.ai as that account.
+
+```sh
+claude                       # probes, enumerates, picks (stderr says which)
+claude --acct claude@...     # force an account by email, local part or handle
+                             # (also CLAUDE_ACCT=…) — escape hatch if the gate misfires
+claude --chrome              # browser work: pool restricted to capable accounts
+claude --acct-status         # credentials, session/weekly/score, every
+                             # model-scoped cap, and Claude-in-Chrome readiness
+claude --acct-login [name]   # collect credentials (all unhealthy, or just one)
+claude --acct-browser [name] # open that account's own browser session
+claude-acct --acct-setup bob # scaffold another account dir (~/.claude-bob)
+command claude               # bypass the wrapper entirely
+```
+
+- Roster: `~/.claude/meta/accounts.json` (`configDir: null` = the default `~/.claude`).
+- Account dirs (`~/.claude-alt`) hold per-account `.credentials.json` + seeded
+  `.claude.json` (project trust + MCP approvals copied; identity/telemetry never;
+  `autoUpdates` off — main owns the shared native install) and symlink everything
+  shared back into this repo: config, `projects/` (transcripts+memory), `sessions/`
+  (the fleet registry — resume/pickers see both accounts), `history.jsonl`,
+  `file-history/`, `plans/`, `paste-cache/`, `todos/`, `tasks/`, `chrome/`.
+- Maintenance subcommands (`auth mcp plugin update doctor install project agents
+  setup-token …`) always run on the default account and skip the health gate — they
+  are how a broken account gets fixed. A preexisting `CLAUDE_CONFIG_DIR` (daemon
+  respawns, in-session children) bypasses everything, as do non-interactive shells
+  (they never see the function).
+- Runtime state: `state/acct-usage.json` (snapshot + probe cache),
+  `state/acct-ledger.jsonl` (launch log, self-truncating), `state/acct-login.lock`.
+- A duplicate-subscription check warns if two accounts sign in as the same email —
+  round-robin across one quota pool would be a no-op.
