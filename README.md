@@ -1,155 +1,113 @@
-# claude-config — a WezTerm control plane for many Claude Code sessions
+# claude-config
 
-This repo is a Claude Code configuration that turns a single WezTerm window into a
-**fleet dashboard**: every tab is one Claude Code session, colored by how long it
-has been waiting on you, labeled by what distinguishes it, and reachable through a
-fuzzy picker and a content search. The whole thing is installed by symlinking the
-repo to `~/.claude` (and `wezterm/wezterm.lua` to `~/.config/wezterm/`).
+A complete, opinionated Claude Code configuration: the whole `~/.claude`
+directory as a git repo. It is installed by symlinking the repo *onto* the
+config directory, so the thing you edit and the thing Claude Code reads are the
+same files.
 
-It is Linux + systemd + WezTerm based.
+Two ideas run through all of it:
 
-## The idea: two layers
+- **Sessions are a fleet, not a window.** A dozen concurrent Claude Code
+  sessions is normal. They need a registry, an urgency order, a way to search
+  across them, and a way to bring back the ones that died.
+- **A transcript is the only artifact that can't be regenerated.** Code can be
+  rewritten; a conversation can't. So durability gets real engineering, not
+  hope.
 
-The visible tab bar is only a front-end. It renders a small, terminal-agnostic
-**data layer** that any tool could consume.
+It is **Linux + systemd + WezTerm**. Nothing here is portable to macOS or
+Windows without work, and the interesting parts assume all three.
 
-```
-Claude Code hooks ──► ~/.claude/state/<session_id>.json   {status, since, wezterm_pane, cwd}
-        │                          ▲
-        │                 bin/claude-snapshot  (60s systemd timer)
-        │                   • snapshot live sessions for crash recovery
-        │                   • REAP state files whose session is dead
-        ▼                          │
-  bin/claude-sessions --json ──────┤        bin/claude-search <text>
-   (urgency-sorted registry)       │         (grep live transcripts)
-        │                          │                 │
-        └───────────────► wezterm/wezterm.lua ◄──────┘
-                          colors · labels · pickers
-```
+## What's in here
 
-**Layer 1 — the data layer (works in any terminal).**
+| Path | What it is |
+|---|---|
+| **[`FLEET.md`](FLEET.md)** | The fleet control plane — a terminal-agnostic data layer, and a WezTerm tab bar that renders it. Wait-color escalation, fuzzy session picker, transcript search, snooze-and-reopen. |
+| **[`bin/README.md`](bin/README.md)** | Durability and resurrection — fsync'ing transcripts against unclean shutdowns, restoring ones that vanished, and reopening the sessions that were live before a reboot. |
+| `skills/` | 13 skills — `workspace`, `feature`, `propose`, `review-pr`, `explore`, `fix-ci`, `humanizer`, and others. |
+| `agents/` | 5 review subagents — security, simplicity, UI, visual, QA. |
+| `hooks/` | 7 hooks — session state, a destructive-command guard, auto-format, lessons injection, transcript fsync, and a pre-commit leak guard. |
+| `bin/` | 16 command-line tools behind the above. |
+| `lib/` | `doctor.mjs` (config integrity), `workspace.mjs` (worktree state), `project.mjs` (project profile). |
+| `systemd/user/` | 9 units — the timers that make durability and resurrection actually run. |
+| `CLAUDE.md` | The standing instructions. Workflow orchestration, core principles, and a section on the economics of an agent's time vs. yours. |
+| `hickey-principles.md`, `ui-design-principles.md` | Reference docs the instructions point at instead of restating. |
 
-- **`hooks/session-state.sh`** is wired into Claude Code's hooks (`SessionStart`,
-  `Stop`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `Notification`).
-  On each event it writes `~/.claude/state/<session_id>.json` with the session's
-  `status` (`working` / `waiting`), `since` (when that status last *changed* — it
-  only moves on a real transition, so "waiting 14m" stays truthful), `wezterm_pane`,
-  and `cwd`. It also sets the terminal tab title with a trailing `●` when the
-  session is waiting on you.
-- **`bin/claude-sessions --json`** joins those state files into an urgency-sorted
-  registry — the list the picker shows.
-- **`bin/claude-search <text>`** greps the transcripts of *live* sessions (ripgrep
-  if present, else grep) and returns the matches ranked by hit count. It is the
-  live-scoped sibling of the `/find-session` skill.
-- **`bin/claude-snapshot`** runs every 60 s from a systemd-user timer. It records
-  the live session set for crash recovery *and* reaps dead `state/` files —
-  a file whose session is no longer live is garbage that would otherwise skew the
-  tab colors and collide with reused WezTerm pane ids. (Reaping is safe: a live
-  session regenerates its file on its next hook, and it never mass-deletes on an
-  empty liveness read.)
+## The parts most worth stealing
 
-**Layer 2 — the WezTerm front-end (`wezterm/wezterm.lua`).**
-It reads the data layer every ~second and turns it into the tab bar described below.
+**The fleet tab bar** ([`FLEET.md`](FLEET.md)). Every tab is one session, colored
+by how long it has been waiting on you — a continuous truecolor gradient on a
+logarithmic age scale, with a dynamic ceiling so the reddest tab is always the
+most-neglected one *relative to the rest*. Wait age runs on an "awake clock"
+that stops during suspend, so resuming your machine doesn't turn the whole bar
+red. `Ctrl+Shift+Space` opens a fuzzy picker sorted by urgency;
+`Ctrl+Shift+F` greps live transcripts and jumps to the match.
 
-## What the tab bar does
+The visible bar is only a front-end. Underneath, `hooks/session-state.sh` writes
+`state/<session_id>.json` on every session event and `bin/claude-sessions --json`
+joins those into an urgency-sorted registry. Any terminal could render it.
 
-**Wait-color escalation.** A waiting tab warms from calm teal → green → yellow →
-orange → deep red as it waits. Details that make it readable:
+**The durability layer** ([`bin/README.md`](bin/README.md)). Claude appends each
+turn to a transcript, but the kernel can hold those writes in the page cache for
+seconds, and ext4's default `data=ordered` journals metadata but not data — so
+an unclean shutdown can roll back whole sessions. This happened, twice, and the
+write-up is the most directly useful thing in the repo. A 20-second timer
+fsyncs and mirrors recent transcripts; a 60-second timer records which sessions
+are live, with a boot-grace guard and a "cliff guard" for suspend-freezes, so a
+post-crash tick can't overwrite the pre-crash set before you restore from it.
 
-- **Continuous truecolor gradient**, interpolated across seven stops — not three
-  hard steps.
-- **Logarithmic age scale** so minutes, hours, and days each get their own band;
-  a few days-old sessions can't flatten everything recent into one color.
-- **Ease-in slow start** (`WAIT_GAMMA`) — a fresh wait stays calm for a while
-  before it climbs.
-- **Dynamic, relative ceiling** = `max(2h, the longest currently-open wait)`. The
-  reddest tab is always the most-neglected relative to the rest, and nothing maxes
-  out before two hours when every wait is recent. Only *open* tabs count toward the
-  ceiling, so lingering orphans don't blow out the scale.
-- **Downtime-frozen ages.** Wait age is measured on an "awake clock" that stops
-  during suspend and does not count powered-off time, and it is persisted to
-  `~/.cache/wezterm-fleet-wait.json`. So resuming the machine — or rebooting —
-  preserves each tab's color instead of inflating every wait by the time you were
-  away.
-- **Live-title gated.** The color only applies when the pane's live title still
-  shows the `●` marker, so a tab that has resumed working never keeps a stale
-  color from a dead session that once held its (reused) pane id.
+**`/workspace`** (`skills/workspace/SKILL.md`). One primitive for isolated
+parallel work: a git worktree, a dev-server port, a copied env file, an isolated
+database, and a state record — created, resumed, and torn down as a unit. The
+other skills (`/feature`, `/propose`, `/review-pr`) call it instead of each
+reimplementing worktree setup.
 
-**Adaptive labels.** Each tab spends its columns on what *distinguishes* it:
-working tabs show their task text; otherwise the label drops default branch names
-(`main`/`master`), de-duplicates a project name that repeats the label, and — when
-the tab is tight — leads with the distinguishing bit (feature branch, else the
-session tag) so right-edge truncation can't eat it.
-
-**Stable, filled layout.** Tabs are sized by proportional shares (the active tab
-gets more) so the row fills the bar (WezTerm's retro tab bar won't stretch on its
-own). The measured bar width is stabilized with hysteresis (a one-column wobble —
-the scrollbar column blinking in and out as scrollback grows — is ignored) and a
-focused-window guard, so nothing jumps while you type. The active tab is
-highlighted so the focused session is unmistakable.
-
-## Keybindings
-
-| Keys | Action |
-|------|--------|
-| `Ctrl+Shift+Space` | **Session picker** — fuzzy list of live (and snoozed) sessions, sorted by urgency; Enter jumps to that tab (or resumes it if closed/snoozed) |
-| `Ctrl+Shift+F` | **Content search** — type text, grep live transcripts, jump to the matching session |
-| `Ctrl+Shift+S` | **Snooze** — pick a time, close the tab now, and auto-reopen it then (resume early from the picker) |
-| `Ctrl+Shift+G` | **Launch family** — spawn a saved cluster of sessions (`~/.claude/fleet/families.json`) into its own workspace |
-| `Ctrl+Shift+←` / `→` | Move the active tab one slot left / right |
-| `Ctrl+Shift+Home` / `End` | Send the active tab to the first / last position |
-
-## Snooze: close now, reopen on schedule
-
-For long-running tasks that are blocked for days, `Ctrl+Shift+S` **closes the tab
-now and schedules it to reopen at a chosen time** (`1h`, `tomorrow 9am`, `3 days`,
-or a precise datetime). This is just a *scheduled resurrection*: closing ends the
-process but the transcript survives, and `claude --resume` brings the conversation
-back exactly.
-
-- **`bin/claude-schedule`** owns `~/.claude/scheduled.json` — `add` / `list` /
-  `cancel` / `reopen-due`. It parses the time, and `reopen-due` spawns any overdue
-  session back as a tab (the same `wezterm cli spawn … claude --resume` that
-  `claude-resume` uses), dropping entries that are already live and keeping ones
-  whose spawn fails so they retry.
-- **`bin/claude-snapshot`** calls `reopen-due` on its existing 60s tick, so a
-  reopen scheduled while the machine is asleep simply fires when it is next on —
-  no new timer, robust to suspend/reboot.
-- Snoozed sessions still appear in the **`Ctrl+Shift+Space` picker** marked
-  `⏰ reopens in Xh`; selecting one reopens it immediately and cancels the schedule.
-
-## Renderer note
-
-The config runs Claude Code on the **classic renderer** (`"tui": "default"`, and
-`CLAUDE_CODE_NO_FLICKER` is *not* set). That keeps output in the terminal's primary
-scrollback, so WezTerm's scrollbar, mouse wheel, and native text selection all
-work. The tradeoff is that resizing the window re-wraps already-printed lines
-(inherent to primary-scrollback terminals); `Ctrl+L` forces a clean redraw. The
-fullscreen/alt-screen renderer resizes cleanly but has no scrollback — this config
-chooses the scrollbar.
+**`lib/doctor.mjs`**. Resolves every cross-reference in the config — file paths
+embedded in skills, agents, and hooks, `settings.json` env values, the `~/.claude`
+symlink — against what is actually on disk. It runs at session start and on
+pre-commit, turning silent breakage (a renamed agent file, a moved doc) into a
+loud, early failure.
 
 ## Install
-
-Dependencies: WezTerm, `python3`, `jq`, and ideally `ripgrep` (grep is the fallback).
 
 ```bash
 git clone <this repo> ~/projects/claude-config
 ln -s ~/projects/claude-config ~/.claude
-mkdir -p ~/.config/wezterm
+mkdir -p ~/.claude/state ~/.config/wezterm
 ln -s ~/.claude/wezterm/wezterm.lua ~/.config/wezterm/wezterm.lua
-mkdir -p ~/.claude/state
+
+# timers for durability + resurrection
+mkdir -p ~/.config/systemd/user
+ln -s ~/.claude/systemd/user/*.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now claude-snapshot.timer claude-transcript-sync.timer
+
+# integrity check + the pre-commit leak guard
+node ~/.claude/lib/doctor.mjs
+ln -sf ../../hooks/pre-commit ~/.claude/.git/hooks/pre-commit
 ```
 
-1. **Wire the hook** — copy the `hooks` block from `settings.json` so
-   `~/.claude/hooks/session-state.sh` runs on the session events listed above.
-2. **Enable the timer** — install the systemd-user unit that runs
-   `~/.claude/bin/claude-snapshot` every 60 s (see
-   `~/.config/systemd/user/claude-snapshot.{service,timer}`) and
-   `systemctl --user enable --now claude-snapshot.timer`.
+`settings.json` already wires the hooks and the status line; it is read from
+`~/.claude/settings.json`, which the symlink provides.
 
-## Related
+**Requirements:** WezTerm, `python3`, `jq`, `node`, systemd-user, and ideally
+`ripgrep` (plain `grep` is the fallback).
 
-`bin/README.md` documents the **durability & resurrection** layer — fsync'ing
-transcripts against unclean shutdowns (`claude-transcript-sync`,
-`claude-restore-transcripts`) and reopening the sessions that were live before a
-reboot (`claude-snapshot`, `claude-resume`).
+**Caveats.** This is one person's live config, published because parts of it are
+generally useful — not a framework. It assumes a `~/projects/<name>` layout, and
+`settings.json` runs with a broad permission allowlist and `defaultMode: auto`,
+which you should read before adopting. `wezterm/families.example.json` is an
+example; copy it to `~/.claude/fleet/families.json` and use absolute paths (the
+`cwd` is handed to WezTerm verbatim — no `~` or `$HOME` expansion).
+
+## Not in this repo
+
+Some things are deliberately kept out of git and stay on the machine: Claude
+Code's own runtime state (`.claude.json`, transcripts, caches), anything
+credential-shaped, and a couple of personal assets. `.gitignore` covers what
+exists today; `hooks/pre-commit` is the backstop for what shows up tomorrow — it
+refuses to stage transcripts, credential-shaped paths, runtime-state
+directories, and content matching known key formats.
+
+If you clone this, note that `skills/kauffj-voice` and `skills/writing` encode
+one person's voice and writing process. They are here as worked examples of
+encoding a preference into a skill, not as something to use as-is.

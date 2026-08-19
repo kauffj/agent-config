@@ -71,9 +71,8 @@ transcript-shrink.log
 gh-pr-status-cache.json
 
 # ── Machine-local, deliberately untracked (present on disk, not shared) ─
-# Private-org tooling and personal assets. These KEEP WORKING locally;
-# they are simply not part of the public repo.
-commands/ops.md
+# Personal assets. These KEEP WORKING locally; they are simply not
+# part of the public repo.
 skills/sign/
 tools/knowledge-audit-*.md
 

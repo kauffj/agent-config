@@ -2,7 +2,6 @@
   "env": {
     "HICKEY_PRINCIPLES": "$HOME/.claude/hickey-principles.md",
     "UI_PRINCIPLES": "$HOME/.claude/ui-design-principles.md",
-    "TEAM_OPS_REPO": "$HOME/projects/team-ops",
     "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1"
   },
   "attribution": {
@@ -40,8 +39,6 @@
       "Bash(npm test *)",
       "Bash(npx *)",
       "Bash(pipx *)",
-      "Bash(ops *)",
-      "Bash(ops-cli *)",
       "Bash(printf *)",
       "Bash(python *)",
       "Bash(python3 *)",
