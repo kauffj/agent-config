@@ -26,6 +26,14 @@ import time
 HOME = os.path.expanduser("~")
 LIVE = os.path.join(HOME, ".claude", "projects")
 BACKUP = os.path.join(HOME, ".claude", "projects-backup")
+# Other agents' transcripts sit in the same page cache and roll back the same
+# way on an unclean shutdown; a Codex rollout is as expensive to lose as a
+# Claude one. Same guards, one more tree.
+TREES = [
+    (LIVE, BACKUP),
+    (os.path.join(HOME, ".codex", "sessions"),
+     os.path.join(HOME, ".claude", "vendor-backup", "codex")),
+]
 WINDOW = 300  # seconds; only touch files modified this recently (keeps each run cheap)
 SHRINK_LOG = os.path.join(HOME, ".claude", "transcript-shrink.log")
 
@@ -75,64 +83,65 @@ def main():
     synced = copied = 0
     touched_backup_dirs = set()
 
-    for root, _dirs, files in os.walk(LIVE):
-        for fn in files:
-            if not fn.endswith(".jsonl"):
-                continue
-            src = os.path.join(root, fn)
-            try:
-                st = os.stat(src)
-            except OSError:
-                continue
-            if now - st.st_mtime > WINDOW:
-                continue  # untouched recently; already durable from a prior run
-
-            # 1) make the live file itself durable
-            if fsync_path(src):
-                synced += 1
-
-            # 2) mirror to the backup tree, but only when the source is newer/bigger.
-            #
-            # NEVER mirror a live file that has SHRUNK. A transcript only loses bytes
-            # when it has been truncated or rolled back, and the fuller backup is
-            # precisely the copy this tree exists to preserve. The old guard tested
-            # `st_size != dst_st.st_size`, so a truncated live file counted as "fresh"
-            # and overwrote the good backup within one 20s tick — destroying the only
-            # surviving copy (this is how ~a week of one session was lost). Refuse the
-            # mirror, keep the backup, and log it so `claude-restore-transcripts` (which
-            # restores when live < backup) can put it back.
-            rel = os.path.relpath(src, LIVE)
-            dst = os.path.join(BACKUP, rel)
-            try:
-                dst_st = os.stat(dst)
-                if st.st_size < dst_st.st_size:
-                    _log_shrink(rel, st.st_size, dst_st.st_size)
+    for live_root, backup_root in TREES:
+        for root, _dirs, files in os.walk(live_root):
+            for fn in files:
+                if not fn.endswith(".jsonl"):
                     continue
-                fresh = (st.st_mtime > dst_st.st_mtime) or (st.st_size != dst_st.st_size)
-            except OSError:
-                fresh = True
-            if fresh:
-                dst_dir = os.path.dirname(dst)
-                os.makedirs(dst_dir, exist_ok=True)
-                tmp = dst + ".tmp"
+                src = os.path.join(root, fn)
                 try:
-                    shutil.copyfile(src, tmp)
-                    fsync_path(tmp)
-                    os.replace(tmp, dst)
-                    copied += 1
-                    touched_backup_dirs.add(dst_dir)
+                    st = os.stat(src)
                 except OSError:
+                    continue
+                if now - st.st_mtime > WINDOW:
+                    continue  # untouched recently; already durable from a prior run
+
+                # 1) make the live file itself durable
+                if fsync_path(src):
+                    synced += 1
+
+                # 2) mirror to the backup tree, but only when the source is newer/bigger.
+                #
+                # NEVER mirror a live file that has SHRUNK. A transcript only loses bytes
+                # when it has been truncated or rolled back, and the fuller backup is
+                # precisely the copy this tree exists to preserve. The old guard tested
+                # `st_size != dst_st.st_size`, so a truncated live file counted as "fresh"
+                # and overwrote the good backup within one 20s tick — destroying the only
+                # surviving copy (this is how ~a week of one session was lost). Refuse the
+                # mirror, keep the backup, and log it so `claude-restore-transcripts` (which
+                # restores when live < backup) can put it back.
+                rel = os.path.relpath(src, live_root)
+                dst = os.path.join(backup_root, rel)
+                try:
+                    dst_st = os.stat(dst)
+                    if st.st_size < dst_st.st_size:
+                        _log_shrink(rel, st.st_size, dst_st.st_size)
+                        continue
+                    fresh = (st.st_mtime > dst_st.st_mtime) or (st.st_size != dst_st.st_size)
+                except OSError:
+                    fresh = True
+                if fresh:
+                    dst_dir = os.path.dirname(dst)
+                    os.makedirs(dst_dir, exist_ok=True)
+                    tmp = dst + ".tmp"
                     try:
-                        os.path.exists(tmp) and os.remove(tmp)
+                        shutil.copyfile(src, tmp)
+                        fsync_path(tmp)
+                        os.replace(tmp, dst)
+                        copied += 1
+                        touched_backup_dirs.add(dst_dir)
                     except OSError:
-                        pass
+                        try:
+                            os.path.exists(tmp) and os.remove(tmp)
+                        except OSError:
+                            pass
 
     for d in touched_backup_dirs:
         fsync_dir(d)
 
     if verbose:
         print(f"fsynced {synced} live transcript(s); refreshed {copied} backup copy(ies) "
-              f"-> {BACKUP}")
+              f"across {len(TREES)} tree(s)")
 
 
 if __name__ == "__main__":

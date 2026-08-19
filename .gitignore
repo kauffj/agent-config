@@ -90,3 +90,6 @@ transcript-check.notified.json
 
 # Chrome native-messaging host wrapper — generated per-machine, pins a version path
 chrome/
+
+# Other agents' transcript mirrors (claude-transcript-sync)
+vendor-backup/
