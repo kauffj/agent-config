@@ -27,8 +27,8 @@ while IFS= read -r f; do
             fail "staging $f" "Credential-shaped path." ;;
         *.local.md|*.local.json)
             fail "staging $f" "Marked .local — deliberately machine-only." ;;
-        commands/ops.md|skills/sign/*|tools/knowledge-audit-*)
-            fail "staging $f" "Kept local on purpose (private-org tooling / personal asset). See .gitignore." ;;
+        skills/sign/*|tools/knowledge-audit-*)
+            fail "staging $f" "Kept local on purpose (personal asset / private notes). See .gitignore." ;;
     esac
 done <<< "$STAGED"
 
