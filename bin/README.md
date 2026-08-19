@@ -114,15 +114,30 @@ recovery happens after you log back in anyway).
   every interactive `claude` launch routes through it via the `claude()` function in
   `~/.bash_aliases` and lands on whichever Max account has the most headroom.
   Usage comes from the same endpoint `/usage` renders (`api/oauth/usage`), cached 60s
-  under an flock; `score = session% + max(0, weekly% − 80) × 20`, so the 5-hour window
-  decides normally and a weekly cap (incl. model-scoped, e.g. Fable) takes over near
-  its limit. Blocked accounts (an unreset limit ≥99%) are skipped; near-ties go to the
-  least-recently-launched; a per-launch bump makes burst spawns (claude-resume) alternate.
-  Tokens are never refreshed here — an idle account is judged from its last-good
-  snapshot with reset-aware decay. Any wrapper failure fails open to a plain launch.
+  under an flock.
+
+  **Balancing is against each window's next reset, not raw usage.** A percentage
+  means nothing on its own: 60% spent with twenty minutes to reset is nearly free,
+  60% spent with four hours to go is scarce, and the account about to refill is the
+  one worth burning. So every limit (5-hour, weekly, model-scoped weekly) gets a
+  *slack* — capacity left over the capacity its window hands back in the time
+  remaining. 1.0 is exactly on pace, below 1 is burning faster than it refills.
+  Score sums session and weekly pressure (1/slack) and the lowest wins, so the
+  scarcer window dominates on its own while the other still breaks ties between
+  accounts whose pace matches. Expect the busier-looking account to be chosen when
+  its windows reset sooner — that is the point, and the launch banner prints
+  time-to-reset next to each percentage so the pick is legible.
+
+  Accounts at/above 99% are skipped, and one too spent to carry a session now
+  (session ≥90%) is passed over even when an imminent reset makes it look cheap —
+  the caps and stall guard read raw percentages, only the score is time-normalized.
+  Near-ties go to the least-recently-launched; a per-launch bump makes burst spawns
+  (claude-resume) alternate. Tokens are never refreshed here — an idle account is
+  judged from its last-good snapshot, with any window whose reset has passed counted
+  as empty. Any wrapper failure fails open to a plain launch.
 
 **Every launch first probes all accounts and prints one enumeration line** before
-exec'ing claude, e.g. `claude-acct: claudepersonal s84% w54% · claude s12% w41% → claude`
+exec'ing claude, e.g. `claude-acct: claudepersonal s84%/2h11m w54%/3d16h · claude s12%/4h w41%/1d8h → claude`
 (accounts are named by the subscription they log into — the email's local part).
 
 **It stays out of the way on a bad day.** The wrapper runs on every launch, so
