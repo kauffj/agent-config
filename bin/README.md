@@ -136,6 +136,12 @@ recovery happens after you log back in anyway).
   judged from its last-good snapshot, with any window whose reset has passed counted
   as empty. Any wrapper failure fails open to a plain launch.
 
+**When every account is capped it refuses and names what else is installed** —
+`codex`, `grok`, `kimi`, `venice`, whichever are on PATH, newest-used first —
+plus how long until the soonest Claude reset and the `--acct` override to start
+Claude anyway. It never launches another vendor for you: typing `claude` should
+never hand you a different model and a different CLI's keybindings.
+
 **Every launch first probes all accounts and prints one enumeration line** before
 exec'ing claude, e.g. `claude-acct: claudepersonal s84%/2h11m w54%/3d16h · claude s12%/4h w41%/1d8h → claude`
 (accounts are named by the subscription they log into — the email's local part).

@@ -562,6 +562,65 @@ def is_maintenance(args):
 
 # ------------------------------------------------------------------- health
 
+# Other agent CLIs on this machine. Claude is not the only way to get work
+# done, and when both subscriptions are capped the useful answer is which tool
+# is still available — not a wall. Never launched automatically: `claude` means
+# Claude, and silently handing over a different model with different
+# keybindings is worse than saying so.
+VENDOR_CLIS = (("codex", "codex"), ("grok", "grok"),
+               ("kimi", "kimi"), ("venice", "venice"))
+
+
+def available_vendors():
+    """Installed non-Claude agent CLIs, newest-used first."""
+    import shutil as _shutil
+    out = []
+    for name, cmd in VENDOR_CLIS:
+        if not _shutil.which(cmd):
+            continue
+        home = Path.home() / ("." + ("kimi-code" if name == "kimi" else name))
+        try:
+            used = max((p.stat().st_mtime for p in home.rglob("*")
+                        if p.is_file()), default=0.0) if home.is_dir() else 0.0
+        except OSError:
+            used = 0.0
+        out.append({"name": name, "cmd": cmd, "last_used": used})
+    return sorted(out, key=lambda v: -v["last_used"])
+
+
+def all_blocked(statuses, now):
+    """Every usable account capped — nothing can start until one resets."""
+    healthy = [s for s in statuses if s["state"] in HEALTHY and s["assessment"]]
+    if not healthy:
+        return None
+    frees = [s["assessment"]["blocked_until"] for s in healthy]
+    if any(f is None or f <= now for f in frees):
+        return None
+    return min(frees)
+
+
+def exhausted_message(statuses, now, vendors, freed_at):
+    lines = ["claude-acct: every account is capped."]
+    for s in statuses:
+        a = s["assessment"]
+        if a and a["blocked_until"] and a["blocked_until"] > now:
+            lines.append("  %s frees up in %s"
+                         % (s.get("label") or s["name"],
+                            humanize_mins(int((a["blocked_until"] - now) // 60))))
+    if vendors:
+        lines.append("Still available on this machine:")
+        for v in vendors:
+            when = ("last used %s" % humanize_ago(v["last_used"], now)
+                    if v["last_used"] else "installed")
+            lines.append("  %-8s (%s)" % (v["cmd"], when))
+        lines.append("Start one of those, or wait %s."
+                     % humanize_mins(int((freed_at - now) // 60)))
+    else:
+        lines.append("Wait %s." % humanize_mins(int((freed_at - now) // 60)))
+    lines.append("To start Claude anyway: claude --acct <account>")
+    return "\n".join(lines)
+
+
 def remedy_plan(statuses, forced=None, interactive=True, minimum=MIN_ACCOUNTS):
     """Decide whether a session may start. Pure.
 
@@ -812,6 +871,11 @@ def cmd_launch(argv):
         if dupes:
             warn("%s share one subscription — they have the same quota pool"
                  % " and ".join(dupes))
+
+    freed_at = None if forced else all_blocked(statuses, now)
+    if freed_at:
+        raise SystemExit(exhausted_message(statuses, now, available_vendors(),
+                                           freed_at))
 
     if forced:
         acct = find_account(accounts, forced)

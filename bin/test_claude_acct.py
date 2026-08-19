@@ -178,6 +178,48 @@ class TestResetAwareBalancing(unittest.TestCase):
         self.assertLess(b["score"], a["score"])
 
 
+class TestExhausted(unittest.TestCase):
+    """When both subscriptions are capped, say so and name what else is
+    installed — never launch a different vendor behind the user's back."""
+
+    def caps(self, name, hours):
+        return {"name": name, "label": name, "state": "ok",
+                "assessment": assess(usage(session=100,
+                                           session_resets=NOW + hours * 3600))}
+
+    def test_detects_every_account_capped(self):
+        st = [self.caps("a", 2), self.caps("b", 3)]
+        self.assertAlmostEqual(L.all_blocked(st, NOW), NOW + 2 * 3600)
+
+    def test_one_usable_account_is_not_exhausted(self):
+        st = [self.caps("a", 2),
+              {"name": "b", "label": "b", "state": "ok",
+               "assessment": assess(usage(session=10))}]
+        self.assertIsNone(L.all_blocked(st, NOW))
+
+    def test_no_assessments_is_not_exhausted(self):
+        # unknown usage must not read as "capped" and block every launch
+        self.assertIsNone(L.all_blocked(
+            [{"name": "a", "label": "a", "state": "ok", "assessment": None}],
+            NOW))
+
+    def test_message_names_alternatives_and_the_wait(self):
+        st = [self.caps("alpha", 2), self.caps("beta", 3)]
+        msg = L.exhausted_message(st, NOW, [{"name": "codex", "cmd": "codex",
+                                             "last_used": NOW - 600}],
+                                  NOW + 2 * 3600)
+        self.assertIn("alpha frees up in 2h00m", msg)
+        self.assertIn("beta frees up in 3h00m", msg)
+        self.assertIn("codex", msg)
+        self.assertIn("10m ago", msg)
+        self.assertIn("--acct", msg)          # the override stays discoverable
+
+    def test_message_without_alternatives_just_gives_the_wait(self):
+        msg = L.exhausted_message([self.caps("alpha", 2)], NOW, [],
+                                  NOW + 2 * 3600)
+        self.assertIn("Wait 2h00m", msg)
+
+
 class TestBlocked(unittest.TestCase):
     def test_active_limit_at_cap_blocks_until_reset(self):
         a = assess(usage(session=100, weekly=50, session_resets=NOW + 1800))
