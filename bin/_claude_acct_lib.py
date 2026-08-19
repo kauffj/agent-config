@@ -53,16 +53,17 @@ Roster: ~/.claude/meta/accounts.json
 configDir null = the default account (~/.claude + ~/.claude.json, no env var).
 """
 
+# urllib.request (97ms), concurrent.futures (32ms) and subprocess (19ms) are
+# imported where they are used, not here: they cost more than everything else
+# this wrapper does, and a launch that hits the usage cache needs none of them.
+# That import time is paid on every single `claude`, including each tab of a
+# claude-resume burst.
 import fcntl
 import json
 import os
 import shutil
-import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -76,6 +77,8 @@ USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 
 MIN_ACCOUNTS = 2         # working accounts required before a session may start
 CACHE_TTL = 60           # seconds a fetched snapshot counts as fresh
+FAIL_TTL = 60            # seconds to stop retrying a network failure
+LOGIN_WAIT = 300         # seconds to wait for a login running in another tab
 FETCH_TIMEOUT = 3.0
 WEEKLY_SOFT_CAP = 80.0   # weekly % where the penalty starts
 WEEKLY_PENALTY = 20.0    # score points per weekly % above the soft cap
@@ -257,6 +260,9 @@ def cli_version():
 def fetch_usage(token):
     """-> (usage, error) with error None | 'auth' (credentials rejected) |
     'network' (couldn't ask — says nothing about the credentials)."""
+    import urllib.error
+    import urllib.request
+
     req = urllib.request.Request(USAGE_URL, headers={
         "Authorization": "Bearer " + token,
         "anthropic-beta": "oauth-2025-04-20",
@@ -290,12 +296,21 @@ def refresh_cache(accounts, cache, now, fetcher=fetch_usage, force=False):
                 entry.get("fetched_at", 0) > now - CACHE_TTL:
             entry.setdefault("probe", "ok")
             continue
+        if not force and entry.get("failed_at", 0) > now - FAIL_TTL:
+            # The API just refused to answer. Retrying it on every launch costs
+            # FETCH_TIMEOUT each time, and probe_all holds the cache lock while
+            # it waits — so an offline laptop would serialize a claude-resume
+            # burst behind one dead connection per tab. Score from the last
+            # good snapshot instead and try again after the cooldown.
+            entry.setdefault("probe", "offline")
+            continue
         if not token_usable(oauth, now):
             entry["probe"] = "idle"   # claude refreshes it at launch
             continue
         stale.append((acct["name"], oauth["accessToken"]))
     if not stale:
         return
+    from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=len(stale)) as pool:
         results = list(pool.map(lambda nt: (nt[0], fetcher(nt[1])), stale))
     for name, (usage, err) in results:
@@ -303,8 +318,12 @@ def refresh_cache(accounts, cache, now, fetcher=fetch_usage, force=False):
         if usage is not None:
             entry.update({"fetched_at": now, "usage": usage, "bump": 0.0,
                           "probe": "ok"})
+            entry.pop("failed_at", None)
+        elif err == "auth":
+            entry["probe"] = "auth"      # a refusal is fast; never cool it down
         else:
-            entry["probe"] = "auth" if err == "auth" else "offline"
+            entry["probe"] = "offline"
+            entry["failed_at"] = now
 
 
 # ------------------------------------------------------------------ policy
@@ -1030,6 +1049,7 @@ def reset_login(acct, why):
     """Undo a wrong login: drop the credentials and set that account's browser
     session aside so the retry starts signed out instead of re-authorizing the
     same subscription."""
+    import subprocess
     warn(why)
     env = account_env(acct, os.environ.copy())
     subprocess.call([str(REAL_CLAUDE), "auth", "logout"], env=env,
@@ -1055,6 +1075,7 @@ def account_env(acct, env):
 def login_account(acct, email=None):
     """Run `claude auth login` in this account's config dir, authorizing
     through this account's own browser session. Interactive."""
+    import subprocess
     dirpath = config_dir(acct)
     if acct["dir"] is not None and not (dirpath / ".claude.json").exists():
         cmd_setup(acct["name"], verbose=False)
@@ -1094,6 +1115,7 @@ def login_account(acct, email=None):
 def open_detached(cmd, env):
     """Hand the browser off and return — never hold the terminal for as long
     as the window is open."""
+    import subprocess
     subprocess.Popen(cmd, env=env, start_new_session=True,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
@@ -1132,20 +1154,44 @@ def cmd_browser(name=None):
 
 
 def collect_credentials(accounts, names):
-    """Log in each named account, one flow at a time machine-wide. Without the
-    lock, a claude-resume burst (ten tabs, all failing the health gate) would
-    start ten simultaneous OAuth flows."""
+    """Log in each named account, one flow at a time machine-wide.
+
+    A broken token fails the health gate for EVERY launch, so a claude-resume
+    burst arrives here all at once. The first tab runs the login; the rest wait
+    on the lock and then re-check, because by the time they get it the account
+    is usually already fixed — that turns one dead token from "the whole fleet
+    exits, re-run claude-resume by hand" into one login and a short pause."""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     lock = open(STATE_DIR / "acct-login.lock", "w")
+    deadline = time.time() + LOGIN_WAIT
+    waited = False
+    while True:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if time.time() >= deadline:
+                raise SystemExit(
+                    "claude-acct: a login has been in progress in another "
+                    "terminal for %d minutes.\n  Finish it there, then start "
+                    "this session again." % (LOGIN_WAIT // 60))
+            if not waited:
+                warn("a login is in progress in another terminal — waiting for "
+                     "it (up to %dm) rather than starting a second one"
+                     % (LOGIN_WAIT // 60))
+                waited = True
+            time.sleep(1)
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        raise SystemExit(
-            "claude-acct: a login is already in progress in another terminal.\n"
-            "  Finish it there, then start this session again.")
-    try:
+        now = time.time()
         for name in names:
-            login_account(find_account(accounts, name))
+            acct = find_account(accounts, name)
+            oauth = read_oauth(acct)
+            if oauth and oauth.get("accessToken") and refresh_alive(oauth, now):
+                if waited:
+                    warn("%s was logged in by the other terminal — continuing"
+                         % display_name(acct, accounts))
+                continue
+            login_account(acct)
     finally:
         fcntl.flock(lock, fcntl.LOCK_UN)
         lock.close()

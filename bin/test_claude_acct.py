@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -326,11 +327,66 @@ class TestCredentialState(unittest.TestCase):
                             fetcher=lambda t: (None, "network"))
             self.assertEqual(cache["a"]["probe"], "offline")
             self.assertIn("usage", cache["a"])  # snapshot survives both
-            L.refresh_cache(accts, cache, NOW,
+            # within the cooldown a launch must not pay the timeout again:
+            # the fetcher is not even called
+            calls = []
+            L.refresh_cache(accts, cache, NOW + 1,
+                            fetcher=lambda t: calls.append(t) or (None, "network"))
+            self.assertEqual(calls, [])
+            self.assertEqual(cache["a"]["probe"], "offline")
+            # ...and once it expires, a successful probe clears the mark
+            L.refresh_cache(accts, cache, NOW + L.FAIL_TTL + 1,
                             fetcher=lambda t: (usage(session=7), None))
             self.assertEqual(cache["a"]["probe"], "ok")
+            self.assertNotIn("failed_at", cache["a"])
         finally:
             L.read_oauth = real_read
+
+    def test_auth_refusal_is_retried_immediately(self):
+        # A 401 answers fast and means "log in again" — cooling it down would
+        # delay the health gate noticing that the account is broken.
+        accts = [{"name": "a", "dir": None, "email": None}]
+        cache = {}
+        creds = {"accessToken": "t", "expiresAt": (NOW + 600) * 1000}
+        real_read = L.read_oauth
+        L.read_oauth = lambda acct: creds
+        try:
+            calls = []
+            for _ in range(2):
+                L.refresh_cache(accts, cache, NOW,
+                                fetcher=lambda t: calls.append(t) or (None, "auth"))
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(cache["a"]["probe"], "auth")
+        finally:
+            L.read_oauth = real_read
+
+
+class TestLoginCollection(unittest.TestCase):
+    """One dead token fails the gate for every launch at once, so a
+    claude-resume burst all arrives here together."""
+
+    ACCTS = [{"name": "alt", "dir": Path("/tmp/cfg-alt"), "email": None}]
+
+    def _run(self, oauth):
+        calls = []
+        real = (L.login_account, L.read_oauth, L.STATE_DIR)
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                L.STATE_DIR = Path(tmp)
+                L.login_account = lambda a, email=None: calls.append(a["name"])
+                L.read_oauth = lambda a: oauth
+                L.collect_credentials(self.ACCTS, ["alt"])
+            finally:
+                (L.login_account, L.read_oauth, L.STATE_DIR) = real
+        return calls
+
+    def test_skips_an_account_another_terminal_already_fixed(self):
+        healthy = {"accessToken": "t",
+                   "refreshTokenExpiresAt": (time.time() + 8640) * 1000}
+        self.assertEqual(self._run(healthy), [])
+
+    def test_still_logs_in_an_account_that_is_actually_broken(self):
+        self.assertEqual(self._run(None), ["alt"])
 
 
 class TestEnumeration(unittest.TestCase):

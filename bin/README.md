@@ -116,6 +116,30 @@ recovery happens after you log back in anyway).
 exec'ing claude, e.g. `claude-acct: claudepersonal s84% w54% · claude s12% w41% → claude`
 (accounts are named by the subscription they log into — the email's local part).
 
+**It stays out of the way on a bad day.** The wrapper runs on every launch, so
+its failure modes matter more than its features:
+
+- *Cost when nothing is wrong*: ~30ms of imports plus a cached probe.
+  `urllib.request` alone costs 97ms to import, so it — and `concurrent.futures`
+  and `subprocess` — are imported at their call sites instead of module level.
+  A launch that hits the 60s usage cache needs none of them.
+- *Offline*: the first launch pays one `FETCH_TIMEOUT` (3s) and then the failure
+  is cached for `FAIL_TTL` (60s). Without that, every launch pays it again —
+  and since the probe holds the cache lock while it waits, a claude-resume burst
+  would serialize one dead connection per tab. Accounts still launch from their
+  last-good snapshot; an unreachable API never reads as broken credentials.
+- *A dead token*: it fails the health gate for every launch at once, so the
+  whole fleet arrives at the login path together. The first tab runs
+  `claude auth login`; the rest wait on a machine-wide lock (up to
+  `LOGIN_WAIT`) and re-check when they get it — by then the account is usually
+  already fixed, so they continue instead of each starting their own flow.
+- *Wrapper missing*: the `claude()` function in `~/.bash_aliases` checks for
+  `bin/claude-acct` on every call, not once at shell startup, and falls through
+  to `command claude` when it isn't there. A shell that outlives the file (a
+  branch checkout, a moved repo) keeps working.
+- *Anything else*: any unexpected exception is caught and turned into a plain
+  `claude` launch. The wrapper is never the reason a session can't start.
+
 **Two working accounts are required.** With fewer — or with any configured account
 whose credentials are broken — no session starts: the wrapper runs
 `claude auth login` in the offending account's config dir (one flow at a time,
