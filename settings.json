@@ -68,9 +68,9 @@
       "mcp__claude_ai_Google_Calendar",
       "mcp__claude_ai_Google_Drive"
     ],
-    "defaultMode": "dontAsk"
+    "defaultMode": "auto"
   },
-  "model": "fable",
+  "model": "opus",
   "disableClaudeAiConnectors": true,
   "hooks": {
     "SessionStart": [
@@ -195,5 +195,13 @@
   "skipDangerousModePermissionPrompt": true,
   "skipWorkflowUsageWarning": true,
   "theme": "dark",
-  "agentPushNotifEnabled": true
+  "agentPushNotifEnabled": true,
+  "autoMode": {
+    "soft_deny": [
+      "$defaults",
+      "Bash(git push production:*)",
+      "Bash(*sync-prod.sh*)",
+      "Bash(psql * -f .workspaces/plans/*prod*.sql*)"
+    ]
+  }
 }
