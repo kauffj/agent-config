@@ -251,6 +251,8 @@ def live_sessions():
         for sid in _attribute_fresh(cwd, pids, set(sessions)):
             sessions.setdefault(sid, {"sessionId": sid, "cwd": cwd, "pid": None,
                                       "status": None, "source": "heuristic"})
+    for info in sessions.values():
+        info.setdefault("vendor", "claude")
     return sessions
 
 
@@ -382,3 +384,112 @@ def clear_recovery():
                    os.path.join(dest_dir, "sessions-recovery.consumed.json"))
     except OSError:
         pass
+
+
+# --------------------------------------------------------------- other vendors
+#
+# The fleet is not Claude-only: Codex, Grok and friends run in the same tabs,
+# compete for the same attention, and vanish from the picker the same way a
+# Claude session does. They just publish nothing like ~/.claude/sessions, so
+# each vendor needs a small adapter that returns the SAME record shape —
+# {sessionId, cwd, pid, status, source, vendor, transcript} — and the views
+# stay vendor-agnostic.
+#
+# Kept out of live_sessions() on purpose: claude-snapshot and claude-resume
+# treat everything it returns as resumable with `claude --resume`, which is
+# wrong for another vendor's id. Views that want the whole fleet call
+# other_vendor_sessions() and merge.
+
+CODEX_SESSIONS_DIR = os.path.join(HOME, ".codex", "sessions")
+
+
+def _pids():
+    for name in os.listdir("/proc"):
+        if name.isdigit():
+            yield int(name)
+
+
+def _codex_rollouts(limit=60):
+    """Codex transcripts, newest first. Laid out as sessions/YYYY/MM/DD/
+    rollout-<iso>-<uuid>.jsonl, so the directory walk is already chronological
+    and only the newest day or two is ever read."""
+    paths = []
+    for root, dirs, files in os.walk(CODEX_SESSIONS_DIR):
+        dirs.sort(reverse=True)
+        for f in files:
+            if f.startswith("rollout-") and f.endswith(".jsonl"):
+                paths.append(os.path.join(root, f))
+    paths.sort(reverse=True)          # ISO timestamp in the name sorts as time
+    return paths[:limit]
+
+
+def _codex_meta(path):
+    """First line of a rollout is a session_meta event carrying id and cwd."""
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            ev = json.loads(f.readline())
+    except (OSError, ValueError):
+        return None
+    if ev.get("type") != "session_meta":
+        return None
+    payload = ev.get("payload") or {}
+    sid = payload.get("id") or payload.get("session_id")
+    if not sid:
+        return None
+    return {"sessionId": sid, "cwd": payload.get("cwd") or "",
+            "transcript": path}
+
+
+def codex_sessions():
+    """Live Codex sessions, matched to their rollout transcript by cwd.
+
+    Codex keeps no pid registry, so liveness comes from /proc and identity from
+    the newest rollout whose session_meta names the same cwd — the same
+    attribution trick _attribute_fresh() uses for an unregistered claude."""
+    procs = {}
+    for pid in _pids():
+        argv = _proc_argv(pid)
+        if not argv:
+            continue
+        exe = argv[0]
+        # the TUI is `node .../bin/codex ...` or the vendored binary; its
+        # code-mode-host child shares the cwd and must not double-count
+        if not (os.path.basename(exe) == "codex"
+                or (len(argv) > 1 and os.path.basename(argv[1]) == "codex")):
+            continue
+        if any("code-mode-host" in a for a in argv):
+            continue
+        cwd = _proc_cwd(pid)
+        if not cwd:
+            continue
+        procs.setdefault(cwd, pid)     # one session per cwd, earliest pid wins
+
+    if not procs:
+        return {}
+    metas = [m for m in (_codex_meta(p) for p in _codex_rollouts()) if m]
+    out, claimed = {}, set()
+    for cwd, pid in procs.items():
+        for m in metas:
+            if m["cwd"] == cwd and m["sessionId"] not in claimed:
+                claimed.add(m["sessionId"])
+                out[m["sessionId"]] = {
+                    "sessionId": m["sessionId"], "cwd": cwd, "pid": pid,
+                    "status": None, "source": "proc", "vendor": "codex",
+                    "transcript": m["transcript"],
+                }
+                break
+    return out
+
+
+VENDOR_ADAPTERS = {"codex": codex_sessions}
+
+
+def other_vendor_sessions():
+    """Every live non-Claude session, same record shape as live_sessions()."""
+    out = {}
+    for name, adapter in VENDOR_ADAPTERS.items():
+        try:
+            out.update(adapter())
+        except Exception:
+            continue          # one broken vendor must never blank the picker
+    return out

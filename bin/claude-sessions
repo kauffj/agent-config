@@ -20,7 +20,8 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from _claude_sessions_lib import live_sessions, CLAUDE_DIR, _project_dir  # noqa: E402
+from _claude_sessions_lib import (live_sessions, other_vendor_sessions,  # noqa: E402
+                                  proc_pane_id, CLAUDE_DIR, _project_dir)
 
 STATE_DIR = os.path.join(CLAUDE_DIR, "state")
 META_DIR = os.path.join(CLAUDE_DIR, "meta")
@@ -80,6 +81,40 @@ def _founding_input(ev):
     if t == "queue-operation" and ev.get("operation") == "enqueue":
         return _plain(ev.get("content")) or None
     return None
+
+
+# Codex replays AGENTS.md into the transcript as the opening "user" turn, so
+# the first message is boilerplate identical across every session.
+_CODEX_INJECTED = ("# AGENTS.md", "<INSTRUCTIONS>", "<environment_context>",
+                   "<user_instructions>")
+
+
+def _codex_topic(path, limit=44):
+    """First real user turn of a Codex rollout. Codex writes no title event, so
+    the opening prompt is the only thing that says what the session is about —
+    once the injected instruction preamble is skipped."""
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                if '"user"' not in line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                payload = ev.get("payload") or {}
+                if payload.get("role") != "user":
+                    continue
+                content = payload.get("content")
+                if isinstance(content, list):
+                    content = " ".join(b.get("text", "") for b in content
+                                       if isinstance(b, dict))
+                txt = _plain(content if isinstance(content, str) else "")
+                if txt and not txt.lstrip().startswith(_CODEX_INJECTED):
+                    return _clip(txt, limit)
+    except OSError:
+        pass
+    return ""
 
 
 def _topic(sid, cwd, limit=44):
@@ -177,11 +212,18 @@ def _urgency(status, age, priority):
 
 
 def records():
-    live = live_sessions()
+    # The fleet is every agent competing for attention in these tabs, not just
+    # the Claude ones: a Codex session you cannot see in the picker is a
+    # session you forget you left running.
+    live = dict(live_sessions())
+    live.update(other_vendor_sessions())
     now = time.time()
     out, maxwait = [], 0
     for sid, info in live.items():
         cwd = info.get("cwd") or ""
+        vendor = info.get("vendor") or "claude"
+        # Only Claude writes state files (its SessionStart/Stop hooks); another
+        # vendor's liveness is all we get, so it reads as plain "working".
         st = _load(os.path.join(STATE_DIR, "%s.json" % sid))
         meta = _load(os.path.join(META_DIR, "%s.json" % sid))
         status = st.get("status") or "working"
@@ -197,7 +239,9 @@ def records():
             "project": os.path.basename(cwd) if cwd else "",
             "branch": branch,
             "label": meta.get("label") or _label(sid, cwd, branch),
-            "topic": _topic(sid, cwd),
+            "vendor": vendor,
+            "topic": (_topic(sid, cwd) if vendor == "claude"
+                      else _codex_topic(info.get("transcript") or "")),
             "pid": info.get("pid"),
             "source": info.get("source"),
             "status": status,
@@ -207,7 +251,10 @@ def records():
             "glyph": None,   # filled below, once the relative ceiling is known
             "group": meta.get("group"),
             "priority": priority,
-            "wezterm_pane": st.get("wezterm_pane"),
+            # no hook to record the pane, so read it off the live process
+            "wezterm_pane": (st.get("wezterm_pane")
+                             or (proc_pane_id(info["pid"]) if info.get("pid")
+                                 and vendor != "claude" else None)),
             "urgency": _urgency(status, age, priority),
         })
     ceiling = max(7200, maxwait)   # 2h floor, else the longest current wait
@@ -224,9 +271,12 @@ def _print_table(recs, grouped=False):
 
     def row(r):
         grp = " [%s]" % r["group"] if r.get("group") else ""
-        return "%s  %-30s %-8s %4s  %s%s" % (
+        # vendor is silent for Claude and named for everything else, so the
+        # common case stays uncluttered and a foreign session is unmistakable
+        vend = "" if r.get("vendor", "claude") == "claude" else " <%s>" % r["vendor"]
+        return "%s  %-30s %-8s %4s  %s%s%s" % (
             r["glyph"], r["label"][:30], r["status"], r["age_str"],
-            r["project"], grp)
+            r["project"], vend, grp)
 
     if grouped:
         seen = {}
