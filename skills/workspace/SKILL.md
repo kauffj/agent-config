@@ -1,8 +1,7 @@
 ---
 name: workspace
-description: Manage parallel work items — worktree, port, env copy, install, state tracking. Generic over features, bugs, refactors, spikes.
+description: Manage isolated parallel work items — each a git worktree + dev-server port + copied env + isolated DB + state record. Use when starting work that should live off the main checkout (a feature, bug fix, refactor, or spike on its own branch), when resuming or listing in-flight work items, or when finishing/abandoning/removing one and tearing down its resources. Also the primitive layer other skills (/feature, /propose, /review-pr) call instead of reimplementing worktree, port, or DB setup. Subcommands — new, list, get, resume, done, abandon, remove.
 argument-hint: "new <description> [--kind feature|bug|refactor|spike] | list [--kind <kind>] | resume <name> | abandon <name> | remove <name> | done <name> | get <name>"
-disable-model-invocation: true
 ---
 
 # /workspace — parallel work items
@@ -13,6 +12,9 @@ Owns the lifecycle of isolated working environments. Each workspace = git worktr
 - `.workspaces/workspaces.json` — `{ workspaces: [...] }`
 - `.workspaces/project.json` — cached project profile (see `lib/project.mjs`)
 - `.workspaces/plans/<slug>.md` — saved plans from `/propose`
+- `.workspaces/worktrees/<name>/` — the worktrees themselves
+
+Worktrees live INSIDE the repo (not as `../<repo>-<name>` siblings — those bloated `~/projects`). The whole `.workspaces/` dir is kept out of git via `.git/info/exclude`, not `.gitignore`: an exclude entry needs no commit, and on self-deploying projects a `.gitignore` commit pushed to main would deploy. The dot-prefixed path also keeps `tsc`/lint wildcard globs in the main checkout from descending into nested worktrees.
 
 On first run after upgrading, the helpers auto-relocate any legacy state from `.claude/` to `.workspaces/`. Old `.claude/features.json` (legacy format) is also transformed.
 
@@ -25,7 +27,7 @@ On first run after upgrading, the helpers auto-relocate any legacy state from `.
   "kind": "feature",
   "description": "...",
   "branch": "feature/member-event-rsvp",
-  "worktreePath": "/abs/path",
+  "worktreePath": "/abs/path/to/repo/.workspaces/worktrees/member-event-rsvp",
   "port": 3001,
   "envFile": ".env.local",
   "screenshotDir": "/tmp/...",
@@ -85,12 +87,15 @@ Parse `--kind` (default `feature`), `--name` (default: derive from description),
    - `refactor` → `refactor/$NAME`
    - `spike` → `spike/$NAME`
 
-4. **Fetch and create worktree:**
+4. **Fetch and create worktree** (run from the main checkout's root). Ensure `.workspaces/` is excluded first — via `.git/info/exclude`, never a `.gitignore` commit (see the note at the top):
    ```bash
    git fetch origin $DEFAULT_BRANCH
-   git worktree add ../$REPO_NAME-$NAME -b $BRANCH origin/${FROM:-$DEFAULT_BRANCH}
+   EXCLUDE="$(git rev-parse --git-common-dir)/info/exclude"
+   mkdir -p "$(dirname "$EXCLUDE")" .workspaces/worktrees
+   grep -qxF '.workspaces/' "$EXCLUDE" 2>/dev/null || echo '.workspaces/' >> "$EXCLUDE"
+   git worktree add .workspaces/worktrees/$NAME -b $BRANCH origin/${FROM:-$DEFAULT_BRANCH}
    ```
-   `$WORKTREE_PATH` = absolute path of the new worktree.
+   `$WORKTREE_PATH` = absolute path of the new worktree (`$(pwd)/.workspaces/worktrees/$NAME`).
 
 5. **Allocate port** starting at 3000:
    ```bash

@@ -1,8 +1,7 @@
 ---
 name: feature
-description: Build a user-facing feature end-to-end via propose → implement → review → manual-review → ship. Thin orchestrator over /workspace, /propose, and /review-pr.
+description: Build and ship a user-facing feature end-to-end — workspace → plan → implement → automated review → screenshots → manual review → commit/push → PR-or-merge. Use when asked to build, add, or implement a feature substantial enough to want a branch and a review pass (not a one-line tweak), or to list, resume, complete, abandon, or remove an in-flight feature. Thin orchestrator over /workspace, /propose, and /review-pr; stops for user approval at the plan, the manual review, and the deploy decision.
 argument-hint: "<description> | list | resume <name> | complete <name> | abandon <name> | remove <name>"
-disable-model-invocation: true
 ---
 
 # /feature — feature pipeline
