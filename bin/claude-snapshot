@@ -17,7 +17,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from _claude_sessions_lib import (  # noqa: E402
-    CLAUDE_DIR, RECOVERY_SNAP, boot_epoch, live_sessions, proc_pane_id,
+    CLAUDE_DIR, RECOVERY_SNAP, boot_epoch, live_sessions, other_vendor_sessions,
+    proc_pane_id,
 )
 
 OUT = os.path.join(CLAUDE_DIR, "sessions-snapshot.json")
@@ -140,9 +141,50 @@ def _attach_tab_positions(sessions):
             s["tab"] = pos
 
 
+# A Codex session appends to its rollout while it works and goes quiet when it
+# wants you. Nothing writes a state file for it — only Claude has hooks — so the
+# tab bar and the attend key (CTRL+SHIFT+A) had to guess from the pane title and
+# got it wrong. Publish the same {status, since} record the hooks write, derived
+# from how long the transcript has been silent.
+VENDOR_IDLE_AFTER = 15          # seconds of silence that count as "waiting"
+
+
+def _publish_vendor_state(sessions, now):
+    """Give non-Claude sessions the state file every view already reads."""
+    for sid, info in sessions.items():
+        path = os.path.join(CLAUDE_DIR, "state", "%s.json" % sid)
+        transcript = info.get("transcript")
+        try:
+            quiet = now - os.path.getmtime(transcript) if transcript else 0
+        except OSError:
+            quiet = 0
+        waiting = quiet >= VENDOR_IDLE_AFTER
+        status = "waiting" if waiting else "working"
+        # `since` is when this status began, so the fleet's wait gradient ages
+        # a quiet Codex tab exactly like a waiting Claude one.
+        since = int(now - quiet) if waiting else int(now)
+        prev = _read(path) or {}
+        if prev.get("status") == status and prev.get("since"):
+            since = prev["since"]          # don't restart an ongoing wait
+        pane = proc_pane_id(info["pid"]) if info.get("pid") else None
+        rec = {"session_id": sid, "status": status, "since": since,
+               "updated": int(now), "cwd": info.get("cwd") or "",
+               "vendor": info.get("vendor") or "other"}
+        if pane:
+            rec["wezterm_pane"] = pane
+        try:
+            _atomic_write(path, rec)
+        except OSError:
+            continue
+
+
 def main():
     live = live_sessions()
-    _reap_dead_state(set(live), _restorable_ids())
+    others = other_vendor_sessions()
+    _publish_vendor_state(others, time.time())
+    # Their ids join the live set so the reap does not delete the state files
+    # published a moment ago, and does remove them once the session is gone.
+    _reap_dead_state(set(live) | set(others), _restorable_ids())
     _reopen_due()
 
     sessions = sorted(
