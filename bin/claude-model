@@ -11,6 +11,9 @@ Both accounts share one transcript store — ~/.claude-alt/projects is a symlink
   claude-model                    what this session runs on, and each account's caps
   claude-model fable              reopen THIS session on an account that has fable
   claude-model fable --dry-run    print the spawn command, change nothing
+  claude-model --continue         hit the 5-hour cap? reopen THIS session wherever
+                                  it can run now, same model (armed automatically
+                                  by hooks/limit-handoff.sh)
 
 The new tab waits for the current session's process to exit before resuming it.
 Two live processes appending to one transcript is the data-loss shape this repo
@@ -116,16 +119,27 @@ def main():
         print(__doc__.strip())
         return
     dry = "--dry-run" in argv
-    rest = [a for a in argv if not a.startswith("-")]
+    # A session cap is the same problem as a model cap — this conversation is
+    # stuck on an account that cannot run it — so it takes the same handoff,
+    # scoped to whatever model the session already uses.
+    cont = "--continue" in argv
+    override_sid = None
+    if "--session" in argv:
+        i = argv.index("--session")
+        if i + 1 < len(argv):
+            override_sid = argv[i + 1]
+    rest = [a for a in argv
+            if not a.startswith("-") and a != override_sid]
     accounts = L.ensure_roster(L.load_accounts())
     now = time.time()
 
-    if not rest:
+    if not rest and not cont:
         return cmd_show(accounts, now)
-    model = rest[0]
+    model = rest[0] if rest else L.launch_model([])
 
     session = session_from_pane() or {}
-    sid = session.get("session_id") or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    sid = (override_sid or session.get("session_id")
+           or os.environ.get("CLAUDE_CODE_SESSION_ID"))
     if not sid:
         sys.exit("claude-model: no session here — run it inside a Claude session.")
     cwd = session.get("cwd") or os.getcwd()
@@ -139,6 +153,16 @@ def main():
               and (s["assessment"]["blocked_until"] is None
                    or s["assessment"]["blocked_until"] <= now)]
     if not usable:
+        if cont:
+            soonest = min((s["assessment"]["blocked_until"] for s in statuses
+                           if s["assessment"] and s["assessment"]["blocked_until"]),
+                          default=None)
+            print("Every account is capped%s — nothing to hand off to. Press "
+                  "Enter in this session once it resets."
+                  % (", soonest frees in %s"
+                     % L.humanize_mins(int((soonest - now) // 60))
+                     if soonest and soonest > now else ""))
+            sys.exit(1)
         print("No account can run %s right now:" % model)
         for a in accounts:
             print("  " + cap_line(a, accounts, model, now))
@@ -147,6 +171,10 @@ def main():
     winner = L.pick([(s["name"], s["assessment"]) for s in usable],
                     L.last_launches(), now)
     here = current_account(accounts)
+    if here and winner == here["name"] and cont:
+        print("%s can still run — nothing to move."
+              % L.display_name(here, accounts))
+        return
     if here and winner == here["name"]:
         print("%s (this session's account) already has room for %s — just use "
               "/model %s, no handoff needed."
@@ -154,16 +182,26 @@ def main():
         return
 
     target = L.find_account(accounts, winner)
+    # No --model on a session-cap handoff: the conversation keeps whatever it
+    # was already running. And no --acct either — the picker routes at exit
+    # time, which can be hours later, by which point the account that ran out
+    # may be the one with the most headroom again.
+    resume = ("claude --resume %s" % sid if cont
+              else "claude --model %s --resume %s" % (model, sid))
     inner = ("unset CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ID; "
              "echo 'claude-model: waiting for the current session (pid %d) to exit "
              "— run /exit in its tab'; "
              "while kill -0 %d 2>/dev/null; do sleep 0.5; done; "
-             "claude --model %s --resume %s; exec bash" % (pid, pid, model, sid))
+             "%s; exec bash" % (pid, pid, resume))
     cmd = ["wezterm", "cli", "spawn", "--cwd", cwd, "--", "bash", "-lic", inner]
 
-    print("session %s  →  %s  on %s (%s)"
-          % (sid[:8], model, L.display_name(target, accounts),
-             cap_line(target, accounts, model, now).split(None, 1)[-1]))
+    if cont:
+        print("session %s  →  %s (capped here, room there)"
+              % (sid[:8], L.display_name(target, accounts)))
+    else:
+        print("session %s  →  %s  on %s (%s)"
+              % (sid[:8], model, L.display_name(target, accounts),
+                 cap_line(target, accounts, model, now).split(None, 1)[-1]))
     if dry:
         print(" ".join(cmd))
         return

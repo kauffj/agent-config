@@ -136,6 +136,18 @@ recovery happens after you log back in anyway).
   judged from its last-good snapshot, with any window whose reset has passed counted
   as empty. Any wrapper failure fails open to a plain launch.
 
+**Hitting the 5-hour cap mid-session hands the conversation over instead of
+ending it.** Both accounts share one transcript store, so the conversation can
+move: `hooks/limit-handoff.sh` catches the `limit_reached` notification and runs
+`claude-model --continue`, which spawns a tab that waits for the capped session's
+process to exit and then resumes the same session id. You `/exit` and the work
+continues on the account with headroom, full context intact. Closing the tab
+cancels it; nothing happens while the old session is still running (two
+processes appending to one transcript is the data-loss shape this repo already
+fights). The resume passes neither `--model` nor `--acct` on purpose — the exit
+can come hours later, and by then the account that ran out may be the roomiest
+again. `claude-model <model>` is the same handoff for a model-scoped weekly cap.
+
 **When every account is capped it refuses and names what else is installed** —
 `codex`, `grok`, `kimi`, `venice`, whichever are on PATH, newest-used first —
 plus how long until the soonest Claude reset and the `--acct` override to start
