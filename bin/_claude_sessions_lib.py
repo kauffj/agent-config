@@ -9,6 +9,7 @@ session id from the process argv (--resume / --session-id / -r).
 import glob
 import json
 import os
+import re
 import time
 from datetime import datetime
 
@@ -44,6 +45,24 @@ def _proc_cwd(pid):
         return os.readlink(f"/proc/{pid}/cwd")
     except OSError:
         return None
+
+
+def proc_pane_id(pid):
+    """The WezTerm pane a process is running in, from its environment, or None.
+
+    Read from /proc rather than a session's state file because that file records
+    the pane from whenever the session last wrote it — after a restore it can name
+    a pane id that no longer exists. The environment is set at exec time and can't
+    go stale.
+    """
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as f:
+            for entry in f.read().split(b"\0"):
+                if entry.startswith(b"WEZTERM_PANE="):
+                    return entry.split(b"=", 1)[1].decode("utf-8", "replace")
+    except (OSError, TypeError, ValueError):
+        pass
+    return None
 
 
 def _looks_like_session_id(s):
@@ -106,8 +125,13 @@ def _scan_proc(known_ids, known_pids):
 
 
 def _project_dir(cwd):
-    # Claude encodes a cwd into a transcript dir by replacing "/" with "-".
-    return os.path.join(PROJECTS_DIR, cwd.replace("/", "-"))
+    # Claude encodes a cwd into a transcript dir by replacing every
+    # non-alphanumeric character with "-", not just "/". Dots count:
+    # ~/projects/example.com -> -home-you-projects-example-com. Replacing
+    # only "/" left every dotted cwd pointing at a directory that never exists,
+    # so transcript_exists() said False and resume_set() silently dropped those
+    # sessions from a restore (2026-08-02: 2 of 18 lost; see test_project_dir).
+    return os.path.join(PROJECTS_DIR, re.sub(r"[^a-zA-Z0-9]", "-", cwd))
 
 
 _CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
@@ -312,7 +336,13 @@ def resume_set(snap_path=SNAPSHOT, recovery_max_age_h=12):
     file is the durable high-water record the snapshot timer is forbidden to
     clobber). Deduped by id, snapshot first; excludes sessions that are already
     live or whose transcript no longer exists on disk (so a rolled-back id never
-    spawns a dead 'No conversation found' tab). Returns [{sessionId, cwd}]."""
+    spawns a dead 'No conversation found' tab).
+
+    Ordered to rebuild the tab bar as it was: sessions carrying a recorded `tab`
+    position come first in visual order (window, then tab index), since callers
+    spawn tabs left to right. Anything without one — no pid when the snapshot was
+    taken, a session outside WezTerm, a pre-feature recovery file — sorts by cwd
+    after them. Returns [{sessionId, cwd, tab?}]."""
     live = set(live_sessions())
     sources = [_snap_meta(snap_path).get("sessions", [])]
     rec = _snap_meta(RECOVERY_SNAP)
@@ -329,7 +359,14 @@ def resume_set(snap_path=SNAPSHOT, recovery_max_age_h=12):
             if not (os.path.isdir(cwd) and transcript_exists(sid, cwd)):
                 continue
             seen.add(sid)
-            out.append({"sessionId": sid, "cwd": cwd})
+            entry = {"sessionId": sid, "cwd": cwd}
+            tab = s.get("tab")
+            if (isinstance(tab, list) and len(tab) == 2
+                    and all(isinstance(v, int) for v in tab)):
+                entry["tab"] = tab
+            out.append(entry)
+    out.sort(key=lambda s: (0, s["tab"][0], s["tab"][1], "")
+             if s.get("tab") else (1, 0, 0, s["cwd"] + s["sessionId"]))
     return out
 
 

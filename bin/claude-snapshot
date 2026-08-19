@@ -17,10 +17,11 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from _claude_sessions_lib import (  # noqa: E402
-    CLAUDE_DIR, RECOVERY_SNAP, boot_epoch, live_sessions,
+    CLAUDE_DIR, RECOVERY_SNAP, boot_epoch, live_sessions, proc_pane_id,
 )
 
 OUT = os.path.join(CLAUDE_DIR, "sessions-snapshot.json")
+TAB_ORDER = os.path.expanduser("~/.cache/wezterm-fleet-tab-order.json")
 PREV = os.path.join(CLAUDE_DIR, "sessions-snapshot.prev.json")
 BOOT_GRACE = 15 * 60  # seconds after boot during which the snapshot may not shrink
 CLIFF_MIN_PREV = 3    # only a "cliff" if we previously tracked at least this many
@@ -120,6 +121,25 @@ def _reopen_due():
             pass
 
 
+def _attach_tab_positions(sessions):
+    """Record each session's on-screen tab position as `tab`: [window, index].
+
+    wezterm.lua publishes {pane_id: [window_id, tab_index]} every tick — the visual
+    order, including any tabs the user dragged. Joining it here by pid->pane is what
+    lets `claude-resume` respawn the fleet in the arrangement it had, instead of
+    alphabetically. Sessions with no position (no pid, or not under WezTerm) simply
+    go without; resume_set() falls back to sorting those by cwd.
+    """
+    order = _read(TAB_ORDER) or {}
+    if not order:
+        return
+    for s in sessions:
+        pane = proc_pane_id(s.get("pid")) if s.get("pid") else None
+        pos = order.get(pane) if pane else None
+        if isinstance(pos, list) and len(pos) == 2:
+            s["tab"] = pos
+
+
 def main():
     live = live_sessions()
     _reap_dead_state(set(live), _restorable_ids())
@@ -129,6 +149,7 @@ def main():
         live.values(),
         key=lambda s: (s.get("cwd") or "", s["sessionId"]),
     )
+    _attach_tab_positions(sessions)
     data = {"capturedAt": int(time.time()), "sessions": sessions}
 
     existing = _read(OUT) or {}

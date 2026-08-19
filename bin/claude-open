@@ -1,35 +1,98 @@
 #!/usr/bin/env bash
-# Open a URL from a Claude session so the resulting window traces back to it.
+# Open a URL in the browser that belongs to this session's Claude account.
 #
-# Correlation is belt-and-suspenders, because an already-running browser
-# re-parents a new window onto its existing process (losing any env tag):
-#   1. Isolated launch — a session-specific --class (and, for Chromium, a private
-#      --user-data-dir) so the window carries WM_CLASS=claude-<sid> AND the new
-#      process is its own tree that keeps CLAUDE_CODE_SESSION_ID in its environ.
-#   2. Launch-time log — append "<epoch> <sid> <class> <url>" to
-#      ~/.claude/spawned-windows.log: the one record that survives re-parenting,
-#      because the launching shell knows the session id even when the window won't.
+# claude-acct binds each account to its own browser profile: the default account
+# uses the system browser, every other account gets ~/.claude-browsers/<name>
+# (signed into that account's claude.ai, carrying its Claude-in-Chrome
+# extension). A URL opened from a session has to land in ITS account's browser —
+# otherwise a link from an alt-account session opens signed in as the other
+# account, which is exactly the confusion the dual-account setup exists to avoid.
 #
-# Pair with `claude-window` to focus the window later. Usage: claude-open <url>
+# Two ways to say which session is opening:
+#   env    — CLAUDE_ACCT_BROWSER_PROFILE / CLAUDE_CODE_SESSION_ID, set in every
+#            session by claude-acct. This is the in-session path.
+#   --pane — resolve the session from ~/.claude/state/<sid>.json by WezTerm pane
+#            id. This is the clicked-link path (wezterm.lua's open-uri handler
+#            knows the pane, not the environment). A pane that isn't a Claude
+#            session falls through to xdg-open — what WezTerm would have done.
+#
+# Correlation (for `claude-window`) is best-effort: --class=claude-<sid> tags the
+# window, and "<epoch> <sid> <class> <url>" is appended to
+# ~/.claude/spawned-windows.log. When the account's browser is already running it
+# re-parents the new window onto that process, so the class is the parent's and
+# only the log survives. That is the deliberate trade: this used to launch a
+# throwaway --user-data-dir per session, which correlated perfectly and was
+# signed into nothing. A signed-in browser is worth more than a tidy WM_CLASS.
+#
+# Usage: claude-open [--pane N] [--dry-run] <url>
 set -u
-LOG="$HOME/.claude/spawned-windows.log"
-sid="${CLAUDE_CODE_SESSION_ID:-unknown}"
-url="${1:-}"
-[[ -z "$url" ]] && { echo "usage: claude-open <url>"; exit 2; }
+CLAUDE_DIR="$HOME/.claude"
+LOG="$CLAUDE_DIR/spawned-windows.log"
+SHIM="$CLAUDE_DIR/bin/claude-acct-browser"
+STATE_DIR="$CLAUDE_DIR/state"
+
+usage() { echo "usage: claude-open [--pane N] [--dry-run] <url>"; }
+
+pane="" dry=0 url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --pane)     pane="${2:-}"; shift 2 || true ;;
+    --pane=*)   pane="${1#*=}"; shift ;;
+    --dry-run)  dry=1; shift ;;
+    -h|--help)  usage; exit 0 ;;
+    --)         shift; url="${1:-}"; break ;;
+    -*)         usage >&2; exit 2 ;;
+    *)          url="$1"; shift ;;
+  esac
+done
+[ -n "$url" ] || { usage >&2; exit 2; }
+
+# --- which session, and therefore which browser profile ----------------------
+if [ -n "$pane" ]; then
+  # Newest matching session wins: a pane is reused across sessions (resume,
+  # `exec bash`), and only the most recent write describes who is there now.
+  read -r sid profile <<<"$(jq -rs --arg p "$pane" '
+      [ .[] | select(type == "object" and .wezterm_pane == $p) ]
+      | sort_by(.updated // 0) | last
+      | if . == null then "" else
+          "\(.session_id // "unknown") \(.browser_profile // "")" end' \
+      "$STATE_DIR"/*.json 2>/dev/null)"
+  if [ -z "${sid:-}" ]; then          # not a Claude pane — behave like WezTerm
+    [ "$dry" = 1 ] && { echo "xdg-open $url"; exit 0; }
+    setsid -f xdg-open "$url" >/dev/null 2>&1 || true
+    exit 0
+  fi
+else
+  sid="${CLAUDE_CODE_SESSION_ID:-unknown}"
+  profile="${CLAUDE_ACCT_BROWSER_PROFILE:-}"
+fi
 cls="claude-$sid"
 
-if command -v google-chrome >/dev/null 2>&1; then chrome=google-chrome
-elif command -v chromium       >/dev/null 2>&1; then chrome=chromium
-elif command -v chromium-browser >/dev/null 2>&1; then chrome=chromium-browser
-else chrome=""; fi
-
-if [[ -n "$chrome" ]]; then
-  setsid -f "$chrome" --class="$cls" --user-data-dir="/tmp/claude-browser-$sid" "$url" >/dev/null 2>&1 || true
+# --- how to launch it --------------------------------------------------------
+# The shim owns everything profile-specific (--user-data-dir, re-exporting
+# CLAUDE_CONFIG_DIR so a native-messaging host binds to the right account), so a
+# non-default account routes through it rather than duplicating that knowledge.
+if [ -n "$profile" ] && [ -x "$SHIM" ]; then
+  set -- env "CLAUDE_ACCT_BROWSER_PROFILE=$profile" "$SHIM" --class="$cls" "$url"
+elif command -v brave-browser >/dev/null 2>&1; then
+  set -- brave-browser --class="$cls" "$url"
+elif command -v google-chrome >/dev/null 2>&1; then
+  set -- google-chrome --class="$cls" "$url"
+elif command -v chromium >/dev/null 2>&1; then
+  set -- chromium --class="$cls" "$url"
+elif command -v chromium-browser >/dev/null 2>&1; then
+  set -- chromium-browser --class="$cls" "$url"
 elif command -v firefox >/dev/null 2>&1; then
-  setsid -f firefox --class="$cls" "$url" >/dev/null 2>&1 || true
+  set -- firefox --class="$cls" "$url"
 else
-  setsid -f xdg-open "$url" >/dev/null 2>&1 || true   # untraceable, but still logged
+  set -- xdg-open "$url"              # untraceable, but still logged
 fi
 
+if [ "$dry" = 1 ]; then
+  printf '%s\n' "$*"
+  exit 0
+fi
+
+setsid -f "$@" >/dev/null 2>&1 || true
 printf '%s %s %s %s\n' "$(printf '%(%s)T' -1)" "$sid" "$cls" "$url" >> "$LOG" 2>/dev/null || true
 echo "opened ($cls) → $url"

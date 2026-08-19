@@ -74,7 +74,11 @@ def main():
         r = subprocess.run(
             ["wezterm", "cli", "spawn", "--cwd", cwd, "--",
              "bash", "-lic",
-             "unset CLAUDE_CODE_CHILD_SESSION; claude --resume %s; exec bash" % sid],
+             # CLAUDE_CODE_SESSION_ID too: it is exported into this process, and a
+             # tab that inherits it hands the spawning session's id to anything
+             # reading the environment (claude-open, /proc-based tooling).
+             "unset CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ID; "
+             "claude --resume %s; exec bash" % sid],
             capture_output=True, text=True)
         ok = r.returncode == 0
         spawned += ok

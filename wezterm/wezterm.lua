@@ -65,6 +65,7 @@ end
 -- active pane id matched against each state file's wezterm_pane.
 -- ---------------------------------------------------------------------------
 local pane_state = {}
+local bar_cols_by_window = {}
 
 -- Wait ages run on an AWAKE clock that freezes during suspend/downtime, so
 -- resuming the machine preserves each tab's color instead of inflating every wait
@@ -82,6 +83,7 @@ local pane_state = {}
 local WAIT_FLOOR_S  = 7200           -- 2h floor for the gradient ceiling
 local AWAKE_GAP_CAP = 120            -- inter-tick gap over this = suspend; not counted
 local WAIT_CACHE    = HOME .. '/.cache/wezterm-fleet-wait.json'
+local TAB_ORDER_CACHE = HOME .. '/.cache/wezterm-fleet-tab-order.json'
 local SAVE_EVERY    = 15             -- persist the awake clock at most this often (s)
 local awake = 0
 local awake_last = nil
@@ -250,11 +252,40 @@ local function save_wait_cache()
   if f then f:write(body); f:close() end
 end
 
+-- Publish { [pane_id] = {window_id, tab_index} } for claude-snapshot, which joins it
+-- to sessions by pid so claude-resume can respawn tabs in their remembered order.
+-- Full overwrite (never merged) so a closed tab leaves no stale slot; skipped unless
+-- the encoding actually changed, keeping the ~1/sec tick free of pointless writes.
+local last_tab_order = nil
+local function save_tab_order(order)
+  if not next(order) then return end   -- a failed mux walk must not erase the file
+  local ok, body = pcall(wezterm.json_encode, order)
+  if not ok or body == last_tab_order then return end
+  local f = io.open(TAB_ORDER_CACHE, 'w')
+  if f then f:write(body); f:close(); last_tab_order = body end
+end
+
+-- update-status is also scheduled by pane-title changes, not just its ~1/sec timer.
+-- A title animation can therefore invoke it many times per second and across every
+-- GUI window. Keep the cheap window-width observation responsive, but run the
+-- module-global mux/state scan at most once per wall-clock second.
+local last_status_refresh = nil
 wezterm.on('update-status', function(window, pane)
-  refresh_acronyms()   -- cheap unless ~/projects changed
+  local ok, dim = pcall(function() return pane:get_dimensions() end)
+  if ok and dim and dim.cols and dim.cols > 0 then
+    local window_id = tostring(window:window_id())
+    local cur = bar_cols_by_window[window_id] or 0
+    if math.abs(dim.cols - cur) > 1 then
+      bar_cols_by_window[window_id] = dim.cols
+    end
+  end
 
   -- Advance the awake clock, freezing any gap big enough to be a suspend.
   local now = os.time()
+  if now == last_status_refresh then return end
+  last_status_refresh = now
+  refresh_acronyms()   -- cheap unless ~/projects changed
+
   local delta = awake_last and (now - awake_last) or 0
   if delta < 0 or delta > AWAKE_GAP_CAP then delta = 0 end
   awake = awake + delta
@@ -264,16 +295,25 @@ wezterm.on('update-status', function(window, pane)
   -- across all windows). The gradient ceiling is computed only over these, so
   -- lingering orphan state files from dead sessions can't blow out the scale.
   -- If the mux walk fails, `live` stays empty and we fall back to counting all.
-  local live = {}
+  -- The same walk records each pane's VISUAL position: ipairs order over w:tabs()
+  -- is the on-screen order (it's what a drag-reorder changes), and it's only
+  -- observable here — `wezterm cli list` returns panes unordered.
+  local live, order = {}, {}
   pcall(function()
     for _, w in ipairs(wezterm.mux.all_windows()) do
-      for _, t in ipairs(w:tabs()) do
+      local wid = w:window_id()
+      for i, t in ipairs(w:tabs()) do
         local ap = t:active_pane()
-        if ap then live[tostring(ap:pane_id())] = true end
+        if ap then
+          local pid = tostring(ap:pane_id())
+          live[pid] = true
+          order[pid] = { wid, i - 1 }
+        end
       end
     end
   end)
   local restrict = next(live) ~= nil
+  save_tab_order(order)
 
   -- Rebuild pane_state (keyed by pane id, for render lookup), computing each
   -- waiting session's downtime-free age and the longest OPEN wait (the ceiling).
@@ -349,35 +389,13 @@ wezterm.on('update-status', function(window, pane)
     save_wait_cache()
   end
 
-  -- Cache the tab-bar width (in cells) so format-tab-title can pad tabs to fill
-  -- it. The bar width isn't passed to that event, and WezTerm's retro bar won't
-  -- stretch tabs on its own (wezterm/wezterm#7702), so we size them ourselves.
-  -- pane:get_dimensions().cols == window text width for unsplit tabs (ours).
-  --
-  -- Two guards keep this from wobbling and jittering every tab:
-  --   * only the FOCUSED window sets it, so a second/background window (with a
-  --     different width) can't clobber the shared value frame to frame;
-  --   * HYSTERESIS — ignore changes of a single column, which is exactly the
-  --     scrollbar column blinking in/out as scrollback grows while you type. Only
-  --     a real resize (>1 col) updates it. This is the true fix for the jitter;
-  --     the proportional sizing just limited the blast radius when it slipped.
-  local focused = true
-  pcall(function() focused = window:is_focused() end)
-  local ok, dim = pcall(function() return pane:get_dimensions() end)
-  if focused and ok and dim and dim.cols and dim.cols > 0 then
-    local cur = wezterm.GLOBAL.bar_cols or 0
-    if math.abs(dim.cols - cur) > 1 then
-      wezterm.GLOBAL.bar_cols = dim.cols
-    end
-  end
-
   -- Hidden "until idle" watcher. A parked pane still writes its state file, so the
   -- `fresh` scan above already holds its live status: ping once when it flips to
   -- waiting, and GC any hidden record whose pane has since closed (dropped from the
   -- `live` set). The single-threaded event loop makes this read-mutate-write atomic
   -- across windows, so exactly ONE window's tick fires the toast even though every
   -- window runs this — which is what we want, since it must also fire while WezTerm
-  -- is unfocused (not gated on `focused`). Fully pcall-guarded: a hiccup here must
+  -- is unfocused. Fully pcall-guarded: a hiccup here must
   -- never wedge the tab bar.
   pcall(function()
     local hid = wezterm.GLOBAL.hidden
@@ -589,6 +607,15 @@ local function fkey_display(fk)
   return fk
 end
 
+-- With Claude's animated terminal title disabled, its startup title is just its
+-- version number. That is not a useful active-tab label; fall back to the stable
+-- project/folder name from pane_state instead. Preserve version-only titles from
+-- ordinary shells and applications, which have no Claude state entry.
+local function useful_pane_title(title, state)
+  if not title or title == '' or (state and title:match('^%d+%.%d+%.%d+$')) then return nil end
+  return title
+end
+
 -- Cost of collapsing k tabs: one ›N marker cell plus a sliver for each of the rest.
 local function collapse_cost(k)
   if k <= 0 then return 0 end
@@ -610,7 +637,7 @@ local function compute_tab_layout(tabs, bar, safe, cap)
       local am, atag, ag = tab_essential(t)
       local ap = t.active_pane
       local ast = ap and pane_state[tostring(ap.pane_id)] or nil
-      local raw = (ap and ap.title ~= '' and ap.title) or fkey_display(ast and ast.fkey) or ('tab ' .. (t.tab_index + 1))
+      local raw = useful_pane_title(ap and ap.title, ast) or fkey_display(ast and ast.fkey) or ('tab ' .. (t.tab_index + 1))
       local alabel = smart_label(raw, nil)   -- drops a project==branch duplicate, etc.
       active_reserve = math.min(ACTIVE_MAX_RESERVE, math.max(am, dispw(' ' .. atag .. ' ' .. ag .. ' ' .. alabel .. ' ')))
       active_idx = t.tab_index
@@ -656,6 +683,52 @@ local function compute_tab_layout(tabs, bar, safe, cap)
   return widths, first_collapsed, collapsed
 end
 
+-- WezTerm calls format-tab-title synchronously in tab order, twice per tab-bar
+-- rebuild (measure, then render). Recomputing the whole-row layout in every
+-- callback made that O(tab_count²). Tab zero starts each pass, so compute once
+-- there and let the remaining callbacks do stable tab-id lookups. Rebuilding at
+-- the start of both passes deliberately avoids fragile phase/invalidation state:
+-- resize, activation, reorder, add/close, title, and pane-state changes are fresh.
+local tab_layout_by_window = {}
+
+local function build_tab_layout(tab, tabs, conf)
+  local window_id = tostring(tab.window_id)
+  local n = math.max(1, #tabs)
+  local barcols = bar_cols_by_window[window_id] or (n * 16)
+  local bar = barcols - TAB_BAR_RESERVE
+  local safe = math.floor(barcols * EQUALIZE_FRAC)
+  local cap = conf.tab_max_width or 64
+  local widths, first_collapsed, collapsed = compute_tab_layout(tabs, bar, safe, cap)
+  local by_tab_id = {}
+
+  for _, current in ipairs(tabs) do
+    by_tab_id[tostring(current.tab_id)] = {
+      target = widths[current.tab_index] or false,
+      marker = current.tab_index == first_collapsed,
+      collapsed = collapsed,
+    }
+  end
+
+  local row = { by_tab_id = by_tab_id }
+  tab_layout_by_window[window_id] = row
+  return row
+end
+
+-- A clicked link opens in the browser of the account THIS pane's session runs on.
+-- Without this, every link goes through xdg-open to the default Brave profile — right
+-- for a default-account session, wrong for every other one (it opens claude.ai signed
+-- in as the other account). claude-open does the pane -> session -> profile lookup and
+-- falls back to xdg-open for a pane that is not a Claude session, so a click in a plain
+-- shell behaves exactly as it did before.
+wezterm.on('open-uri', function(_, pane, uri)
+  if not uri:match('^https?://') then return true end   -- mailto:, file:, ... unchanged
+  wezterm.background_child_process({
+    wezterm.home_dir .. '/.claude/bin/claude-open',
+    '--pane', tostring(pane:pane_id()), uri,
+  })
+  return false
+end)
+
 wezterm.on('format-tab-title', function(tab, tabs, panes, conf, hover, max_width)
   local idx = tab.tab_index + 1
   local pt = tab.active_pane and tab.active_pane.title or ''
@@ -671,24 +744,28 @@ wezterm.on('format-tab-title', function(tab, tabs, panes, conf, hover, max_width
   -- no Claude session (plain shell) keeps the sequential idx.
   local _, tag, glyph = tab_essential(tab)
 
-  -- Overflow layout (shared by every tab in the row): active gets its full label,
-  -- others get their essential left→right, the rest collapse off the right.
-  local n = math.max(1, #tabs)
-  local barcols = wezterm.GLOBAL.bar_cols or (n * 16)
-  local bar = barcols - TAB_BAR_RESERVE                 -- hard overflow limit
-  local safe = math.floor(barcols * EQUALIZE_FRAC)      -- colored anti-equalize limit
-  local cap = conf.tab_max_width or 64
-  local widths, first_collapsed, collapsed = compute_tab_layout(tabs, bar, safe, cap)
-  local target = widths[tab.tab_index]
+  -- Overflow layout is computed once for the row and served by stable tab id.
+  local window_id = tostring(tab.window_id)
+  local row = tab_layout_by_window[window_id]
+  if tab.tab_index == 0 or not row then
+    row = build_tab_layout(tab, tabs, conf)
+  end
+  local entry = row.by_tab_id[tostring(tab.tab_id)]
+  if not entry then
+    -- Defensive recovery if WezTerm ever presents an unexpected callback order.
+    row = build_tab_layout(tab, tabs, conf)
+    entry = row.by_tab_id[tostring(tab.tab_id)]
+  end
+  local target = entry.target
 
   -- Collapsed tab: the boundary one carries the ›N marker; the rest render as an
   -- empty sliver. All remain reachable via the picker (Ctrl+Shift+Space).
   if not target then
-    if tab.tab_index == first_collapsed then
+    if entry.marker then
       return {
         { Background = { Color = COLLAPSE_BG } },
         { Foreground = { Color = COLLAPSE_FG } },
-        { Text = '›' .. collapsed },
+        { Text = '›' .. entry.collapsed },
       }
     end
     return { { Background = { Color = COLLAPSE_BG } }, { Foreground = { Color = COLLAPSE_FG } }, { Text = '·' } }
@@ -698,7 +775,7 @@ wezterm.on('format-tab-title', function(tab, tabs, panes, conf, hover, max_width
   -- tab is exactly its essential code+icon.
   local text
   if tab.is_active then
-    local raw = (pt ~= '' and pt) or fkey_display(st and st.fkey) or ('tab ' .. idx)
+    local raw = useful_pane_title(pt, st) or fkey_display(st and st.fkey) or ('tab ' .. idx)
     text = fit(string.format(' %s %s %s ', tag, glyph, smart_label(raw, nil)), target)
   else
     text = fit(' ' .. tag .. ' ' .. glyph .. ' ', target)
@@ -1215,6 +1292,26 @@ config.keys = {
         args = { HOME .. '/.claude/bin/claude-transcript',
                  '--pane', tostring(pane:pane_id()), '--hold' },
       }, pane)
+    end) },
+  -- Attend: jump to the left-most tab that is NOT working — a waiting '●' or idle
+  -- '·' tab (same status_glyph the tab bar renders). If already on it, advance to
+  -- the next one, so repeated presses skip past tabs you've decided to leave.
+  { key = 'a',     mods = 'CTRL|SHIFT', action = wezterm.action_callback(function(win, pane)
+      local active_id = win:active_tab() and win:active_tab():tab_id() or nil
+      local idle, on_first = {}, false
+      for i, t in ipairs(win:mux_window():tabs()) do
+        local ap = t:active_pane()
+        local st = ap and pane_state[tostring(ap:pane_id())] or nil
+        if status_glyph(st, ap and ap:get_title() or '') ~= '✳' then
+          idle[#idle + 1] = i - 1
+          if #idle == 1 and t:tab_id() == active_id then on_first = true end
+        end
+      end
+      if #idle == 0 then
+        win:toast_notification('WezTerm', 'all tabs are working', nil, 2000)
+        return
+      end
+      win:perform_action(act.ActivateTab(on_first and idle[2] or idle[1]), pane)
     end) },
   -- Reorder the active tab. Left/Right shift it one slot; Home/End send it to the ends.
   { key = 'LeftArrow',  mods = 'CTRL|SHIFT', action = act.MoveTabRelative(-1) },

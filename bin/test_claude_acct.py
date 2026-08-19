@@ -53,12 +53,12 @@ def assess(u, model="fable", now=NOW, bump=0.0, fetched=NOW):
 
 
 class TestScoring(unittest.TestCase):
-    def test_hourly_decides_when_weeklies_are_cool(self):
-        # Audit example: session 10/weekly 60 must BEAT session 40/weekly 30 —
-        # a mid-range weekly must not override the session signal.
+    def test_weekly_behind_pace_outweighs_a_lower_session(self):
+        # 60% of the week spent with six of seven days left is far behind pace;
+        # a lower 5-hour number does not redeem it.
         a = assess(usage(session=10, weekly=60))
         b = assess(usage(session=40, weekly=30))
-        self.assertLess(a["score"], b["score"])
+        self.assertGreater(a["score"], b["score"])
 
     def test_hot_weekly_overrules_any_session_gap(self):
         # The user ask: shift off an account whose weekly approaches cap,
@@ -67,9 +67,15 @@ class TestScoring(unittest.TestCase):
         busy = assess(usage(session=70, weekly=30))
         self.assertGreater(hot["score"], busy["score"])
 
-    def test_penalty_starts_at_soft_cap(self):
-        self.assertEqual(L.score(20, L.WEEKLY_SOFT_CAP), 20)
-        self.assertGreater(L.score(20, L.WEEKLY_SOFT_CAP + 1), 20)
+    def test_slack_is_one_exactly_on_pace(self):
+        # Half the window spent with half of it left = exactly on pace.
+        half = {"kind": "session", "percent": 50.0,
+                "resets_at": NOW + L.SESSION_WINDOW_H * 3600 / 2}
+        self.assertAlmostEqual(L.limit_slack(half, NOW), 1.0)
+        ahead = dict(half, percent=10.0)
+        self.assertGreater(L.limit_slack(ahead, NOW), 1.0)
+        behind = dict(half, percent=90.0)
+        self.assertLess(L.limit_slack(behind, NOW), 1.0)
 
     def test_scoped_weekly_counts_for_matching_model(self):
         # Live shape: weekly_all 45 but Fable-scoped 83 — the scoped cap is
@@ -115,13 +121,61 @@ class TestResetDecay(unittest.TestCase):
         a = L.assess(entry(u), "fable", NOW)
         self.assertEqual((a["session"], a["weekly"]), (30.0, 88.0))
 
-    def test_empty_usage_scores_zero(self):
+    def test_empty_usage_is_neutral_pace(self):
         a = L.assess(entry({"limits": []}), "fable", NOW)
-        self.assertEqual(a["score"], 0)
+        self.assertEqual(a["pace"], 1.0)
 
     def test_no_usage_is_none(self):
         self.assertIsNone(L.assess({}, "fable", NOW))
         self.assertIsNone(L.assess(None, "fable", NOW))
+
+
+class TestResetAwareBalancing(unittest.TestCase):
+    """Usage is judged against the next reset, not in the abstract: capacity
+    that is about to refill is cheap, capacity that has to last is dear."""
+
+    def test_imminent_reset_beats_lower_usage(self):
+        # 60% spent but reset in 30m vs 40% spent that must last 4.5h: burn the
+        # one about to refill. Pure-usage scoring got this backwards.
+        soon = assess(usage(session=60, session_resets=NOW + 1800))
+        later = assess(usage(session=40, session_resets=NOW + 4.5 * 3600))
+        self.assertLess(soon["score"], later["score"])
+        self.assertEqual(L.pick([("soon", soon), ("later", later)], {}, NOW),
+                         "soon")
+
+    def test_same_usage_prefers_the_sooner_reset(self):
+        near = assess(usage(session=50, session_resets=NOW + 3600))
+        far = assess(usage(session=50, session_resets=NOW + 4 * 3600))
+        self.assertLess(near["score"], far["score"])
+
+    def test_session_decides_when_weekly_pace_is_identical(self):
+        # Why score sums both windows instead of taking only the worst: with
+        # matching weeklies, the 5-hour window must still break the tie.
+        spent = assess(usage(session=80, weekly=50))
+        fresh = assess(usage(session=10, weekly=50))
+        self.assertLess(fresh["score"], spent["score"])
+
+    def test_stall_guard_skips_an_account_too_spent_to_run(self):
+        # 95% with a reset minutes away scores cheaply, but a session started
+        # there stalls immediately — take the account that can carry the work.
+        nearly = assess(usage(session=95, session_resets=NOW + 360))
+        steady = assess(usage(session=40, session_resets=NOW + 4 * 3600))
+        self.assertTrue(nearly["stall"])
+        self.assertLess(nearly["score"], steady["score"])   # cheaper on pace
+        self.assertEqual(L.pick([("nearly", nearly), ("steady", steady)],
+                                {}, NOW), "steady")
+
+    def test_stall_guard_yields_when_nothing_else_is_available(self):
+        nearly = assess(usage(session=95, session_resets=NOW + 360))
+        self.assertEqual(L.pick([("nearly", nearly)], {}, NOW), "nearly")
+
+    def test_unknown_reset_falls_back_to_plain_usage(self):
+        def no_reset(pct):
+            return {"limits": [{"kind": "session", "percent": pct,
+                                "resets_at": None, "scope": None}]}
+        a = L.assess(entry(no_reset(70)), "fable", NOW)
+        b = L.assess(entry(no_reset(20)), "fable", NOW)
+        self.assertLess(b["score"], a["score"])
 
 
 class TestBlocked(unittest.TestCase):
@@ -394,8 +448,9 @@ class TestEnumeration(unittest.TestCase):
         st = [status("main", "ok", usage(session=79, weekly=100)),
               status("alt", "ok", usage(session=12, weekly=41))]
         line = L.enumeration_line(st, NOW, winner="alt")
-        self.assertIn("main s79% w100%", line)
-        self.assertIn("alt s12% w41%", line)
+        # percentages carry their time-to-reset: that is what decides the pick
+        self.assertIn("main s79%/1h00m w100%/6d0h", line)
+        self.assertIn("alt s12%/1h00m w41%/6d0h", line)
         self.assertIn("→ alt", line)
         self.assertIn("blocked", line)   # weekly at 100%
         self.assertEqual(len(line.splitlines()), 1)  # brief: one line

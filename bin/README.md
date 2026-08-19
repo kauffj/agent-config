@@ -45,9 +45,18 @@ shrink the window system-wide.)
   guard. The resume commands union it into their set, so a session that vanished
   from the live snapshot is still reopened. It's archived to `backups/` once a
   restore brings everything back, and ignored after 12 h so it can't go stale.
+- **Tab-order memory:** the fleet tab bar (`wezterm/wezterm.lua`) publishes each
+  pane's on-screen position to `~/.cache/wezterm-fleet-tab-order.json` every tick —
+  the only place visual order is observable, since `wezterm cli list` returns panes
+  unordered. `claude-snapshot` joins it to sessions by pid (`WEZTERM_PANE` from
+  `/proc/<pid>/environ`, not the state file, which can name a dead pane) and stores
+  it as `tab: [window, index]`. `resume_set()` sorts on it, so a restore rebuilds
+  the bar as you arranged it — dragged tabs included. Sessions without a position
+  sort by cwd after the rest.
 - **`claude-resume`** — the on-demand restore command. Takes the resume set
   (snapshot ∪ recovery, minus sessions already live or whose transcript is gone)
-  and spawns a `claude --resume <id>` tab per session via `wezterm cli spawn`.
+  and spawns a `claude --resume <id>` tab per session via `wezterm cli spawn`, in
+  remembered tab order.
   Run it from inside WezTerm. `--snapshot PATH` restores from a specific snapshot
   (e.g. the `.prev` backup); `--from-transcripts [N]` ignores the snapshot and
   reconstructs the N most-recently-active sessions from transcript files — the
@@ -200,6 +209,33 @@ a mid-session `/model` switch can hit a wall the session would otherwise not see
 coming. It reads the cached snapshot only; a hook must never block a launch on
 the network.
 
+- **`claude-model`** — the way out of that wall. An account's model caps are fixed
+  for the life of a session, but both accounts share one transcript store, so the
+  *conversation* can move: `claude-model fable` picks the account with Fable
+  headroom and spawns a tab that resumes this same session id there. The new tab
+  **waits on the old session's pid** before starting claude — two live processes
+  appending to one transcript is the failure this repo exists to prevent — so the
+  handoff is: run it, `/exit` the old tab, the new one takes over by itself. It
+  forces no account: `--model` is what makes `launch_model()` scope the caps, and
+  the picker routes on its own. Bare `claude-model` prints this session's account
+  and every model-scoped cap; `--dry-run` prints the spawn command.
+
+**Links open in the account's own browser.** A URL from an `alt` session opening
+in the default profile means claude.ai signed in as the *other* account, so both
+ways of opening one route by session:
+
+- **`claude-open <url>`** — resolves the profile from `CLAUDE_ACCT_BROWSER_PROFILE`
+  and hands off to `claude-acct-browser`; the default account gets plain
+  `brave-browser`. It used to launch a throwaway `--user-data-dir` per session,
+  which correlated windows perfectly and was signed into nothing — a signed-in
+  browser is worth more, so correlation (`--class=claude-<sid>` +
+  `spawned-windows.log`) is now best-effort: once the account browser is running,
+  new windows re-parent onto it.
+- **a clicked link** — WezTerm's `open-uri` handler calls `claude-open --pane <id>`,
+  which reads the profile out of `state/<sid>.json` (the session-state hook records
+  `browser_profile` next to `wezterm_pane`). A pane that isn't a Claude session, or
+  a non-`http(s)` URI, falls through to `xdg-open` exactly as before.
+
 To give a second account a browser: `claude --acct-browser alt` opens its
 profile (with the extension page and claude.ai when the extension is missing);
 install the extension there and sign into claude.ai as that account.
@@ -213,6 +249,8 @@ claude --acct-status         # credentials, session/weekly/score, every
                              # model-scoped cap, and Claude-in-Chrome readiness
 claude --acct-login [name]   # collect credentials (all unhealthy, or just one)
 claude --acct-browser [name] # open that account's own browser session
+claude-model fable           # move THIS conversation to the account that has fable
+claude-open <url>            # open a URL in this session's account browser
 claude-acct --acct-setup bob # scaffold another account dir (~/.claude-bob)
 command claude               # bypass the wrapper entirely
 ```

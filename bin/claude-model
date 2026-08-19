@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""Move this conversation to the account that still has room for a model.
+
+A session's account is fixed for its whole life, and so are that account's model
+caps: `/model fable` inside a session whose account has burned its Fable week
+fails, and the only escape used to be starting a *new* conversation with
+`claude --model fable` (which the picker routes to the account with headroom).
+Both accounts share one transcript store — ~/.claude-alt/projects is a symlink to
+~/.claude/projects — so the conversation itself can move instead.
+
+  claude-model                    what this session runs on, and each account's caps
+  claude-model fable              reopen THIS session on an account that has fable
+  claude-model fable --dry-run    print the spawn command, change nothing
+
+The new tab waits for the current session's process to exit before resuming it.
+Two live processes appending to one transcript is the data-loss shape this repo
+already fights (bin/README.md, "Durability"), so the handoff is: run this, /exit
+the old tab, the new one starts by itself. No account is forced — `--model` makes
+launch_model() scope the caps, and the picker routes on its own.
+"""
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import _claude_acct_lib as L  # noqa: E402
+
+STATE_DIR = L.CLAUDE_DIR / "state"
+
+
+def session_from_pane():
+    """This pane's session, per the state file the session-state hook writes.
+    Authoritative (the hook is handed the session id) and immune to the stale
+    CLAUDE_CODE_SESSION_ID a spawning session can leave in the environment."""
+    pane = os.environ.get("WEZTERM_PANE")
+    if not pane:
+        return None
+    best = None
+    try:
+        entries = list(STATE_DIR.glob("*.json"))
+    except OSError:
+        return None
+    for path in entries:
+        try:
+            rec = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(rec, dict) or rec.get("wezterm_pane") != pane:
+            continue
+        if best is None or (rec.get("updated") or 0) > (best.get("updated") or 0):
+            best = rec
+    return best
+
+
+def claude_ancestor():
+    """The pid of the claude process this script is running under. Walked from
+    /proc rather than read from $CLAUDE_PID so a nested shell can't lie."""
+    pid = os.getpid()
+    for _ in range(12):
+        try:
+            with open("/proc/%d/stat" % pid) as f:
+                fields = f.read().rsplit(") ", 1)
+            comm = fields[0].split("(", 1)[1]
+            ppid = int(fields[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            return None
+        if comm == "claude":
+            return pid
+        if ppid <= 1:
+            return None
+        pid = ppid
+    return None
+
+
+def current_account(accounts):
+    cfg = os.path.realpath(os.environ.get("CLAUDE_CONFIG_DIR") or str(L.CLAUDE_DIR))
+    for a in accounts:
+        if os.path.realpath(str(L.config_dir(a))) == cfg:
+            return a
+    return None
+
+
+def cap_line(acct, accounts, model, now):
+    """One account's standing on `model`, in a line a human can act on."""
+    caps = [c for c in L.scoped_caps(L.cached_usage(acct["name"]), now)
+            if L.model_matches(c["model"], model)] if model else \
+        L.scoped_caps(L.cached_usage(acct["name"]), now)
+    if not caps:
+        return "%-26s no model-scoped cap" % L.display_name(acct, accounts)
+    parts = []
+    for c in caps:
+        when = ""
+        if c["resets_at"] and c["resets_at"] > now:
+            when = ", resets in %s" % L.humanize_mins(int((c["resets_at"] - now) // 60))
+        parts.append("%s %.0f%%%s" % (c["model"], c["percent"], when))
+    return "%-26s %s" % (L.display_name(acct, accounts), "; ".join(parts))
+
+
+def cmd_show(accounts, now):
+    here = current_account(accounts)
+    print("this session: %s, default model %s"
+          % (L.display_name(here, accounts) if here else "(unknown account)",
+             L.launch_model([]) or "(unset)"))
+    print("\nModel-scoped weekly caps (cached):")
+    for a in accounts:
+        print("  " + cap_line(a, accounts, None, now))
+    print("\nMove this conversation to the account that has one:  claude-model <model>")
+
+
+def main():
+    argv = sys.argv[1:]
+    if "-h" in argv or "--help" in argv:
+        print(__doc__.strip())
+        return
+    dry = "--dry-run" in argv
+    rest = [a for a in argv if not a.startswith("-")]
+    accounts = L.ensure_roster(L.load_accounts())
+    now = time.time()
+
+    if not rest:
+        return cmd_show(accounts, now)
+    model = rest[0]
+
+    session = session_from_pane() or {}
+    sid = session.get("session_id") or os.environ.get("CLAUDE_CODE_SESSION_ID")
+    if not sid:
+        sys.exit("claude-model: no session here — run it inside a Claude session.")
+    cwd = session.get("cwd") or os.getcwd()
+    pid = claude_ancestor() or int(os.environ.get("CLAUDE_PID") or 0)
+    if not pid:
+        sys.exit("claude-model: can't find this session's claude process.")
+
+    statuses = L.probe_all(accounts, model, now)
+    usable = [s for s in statuses
+              if s["state"] in L.HEALTHY and s["assessment"]
+              and (s["assessment"]["blocked_until"] is None
+                   or s["assessment"]["blocked_until"] <= now)]
+    if not usable:
+        print("No account can run %s right now:" % model)
+        for a in accounts:
+            print("  " + cap_line(a, accounts, model, now))
+        sys.exit(1)
+
+    winner = L.pick([(s["name"], s["assessment"]) for s in usable],
+                    L.last_launches(), now)
+    here = current_account(accounts)
+    if here and winner == here["name"]:
+        print("%s (this session's account) already has room for %s — just use "
+              "/model %s, no handoff needed."
+              % (L.display_name(here, accounts), model, model))
+        return
+
+    target = L.find_account(accounts, winner)
+    inner = ("unset CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ID; "
+             "echo 'claude-model: waiting for the current session (pid %d) to exit "
+             "— run /exit in its tab'; "
+             "while kill -0 %d 2>/dev/null; do sleep 0.5; done; "
+             "claude --model %s --resume %s; exec bash" % (pid, pid, model, sid))
+    cmd = ["wezterm", "cli", "spawn", "--cwd", cwd, "--", "bash", "-lic", inner]
+
+    print("session %s  →  %s  on %s (%s)"
+          % (sid[:8], model, L.display_name(target, accounts),
+             cap_line(target, accounts, model, now).split(None, 1)[-1]))
+    if dry:
+        print(" ".join(cmd))
+        return
+    if not shutil.which("wezterm"):
+        sys.exit("wezterm not on PATH — run this from inside WezTerm")
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        sys.exit("spawn failed: %s" % r.stderr.strip())
+    print("New tab is waiting. Run /exit here and it picks the conversation up.")
+
+
+if __name__ == "__main__":
+    main()

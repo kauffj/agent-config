@@ -50,8 +50,9 @@ for cap in maxed[:1]:
             if other["model"] == cap["model"] and other["percent"] < 90:
                 roomy.append("%s is at %.0f%%"
                              % (L.display_name(a, accounts), other["percent"]))
-    alt = (" %s — start a %s session with 'claude --model %s' and the picker "
-           "routes there." % (" and ".join(roomy), cap["model"], cap["model"].lower())
+    alt = (" %s — move THIS conversation there with 'claude-model %s': it resumes "
+           "this session on that account as soon as you /exit here."
+           % (" and ".join(roomy), cap["model"].lower())
            ) if roomy else (" No other account has %s headroom either."
                             % cap["model"])
     print("Model limit: this account's %s weekly cap is used up (%.0f%%%s), so "

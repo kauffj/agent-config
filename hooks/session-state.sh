@@ -4,7 +4,11 @@
 # Fired on every lifecycle event, it does four things in order and ALWAYS exits 0,
 # so a bug here can never wedge a session:
 #   1. Derives status (working|waiting) from the hook event.
-#   2. Writes ~/.claude/state/<session_id>.json {status, since, wezterm_pane, cwd}.
+#   2. Writes ~/.claude/state/<session_id>.json
+#      {status, since, wezterm_pane, cwd, browser_profile}. browser_profile is
+#      the account binding claude-acct put in the environment — it is what lets
+#      claude-open route a clicked link (which knows only a pane) into the
+#      browser of the account this session runs on. Empty = the default account.
 #      `since` only moves on a real status *transition*, so "waiting 14m" stays
 #      truthful across repeated same-status events.
 #   3. Emits the OSC-0 tab title + idle marker via the terminalSequence field
@@ -87,7 +91,9 @@ tmp="$state_file.$$"
 if jq -nc --arg sid "$session_id" --arg st "$status" \
        --argjson since "$since" --argjson updated "$now" \
        --arg pane "${WEZTERM_PANE:-}" --arg cwd "$cwd" \
-     '{session_id:$sid, status:$st, since:$since, updated:$updated, cwd:$cwd}
+       --arg profile "${CLAUDE_ACCT_BROWSER_PROFILE:-}" \
+     '{session_id:$sid, status:$st, since:$since, updated:$updated, cwd:$cwd,
+       browser_profile:$profile}
       + (if $pane != "" then {wezterm_pane:$pane} else {} end)' >"$tmp" 2>/dev/null; then
   mv -f "$tmp" "$state_file" 2>/dev/null
 fi

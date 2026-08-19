@@ -8,13 +8,18 @@ broken, the wrapper does NOT launch a session — it collects the missing
 credentials (`claude auth login` inside that account's config dir) and, if that
 can't be done here, exits with the exact command to run.
 
-Policy ("hourly by default, weekly if approaching cap"):
-    score = session% + max(0, weekly% - 80) * 20        (lowest score wins)
-Session (5-hour) utilization decides normally; once an account's weekly cap —
-including a model-scoped weekly like Fable's — passes 80%, the penalty ramps
-hard enough to overrule any session difference. Accounts with an active limit
-at/above 99% that hasn't reset are skipped. Near-ties go to the account
-launched least recently.
+Policy: balance against each window's next reset, not against raw usage. A
+percentage only means something relative to when it refills — 60% spent with
+twenty minutes to reset is nearly free, 60% spent with four hours to go is
+scarce, and the account about to refill is the one worth burning. So every
+limit (5-hour, weekly, model-scoped weekly) gets a slack: capacity left over
+the capacity its window would hand back in the time remaining. 1.0 is exactly
+on pace, below 1 is burning faster than it refills. Score sums session and
+weekly pressure (1/slack), lowest wins — the scarcer window dominates on its
+own, while the other still breaks ties between accounts whose pace matches.
+Accounts at/above 99% are skipped, and one too spent to carry a session now is
+passed over even when an imminent reset makes it look cheap. Near-ties go to
+the account launched least recently.
 
 Usage comes from the endpoint /usage itself renders
 (api.anthropic.com/api/oauth/usage), cached under an flock so a burst of
@@ -80,11 +85,15 @@ CACHE_TTL = 60           # seconds a fetched snapshot counts as fresh
 FAIL_TTL = 60            # seconds to stop retrying a network failure
 LOGIN_WAIT = 300         # seconds to wait for a login running in another tab
 FETCH_TIMEOUT = 3.0
-WEEKLY_SOFT_CAP = 80.0   # weekly % where the penalty starts
-WEEKLY_PENALTY = 20.0    # score points per weekly % above the soft cap
 BLOCKED_AT = 99.0        # an active limit at/above this = account unusable
-HERD_BUMP = 3.0          # score bump per launch within the cache window
-TIE_EPSILON = 0.5        # score gap treated as a tie -> least recently used
+STALL_GUARD = 90.0       # session % above which a launch would stall out
+SESSION_WINDOW_H = 5.0   # nominal length of the session window
+WEEKLY_WINDOW_H = 168.0  # nominal length of the weekly window
+RESET_FLOOR_H = 0.05     # never divide by an almost-zero time-to-reset
+SLACK_FLOOR = 0.01       # ... nor by almost-zero slack
+WEEKLY_WEIGHT = 1.0      # weekly pressure relative to session pressure
+HERD_BUMP = 0.2          # score bump per launch within the cache window
+TIE_EPSILON = 0.05       # score gap treated as a tie -> least recently used
 
 # Credential states. Healthy means claude can authenticate with it right now;
 # "idle" (access token expired, refresh token alive) and "offline" (we simply
@@ -419,8 +428,43 @@ def session_weekly(limits):
     return session, weekly
 
 
-def score(session, weekly):
-    return session + max(0.0, weekly - WEEKLY_SOFT_CAP) * WEEKLY_PENALTY
+def window_hours(kind):
+    return SESSION_WINDOW_H if kind == "session" else WEEKLY_WINDOW_H
+
+
+def limit_slack(lim, now):
+    """How far ahead of its own refill pace this limit is.
+
+    1.0 means capacity left is exactly proportional to time left; above 1 is
+    ahead, below 1 is burning faster than the window refills. This is what
+    makes a percentage mean anything: 60% spent with 20 minutes to reset is
+    nearly free, 60% spent with four hours to go is scarce. A missing
+    resets_at falls back to a full window, which degrades to plain usage."""
+    w = window_hours(lim["kind"])
+    remaining = max(0.0, 100.0 - lim["percent"])
+    resets = lim.get("resets_at")
+    hours = w if not resets else (resets - now) / 3600.0
+    hours = min(max(hours, RESET_FLOOR_H), w)
+    return (remaining * w) / (100.0 * hours)
+
+
+def pressure(lim, now):
+    """Cost of leaning on this limit — grows without bound as slack runs out."""
+    return 1.0 / max(limit_slack(lim, now), SLACK_FLOOR)
+
+
+def score(limits, now):
+    """Lower is better.
+
+    Both windows always contribute, rather than only the worst one: when two
+    accounts have identical weekly pace, a nearly-spent 5-hour window still
+    decides between them. The scarcer window dominates on its own, because
+    pressure diverges as slack approaches zero."""
+    session = max((pressure(l, now) for l in limits if l["kind"] == "session"),
+                  default=1.0)
+    weekly = max((pressure(l, now) for l in limits if l["kind"] != "session"),
+                 default=1.0)
+    return session + WEEKLY_WEIGHT * weekly
 
 
 def blocked_until(limits, now):
@@ -443,7 +487,15 @@ def assess(entry, launch_model, now):
     return {
         "session": session,
         "weekly": weekly,
-        "score": score(session, weekly) + float((entry or {}).get("bump") or 0.0),
+        "pace": min((limit_slack(l, now) for l in limits), default=1.0),
+        "session_resets": max((l["resets_at"] for l in limits
+                               if l["kind"] == "session" and l["resets_at"]),
+                              default=None),
+        "weekly_resets": max((l["resets_at"] for l in limits
+                              if l["kind"] != "session" and l["resets_at"]),
+                             default=None),
+        "stall": session >= STALL_GUARD,
+        "score": score(limits, now) + float((entry or {}).get("bump") or 0.0),
         "blocked_until": blocked_until(limits, now),
         "age": now - (entry or {}).get("fetched_at", now),
     }
@@ -453,9 +505,14 @@ def pick(candidates, last_launch, now):
     """candidates: [(name, assessment-or-None)]. Winning name, or None."""
     usable = [(n, a) for n, a in candidates
               if a and (a["blocked_until"] is None or a["blocked_until"] <= now)]
-    if usable:
-        best = min(usable, key=lambda na: na[1]["score"])
-        ties = [na for na in usable
+    # An account can score well purely because its window resets in minutes,
+    # while still being too spent to get through the next few of them. Prefer
+    # accounts that can actually carry a session; fall back only if none can.
+    steady = [na for na in usable if not na[1].get("stall")]
+    pool = steady or usable
+    if pool:
+        best = min(pool, key=lambda na: na[1]["score"])
+        ties = [na for na in pool
                 if na[1]["score"] - best[1]["score"] <= TIE_EPSILON]
         return min(ties, key=lambda na: last_launch.get(na[0], 0))[0]
     scored = [(n, a) for n, a in candidates if a]
@@ -644,7 +701,14 @@ def render_status(status, now):
         return "%s ✗%s" % (who, "auth" if state != "missing" else "no-login")
     if not a:
         return "%s ?" % who
-    out = "%s s%.0f%% w%.0f%%" % (who, a["session"], a["weekly"])
+    # Percentages alone make a pick look wrong (the busier account can be the
+    # right one), so show what the decision actually turns on: time to reset.
+    def window(pct, resets):
+        if not resets or resets <= now:
+            return "%.0f%%" % pct
+        return "%.0f%%/%s" % (pct, humanize_mins(int((resets - now) // 60)))
+    out = "%s s%s w%s" % (who, window(a["session"], a.get("session_resets")),
+                          window(a["weekly"], a.get("weekly_resets")))
     if a["blocked_until"] and a["blocked_until"] > now:
         out += " blocked %s" % humanize_mins(int((a["blocked_until"] - now) // 60))
     if state == "offline":
@@ -789,7 +853,7 @@ def cmd_status():
                    if s["state"] in HEALTHY], last, now)
 
     print("%-26s %-9s %-9s %-7s %-12s %s"
-          % ("account", "session", "weekly", "score", "last-launch", "state"))
+          % ("account", "session", "weekly", "pace", "last-launch", "state"))
     for s in statuses:
         a = s["assessment"]
         mark = "→" if s["name"] == winner else " "
@@ -803,7 +867,7 @@ def cmd_status():
               % (mark, email_of(s["acct"]) or s["name"],
                  "%.0f%%" % a["session"] if a else "—",
                  "%.0f%%" % a["weekly"] if a else "—",
-                 "%.0f" % a["score"] if a else "—",
+                 "%.2f" % a["pace"] if a else "—",
                  humanize_ago(last.get(s["name"]), now),
                  ", ".join(notes)))
 
