@@ -18,7 +18,7 @@ active sessions and remember only a fragment of what was said.
 Use the search script (no other transcript spelunking needed):
 
 ```
-/home/you/projects/claude-beep/claude-grep [--since 6h|2d|1w] [--all] [-m N] PATTERN
+$HOME/projects/claude-beep/claude-grep [--since 6h|2d|1w] [--all] [-m N] PATTERN
 ```
 
 - Searches user + assistant text of session transcripts (what the user could

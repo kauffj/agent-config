@@ -1,10 +1,52 @@
 #!/usr/bin/env bash
-# git pre-commit hook — block commits that introduce broken config references.
+# git pre-commit hook — config integrity + public-repo leak guard.
 #
 # Canonical (version-controlled) source: hooks/pre-commit
 # Install once with:
 #   ln -sf ../../hooks/pre-commit "$(git rev-parse --git-dir)/hooks/pre-commit"
 #
-# Runs the integrity checker; exit 1 (broken file refs / settings paths /
-# symlink) aborts the commit. Warnings alone (machine-specific paths) pass.
+# This repo is symlinked to ~/.claude, so Claude Code's own runtime state lands
+# inside the working tree. .gitignore covers what exists today; this hook is the
+# backstop for what shows up tomorrow. Escape hatch: git commit --no-verify.
+
+fail() { echo ""; echo "BLOCKED (pre-commit): $1" >&2; echo "   $2" >&2; echo ""; exit 1; }
+
+STAGED=$(git diff --cached --name-only --diff-filter=AM)
+[ -z "$STAGED" ] && exec node "$(git rev-parse --show-toplevel)/lib/doctor.mjs"
+
+# 1. Paths that must never be tracked in a public repo.
+while IFS= read -r f; do
+    case "$f" in
+        .claude.json|.claude.json.*)
+            fail "staging $f" "Claude Code's config: oauthAccount (email, uuid, org, billing tier), userID, machineID, per-project history." ;;
+        *.jsonl)
+            fail "staging $f" "Looks like a transcript. Transcripts carry connection strings, keys, and private conversation." ;;
+        jobs/*|daemon/*|rescue/*|state/*|meta/*|fleet/*)
+            fail "staging $f" "Runtime state, not source. It is gitignored for a reason." ;;
+        *.key|*.pem|*credentials*|*id_rsa*|*id_ed25519*|*.env|*.env.*)
+            fail "staging $f" "Credential-shaped path." ;;
+        *.local.md|*.local.json)
+            fail "staging $f" "Marked .local — deliberately machine-only." ;;
+        commands/ops.md|skills/sign/*|tools/knowledge-audit-*)
+            fail "staging $f" "Kept local on purpose (private-org tooling / personal asset). See .gitignore." ;;
+    esac
+done <<< "$STAGED"
+
+# 2. Machine/org context that auto mode writes into settings.json.
+if git diff --cached --name-only | grep -qx 'settings.json'; then
+    if git show :settings.json | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("autoMode",{}).get("environment") else 1)' 2>/dev/null; then
+        fail "settings.json contains autoMode.environment" \
+             "That block is a generated infra dossier (prod hosts, secret locations, deploy mechanics). Strip it with:
+     python3 -c 'import json,collections as c;p=\"settings.json\";d=json.load(open(p),object_pairs_hook=c.OrderedDict);d.get(\"autoMode\",{}).pop(\"environment\",None);open(p,\"w\").write(json.dumps(d,indent=2,ensure_ascii=False)+chr(10))'"
+    fi
+fi
+
+# 3. High-signal secrets in staged content. This file is excluded from its own
+#    scan: the patterns below appear here literally, so scanning the scanner is
+#    a guaranteed false positive.
+if git diff --cached -U0 -- . ':(exclude)hooks/pre-commit' | grep -nIE '^\+.*(sk-ant-[A-Za-z0-9]|ghp_[A-Za-z0-9]{20}|github_pat_|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY|xox[bpsa]-[0-9])' >/dev/null; then
+    fail "staged content matches a credential pattern" "Find it with: git diff --cached -- . ':(exclude)hooks/pre-commit' | grep -nE 'sk-ant-|ghp_|github_pat_|AKIA|PRIVATE KEY|xox[bpsa]-'"
+fi
+
+# 4. Existing behavior: dangling config references abort the commit.
 exec node "$(git rev-parse --show-toplevel)/lib/doctor.mjs"

@@ -1,10 +1,10 @@
 {
-  "demo-app": [
-    { "cwd": "/home/you/projects/demo-app", "label": "main", "cmd": "claude" },
-    { "cwd": "/home/you/projects/demo-app", "label": "tests", "cmd": "claude" }
+  "webapp": [
+    { "cwd": "/home/you/projects/webapp", "label": "main", "cmd": "claude" },
+    { "cwd": "/home/you/projects/webapp", "label": "tests", "cmd": "claude" }
   ],
-  "team-ops": [
-    { "cwd": "/home/you/projects/team-ops", "cmd": "claude" },
-    { "cwd": "/home/you/projects/claude-config", "cmd": "claude" }
+  "config": [
+    { "cwd": "/home/you/projects/notes", "cmd": "claude" },
+    { "cwd": "/home/you/.claude", "cmd": "claude" }
   ]
 }

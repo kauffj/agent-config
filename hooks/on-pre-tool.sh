@@ -14,12 +14,14 @@ case "$TOOL" in
             exit 2
         fi
 
-        # ── Keep the demo-app MAIN checkout on 'main' ────────────────────────
-        # Branch-switching git commands (checkout/switch to a branch, -b/-B)
-        # must not run in the main working copy (/home/you/projects/demo-app):
-        # start work in a worktree instead. Self-scoped to the demo-app repo's
-        # MAIN checkout — inert in every other repo, in linked worktrees, and
-        # for file-restore checkouts ('git checkout -- <file>').
+        # ── Keep an opted-in repo's MAIN checkout on its protected branch ──
+        # Opt a repo in from inside it (no path is hardcoded here):
+        #   git config claude.protectMainCheckout true
+        #   git config claude.protectedBranch main        # optional, default: main
+        # Then branch-switching git commands are blocked in that repo's MAIN
+        # working copy — start the work in a linked worktree instead. Inert in
+        # every repo that has not opted in, in linked worktrees, and for file
+        # restores ('git checkout -- <file>').
         if echo "$CMD" | grep -qE '(^|[;&|[:space:]])git[[:space:]]+(checkout|switch)([[:space:]]|$)'; then
             CWD=$(echo "$INPUT" | jq -r '.cwd // empty')
             TARGET="$CWD"
@@ -27,19 +29,20 @@ case "$TOOL" in
             if [ -n "$LEAD" ]; then
                 case "$LEAD" in /*) TARGET="$LEAD";; *) TARGET="$CWD/$LEAD";; esac
             fi
-            MAIN_GIT=$(readlink -f /home/you/projects/demo-app/.git 2>/dev/null)
             COMMON=$(cd "$TARGET" 2>/dev/null && git rev-parse --git-common-dir 2>/dev/null)
             COMMON=$(cd "$TARGET" 2>/dev/null && readlink -f "$COMMON" 2>/dev/null)
             GITDIR=$(cd "$TARGET" 2>/dev/null && git rev-parse --absolute-git-dir 2>/dev/null)
-            # demo-app repo (COMMON==MAIN_GIT) AND its main checkout (GITDIR==COMMON)
-            if [ -n "$COMMON" ] && [ "$COMMON" = "$MAIN_GIT" ] && [ "$GITDIR" = "$COMMON" ]; then
+            OPTIN=$(git -C "$TARGET" config --bool claude.protectMainCheckout 2>/dev/null)
+            KEEP=$(git -C "$TARGET" config claude.protectedBranch 2>/dev/null); KEEP=${KEEP:-main}
+            # opted in AND this is the MAIN checkout (not a linked worktree)
+            if [ "$OPTIN" = "true" ] && [ -n "$COMMON" ] && [ "$GITDIR" = "$COMMON" ]; then
                 BLOCK=0
-                # Returning to 'main' is always allowed; only moving OFF main is blocked.
+                # Returning to the protected branch is always allowed; only moving OFF it is blocked.
                 if echo "$CMD" | grep -qE 'git[[:space:]]+switch([[:space:]]|$)'; then
                     SW=$(printf '%s' "$CMD" | sed -E 's/.*git[[:space:]]+switch[[:space:]]+//')
                     if ! printf '%s' "$SW" | grep -qE '^(-h|--help)([[:space:]]|$)'; then
                         SWB=$(printf '%s' "$SW" | awk '{print $NF}')   # target branch = last token
-                        [ "$SWB" != "main" ] && BLOCK=1
+                        [ "$SWB" != "$KEEP" ] && BLOCK=1
                     fi
                 fi
                 if echo "$CMD" | grep -qE 'git[[:space:]]+checkout([[:space:]]|$)'; then
@@ -49,14 +52,14 @@ case "$TOOL" in
                         BLOCK=1                                       # creating a branch in the main checkout
                     else
                         ARG=$(printf '%s' "$CMD" | sed -E 's/.*git[[:space:]]+checkout[[:space:]]+//; s/[[:space:]].*//')
-                        if [ "$ARG" = "main" ]; then
-                            :                                        # returning to main is always fine
+                        if [ "$ARG" = "$KEEP" ]; then
+                            :                                        # returning to the protected branch is always fine
                         elif [ "$ARG" = "-" ]; then
                             BLOCK=1                                  # previous-branch switch
                         elif printf '%s' "$ARG" | grep -qE '^-'; then
                             :                                        # option-only, leave alone
                         elif git -C "$TARGET" show-ref --verify --quiet "refs/heads/$ARG" 2>/dev/null; then
-                            BLOCK=1                                  # existing local branch (incl. feat/foo)
+                            BLOCK=1                                  # existing local branch
                         elif [ ! -e "$TARGET/$ARG" ] && git -C "$TARGET" rev-parse --verify --quiet "${ARG}^{commit}" >/dev/null 2>&1; then
                             BLOCK=1                                  # a ref/commit that isn't a file → detach/switch
                         else
@@ -65,7 +68,8 @@ case "$TOOL" in
                     fi
                 fi
                 if [ "$BLOCK" = "1" ]; then
-                    echo "Blocked: '$CMD' would change the branch of the MAIN demo-app checkout (/home/you/projects/demo-app), which must stay on 'main'. Start the work in an isolated worktree instead, e.g.:  git -C /home/you/projects/demo-app worktree add -b <branch> ../demo-app-<name> origin/main  (then cd into it). File restores like 'git checkout -- <file>' are unaffected." >&2
+                    TOP=$(git -C "$TARGET" rev-parse --show-toplevel 2>/dev/null)
+                    echo "Blocked: '$CMD' would move the MAIN checkout of $TOP off '$KEEP', which this repo pins (claude.protectMainCheckout). Start the work in an isolated worktree instead, e.g.:  git -C $TOP worktree add -b <branch> .workspaces/worktrees/<name> origin/$KEEP  (then cd into it). File restores like 'git checkout -- <file>' are unaffected." >&2
                     exit 2
                 fi
             fi

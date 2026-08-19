@@ -164,7 +164,7 @@ def display_name(acct, accounts=None):
 
 def find_account(accounts, key):
     """Match on email, its local part, or the internal handle — any prefix
-    that is unambiguous. `--acct claude` and `--acct you@example.com` both
+    that is unambiguous. `--acct you` and `--acct you@example.com` both
     work; so does the legacy `--acct alt`."""
     k = (key or "").strip().lower()
     for a in accounts:                                   # exact handle

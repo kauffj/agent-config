@@ -681,7 +681,7 @@ class TestSeed(unittest.TestCase):
         "tipsHistory": {"tip": 1},
         "numStartups": 999,
         "projects": {
-            "/home/you/projects/demo-app": {
+            "/home/user/projects/demo-app": {
                 "hasTrustDialogAccepted": True,
                 "allowedTools": ["Bash(npm:*)"],
                 "exampleFiles": ["a", "b"],
@@ -710,7 +710,7 @@ class TestSeed(unittest.TestCase):
 
     def test_projects_stripped_to_trust_and_approvals(self):
         out = L.seed_claude_json(self.SRC)
-        proj = out["projects"]["/home/you/projects/demo-app"]
+        proj = out["projects"]["/home/user/projects/demo-app"]
         self.assertEqual(proj, {"hasTrustDialogAccepted": True,
                                 "allowedTools": ["Bash(npm:*)"]})
         # a project with nothing seed-worthy is dropped entirely

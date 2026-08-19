@@ -2,7 +2,7 @@
   "env": {
     "HICKEY_PRINCIPLES": "$HOME/.claude/hickey-principles.md",
     "UI_PRINCIPLES": "$HOME/.claude/ui-design-principles.md",
-    "TEAM_OPS_REPO": "/home/you/projects/team-ops",
+    "TEAM_OPS_REPO": "$HOME/projects/team-ops",
     "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1"
   },
   "attribution": {

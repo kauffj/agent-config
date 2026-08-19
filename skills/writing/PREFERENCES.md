@@ -41,6 +41,5 @@ new about how he wants to work (and log the correction in `lessons.md`).
 ## Per-project constraints
 - Always establish the **hot-zone** (never-mention set) up front — active-litigation matters,
   PII, donor data, secrets. Honor it even in "generic" mentions.
-- Per-piece hot-zone sets live in a local, gitignored file.
-  (see that file for the per-piece never-mention set).
-
+- Per-piece hot-zone sets live in `hot-zone.local.md` (gitignored — a published list of
+  "never mention these" advertises exactly what is sensitive). Read it before drafting.

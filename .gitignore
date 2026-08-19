@@ -53,6 +53,33 @@ spawned-windows.log
 scheduled.json
 scheduled.log
 
+# ── Runtime state that must never reach a public repo ──────────────────
+# Claude Code's own config: oauthAccount (email, uuid, org, billing tier),
+# userID, machineID, per-project history.
+.claude.json
+.claude.json.backup
+
+# Background job runner: state, timelines, and COPIED TRANSCRIPTS.
+jobs/
+daemon/
+daemon.lock
+daemon.log
+daemon.status.json
+
+# Assorted runtime logs & caches written into the repo root.
+transcript-shrink.log
+gh-pr-status-cache.json
+
+# ── Machine-local, deliberately untracked (present on disk, not shared) ─
+# Private-org tooling and personal assets. These KEEP WORKING locally;
+# they are simply not part of the public repo.
+commands/ops.md
+skills/sign/
+tools/knowledge-audit-*.md
+
+# Per-piece never-mention sets and any other local-only notes.
+*.local.md
+
 __pycache__/
 *.pyc
 projects-backup/
