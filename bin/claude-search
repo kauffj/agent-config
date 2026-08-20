@@ -13,22 +13,57 @@ Code is not on the user's PATH, so we can't assume `rg`).
 """
 import os
 import shutil
+from urllib.parse import unquote
 import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from _claude_sessions_lib import live_sessions, _project_dir, PROJECTS_DIR  # noqa: E402
+from _claude_sessions_lib import (live_sessions, other_vendor_sessions,  # noqa: E402
+                                  _project_dir, PROJECTS_DIR, CODEX_SESSIONS_DIR,
+                                  GROK_SESSIONS_DIR)
+
+# Cross-session search stops being cross-session the moment half the fleet runs
+# somewhere else, so --all sweeps every vendor's transcript store.
+ALL_ROOTS = [PROJECTS_DIR, CODEX_SESSIONS_DIR, GROK_SESSIONS_DIR]
+
+
+def _label_for(path):
+    """Name an unswept transcript by its session, not its filename. Claude
+    names the file after the session; Codex embeds the id in the rollout name;
+    Grok puts it in the parent directory and percent-encodes the cwd above it,
+    so a hit reads as a session instead of "updates" or "prompt_h"."""
+    stem = os.path.basename(path)[:-6]
+    if path.startswith(GROK_SESSIONS_DIR):
+        parent = os.path.basename(os.path.dirname(path))
+        grand = os.path.basename(os.path.dirname(os.path.dirname(path)))
+        if parent.startswith("%2F"):       # per-directory file, not a session
+            return ("%s <grok>" % stem, unquote(parent))
+        if grand.startswith("%2F"):        # sessions/<cwd>/<uuid>/file.jsonl
+            return ("%s <grok>" % parent[:8], unquote(grand))
+        return ("%s <grok>" % stem[:8], path)
+    if path.startswith(CODEX_SESSIONS_DIR):
+        # rollout-<iso>-<uuid>.jsonl
+        parts = stem.split("-")
+        return ("%s <codex>" % (parts[-5][:8] if len(parts) >= 5 else stem[:8]),
+                path)
+    return (stem[:8], path)
+
+
+def _roots():
+    """Only the stores that exist — a missing vendor dir is not an error."""
+    return [r for r in ALL_ROOTS if os.path.isdir(r)] or [PROJECTS_DIR]
 
 
 def build_cmd(pattern, all_, targets):
     rg = shutil.which("rg")
     if rg:
         base = [rg, "-i", "-c", "-H", "--no-heading"]
-        return base + (["--glob", "*.jsonl", pattern, PROJECTS_DIR] if all_
+        return base + (["--glob", "*.jsonl", pattern, *_roots()] if all_
                        else [pattern, *targets])
     grep = shutil.which("grep") or "grep"
     if all_:
-        return [grep, "-r", "-i", "-c", "-H", "--include=*.jsonl", pattern, PROJECTS_DIR]
+        return [grep, "-r", "-i", "-c", "-H", "--include=*.jsonl", pattern,
+                *_roots()]
     return [grep, "-i", "-c", "-H", pattern, *targets]
 
 
@@ -47,7 +82,13 @@ def main():
         for sid, info in live_sessions().items():
             p = os.path.join(_project_dir(info.get("cwd") or ""), "%s.jsonl" % sid)
             if os.path.exists(p):
-                label_by_path[p] = (sid, info.get("cwd") or "")
+                label_by_path[p] = (sid[:8], info.get("cwd") or "")
+        # Other vendors record where their transcript is, so no path guessing.
+        for sid, info in other_vendor_sessions().items():
+            p = info.get("transcript")
+            if p and os.path.exists(p):
+                label_by_path[p] = ("%s <%s>" % (sid[:8], info["vendor"]),
+                                    info.get("cwd") or "")
         if not label_by_path:
             print("no live sessions with transcripts")
             return
@@ -66,14 +107,15 @@ def main():
         path, _, count = line.rpartition(":")
         if not count.isdigit() or int(count) == 0:   # grep -c emits :0 for misses
             continue
-        sid, cwd = label_by_path.get(path, (os.path.basename(path)[:-6], path))
+        sid, cwd = label_by_path.get(path) or _label_for(path)
         rows.append((int(count), sid, cwd))
 
     if not rows:
         print("no matches for %r in %s sessions" % (pattern, "all" if all_ else "live"))
         return
+    width = max(len(sid) for _, sid, _ in rows)
     for count, sid, cwd in sorted(rows, reverse=True):
-        print("%4d  %s  %s" % (count, sid[:8], cwd))
+        print("%4d  %-*s  %s" % (count, width, sid, cwd))
 
 
 if __name__ == "__main__":
