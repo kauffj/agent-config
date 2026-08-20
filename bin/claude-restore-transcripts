@@ -18,6 +18,15 @@ import sys
 HOME = os.path.expanduser("~")
 LIVE = os.path.join(HOME, ".claude", "projects")
 BACKUP = os.path.join(HOME, ".claude", "projects-backup")
+# Mirrored by claude-transcript-sync; same rollback exposure, same restore.
+# Keep the pairs in step with TREES there.
+TREES = [
+    (LIVE, BACKUP),
+    (os.path.join(HOME, ".codex", "sessions"),
+     os.path.join(HOME, ".claude", "vendor-backup", "codex")),
+    (os.path.join(HOME, ".grok", "sessions"),
+     os.path.join(HOME, ".claude", "vendor-backup", "grok")),
+]
 
 
 def main():
@@ -26,13 +35,16 @@ def main():
         sys.exit(f"No backup tree at {BACKUP} (is the claude-transcript-sync timer running?)")
 
     restored = 0
-    for root, _dirs, files in os.walk(BACKUP):
+    for live_root, backup_root in TREES:
+      if not os.path.isdir(backup_root):
+        continue
+      for root, _dirs, files in os.walk(backup_root):
         for fn in files:
             if not fn.endswith(".jsonl"):
                 continue
             bpath = os.path.join(root, fn)
-            rel = os.path.relpath(bpath, BACKUP)
-            lpath = os.path.join(LIVE, rel)
+            rel = os.path.relpath(bpath, backup_root)
+            lpath = os.path.join(live_root, rel)
             try:
                 bsz = os.path.getsize(bpath)
             except OSError:
@@ -60,7 +72,7 @@ def main():
     elif dry:
         print(f"({restored} transcript(s) would be restored — dry run, nothing written)")
     else:
-        print(f"Restored {restored} transcript(s) into {LIVE}.")
+        print(f"Restored {restored} transcript(s) across {len(TREES)} tree(s).")
 
 
 if __name__ == "__main__":
