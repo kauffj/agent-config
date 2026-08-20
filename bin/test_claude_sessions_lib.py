@@ -228,5 +228,50 @@ class TestVendorResume(unittest.TestCase):
         ])
         self.assertEqual(L.resume_set(snap_path=snap), [])
 
+
+class TestVendorTranscriptReader(unittest.TestCase):
+    """The reader exists so a conversation can be read without the terminal
+    mangling it; that is worth as much on a Codex or Grok tab."""
+
+    @classmethod
+    def setUpClass(cls):
+        from importlib.machinery import SourceFileLoader
+        cls.ct = SourceFileLoader(
+            "ct", os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                               "claude-transcript")).load_module()
+
+    def test_injected_preamble_is_not_a_prompt(self):
+        clean = self.ct._clean_prompt
+        for junk in ("# AGENTS.md instructions\n<INSTRUCTIONS>\nblah",
+                     "<environment_context>x</environment_context>",
+                     "<user_info>OS: linux</user_info>", "   ", ""):
+            self.assertEqual(clean(junk), "", junk[:30])
+
+    def test_grok_prompt_is_unwrapped(self):
+        # Grok wraps what the human typed in <user_query>.
+        got = self.ct._clean_prompt("<user_query>\nship it\n</user_query>")
+        self.assertEqual(got, "ship it")
+
+    def test_system_reminders_are_stripped(self):
+        got = self.ct._clean_prompt(
+            "real question<system-reminder>noise</system-reminder>")
+        self.assertEqual(got, "real question")
+
+    def test_renderer_is_chosen_by_where_the_file_lives(self):
+        import glob as _glob
+        for root, fn in ((L.GROK_SESSIONS_DIR, "render_grok"),
+                         (L.CODEX_SESSIONS_DIR, "render_codex")):
+            if not os.path.isdir(root):
+                continue
+            hits = _glob.glob(os.path.join(root, "**", "*.jsonl"),
+                              recursive=True)
+            if not hits:
+                continue
+            path = max(hits, key=os.path.getmtime)
+            text = self.ct.render(path, color=False)
+            self.assertIn(os.path.basename(root.rstrip("/")) and "session",
+                          text.split("\n")[0])
+            self.assertNotIn("<INSTRUCTIONS>", text)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

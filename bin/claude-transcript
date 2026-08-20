@@ -28,7 +28,9 @@ import sys
 from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from _claude_sessions_lib import PROJECTS_DIR, _project_dir, live_sessions
+from _claude_sessions_lib import (PROJECTS_DIR, _project_dir, live_sessions,
+                                  other_vendor_sessions, CODEX_SESSIONS_DIR,
+                                  GROK_SESSIONS_DIR)
 
 BOLD, DIM, CYAN, RESET = "\033[1m", "\033[2m", "\033[36m", "\033[0m"
 
@@ -67,6 +69,19 @@ def by_pane(pane):
             path = os.path.join(_project_dir(info["cwd"]), sid + ".jsonl")
             if os.path.isfile(path):
                 return path
+    # Other vendors run in these panes too, and record where their transcript
+    # is, so the reader works on their tabs without guessing a path.
+    for sid, info in other_vendor_sessions().items():
+        pid, path = info.get("pid"), info.get("transcript")
+        if not pid or not path or not os.path.isfile(path):
+            continue
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                env = f.read().split(b"\0")
+        except OSError:
+            continue
+        if want in env:
+            return path
     return None
 
 
@@ -120,7 +135,106 @@ def hhmm(entry):
         return "??:??"
 
 
+# Injected preamble each vendor replays into its own transcript as a "user"
+# turn. It is identical in every session and is not something anyone typed.
+INJECTED = ("# AGENTS.md", "<INSTRUCTIONS>", "<environment_context>",
+            "<user_instructions>", "<user_info>", "<system-reminder>")
+QUERY_RE = re.compile(r"<user_query>(.*?)</user_query>", re.S)
+
+
+def _clean_prompt(txt):
+    """The part a human actually typed, or '' if this turn is machinery."""
+    txt = (txt or "").strip()
+    m = QUERY_RE.search(txt)          # grok wraps the real prompt
+    if m:
+        txt = m.group(1).strip()
+    txt = REMINDER_RE.sub("", txt).strip()
+    if not txt or txt.startswith(INJECTED):
+        return ""
+    return txt
+
+
+def _vendor_frame(out, txt, d, c, b, r, stamp=""):
+    head = f" {stamp} " if stamp else " "
+    out.append(f"\n{d}{'─' * 8}{head}{'─' * 44}{r}\n{c}{b}❯{r} {b}{txt}{r}\n")
+
+
+def render_grok(path, color=True):
+    """Grok chat_history.jsonl: assistant turns are plain strings, user turns
+    are text blocks with the real prompt inside <user_query>."""
+    b, d, c, r = (BOLD, DIM, CYAN, RESET) if color else ("", "", "", "")
+    sid = os.path.basename(os.path.dirname(path))
+    out = [f"{d}grok session {sid}\n{path}{r}\n"]
+    with open(path, encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            kind = e.get("type")
+            if kind == "user" and not e.get("synthetic_reason"):
+                content = e.get("content")
+                blocks = [content] if isinstance(content, str) else [
+                    x.get("text", "") for x in content or []
+                    if isinstance(x, dict)]
+                for txt in blocks:
+                    cleaned = _clean_prompt(txt)
+                    if cleaned:
+                        _vendor_frame(out, cleaned, d, c, b, r)
+            elif kind == "assistant":
+                content = e.get("content")
+                if isinstance(content, str) and content.strip():
+                    out.append("\n" + content.rstrip() + "\n")
+                elif isinstance(content, list):
+                    for x in content:
+                        if isinstance(x, dict) and x.get("text", "").strip():
+                            out.append("\n" + x["text"].rstrip() + "\n")
+    return "".join(out)
+
+
+def render_codex(path, color=True):
+    """Codex rollout: response_item messages carry the conversation; the rest
+    (event_msg, world_state, turn_context) is machinery."""
+    b, d, c, r = (BOLD, DIM, CYAN, RESET) if color else ("", "", "", "")
+    out = [f"{d}codex session {os.path.basename(path)[:-6]}\n{path}{r}\n"]
+    with open(path, encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            if e.get("type") != "response_item":
+                continue
+            payload = e.get("payload") or {}
+            if payload.get("type") != "message":
+                continue
+            role = payload.get("role")
+            if role not in ("user", "assistant"):
+                continue          # developer turns are injected scaffolding
+            texts = [x.get("text", "") for x in payload.get("content") or []
+                     if isinstance(x, dict)]
+            stamp = (e.get("timestamp") or "")[11:16]
+            for txt in texts:
+                if role == "user":
+                    cleaned = _clean_prompt(txt)
+                    if cleaned:
+                        _vendor_frame(out, cleaned, d, c, b, r, stamp)
+                elif txt.strip():
+                    out.append("\n" + txt.rstrip() + "\n")
+    return "".join(out)
+
+
 def render(path, color=True):
+    # Each vendor writes its own schema; pick the reader from where the file
+    # lives rather than sniffing content.
+    if path.startswith(CODEX_SESSIONS_DIR):
+        return render_codex(path, color)
+    if path.startswith(GROK_SESSIONS_DIR):
+        return render_grok(path, color)
+    return render_claude(path, color)
+
+
+def render_claude(path, color=True):
     b, d, c, r = (BOLD, DIM, CYAN, RESET) if color else ("", "", "", "")
     sid = os.path.basename(path)[:-6]
     out = [f"{d}session {sid}\n{path}{r}\n"]
