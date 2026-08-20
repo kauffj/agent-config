@@ -99,7 +99,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "echo 'POST-COMPACTION CONTEXT: Enter plan mode for non-trivial tasks. Update tasks/lessons.md after corrections. Verify before marking complete. Simplicity first \u2014 no premature abstractions. Check tasks/todo.md for current progress.'"
+            "command": "echo 'POST-COMPACTION CONTEXT: Enter plan mode for non-trivial tasks. Update tasks/lessons.md after corrections. Verify before marking complete. Simplicity first — no premature abstractions. Check tasks/todo.md for current progress.'"
           }
         ]
       }

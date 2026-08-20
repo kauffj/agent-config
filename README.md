@@ -46,6 +46,15 @@ The visible bar is only a front-end. Underneath, `hooks/session-state.sh` writes
 `state/<session_id>.json` on every session event and `bin/claude-sessions --json`
 joins those into an urgency-sorted registry. Any terminal could render it.
 
+The registry is not Claude-only. Codex and Grok sessions run in the same tabs and
+compete for the same attention, so each vendor gets a small adapter returning the
+same record shape plus a `vendor` tag — and the picker, the tab bar, the attend
+key, cross-session search, the transcript reader and the post-reboot restore all
+work on them without knowing which vendor they are. Vendors that publish no
+session registry are found by process and matched to their own transcript store;
+they get a status from how long that transcript has been silent, since only
+Claude has hooks to report one.
+
 **The durability layer** ([`bin/README.md`](bin/README.md)). Claude appends each
 turn to a transcript, but the kernel can hold those writes in the page cache for
 seconds, and ext4's default `data=ordered` journals metadata but not data — so
@@ -54,6 +63,19 @@ write-up is the most directly useful thing in the repo. A 20-second timer
 fsyncs and mirrors recent transcripts; a 60-second timer records which sessions
 are live, with a boot-grace guard and a "cliff guard" for suspend-freezes, so a
 post-crash tick can't overwrite the pre-crash set before you restore from it.
+
+**The account router** (`bin/claude-acct`). Two subscriptions, one `claude`
+command: every launch probes both accounts and starts the session on whichever
+has more headroom — scoring usage against each window's *next reset* rather than
+its raw percentage, because 60% spent with twenty minutes to refill is cheaper
+than 40% that has to last four hours. It enforces limits rather than working
+around them: when every account is capped it refuses and names what else is
+installed instead, and a session that hits its cap mid-turn hands the
+conversation to the account with room rather than ending (both accounts share
+one transcript store, so the conversation itself can move). One person, two paid
+subscriptions, no shared credentials. It reads an undocumented
+`api/oauth/usage` endpoint — the same one `/usage` renders — so treat that part
+as liable to change without notice.
 
 **`/workspace`** (`skills/workspace/SKILL.md`). One primitive for isolated
 parallel work: a git worktree, a dev-server port, a copied env file, an isolated
