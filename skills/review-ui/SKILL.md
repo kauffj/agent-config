@@ -45,22 +45,19 @@ From the diff, extract only frontend files: `.tsx`, `.jsx`, `.css`, `.scss`, `.h
 
 If no frontend files were changed, report "No frontend files changed — nothing for UI review." and stop.
 
-## Step 3: Read Changed Files
-
-Read each changed frontend file **in full** so you understand the surrounding context, not just the diff hunks.
-
-## Step 4: Run UI Review
+## Step 3: Run UI Review
 
 Launch the agent defined in `$HOME/.claude/agents/ui-reviewer.md`. Provide:
-- The full content of all changed frontend files
-- The diff for context on what specifically changed
+- The changed frontend files, as **paths** — the agent has Read/Grep/Glob and
+  reads them itself, in its own context. Do not read them here and paste the
+  contents in: that spends the main conversation's context on exactly the work
+  being delegated, pays for every file twice, and caps how large a change can
+  be reviewed at all.
+- The diff, for what specifically changed
 - `$UI_PRINCIPLES` env var points to the principles file
 
-## Step 5: Present Findings
+## Step 4: Present Findings
 
-Display the agent's findings directly. The output will be structured as:
-
-### MUST FIX
-### SHOULD FIX
-### CONSIDER
-### What I couldn't evaluate
+Display the agent's findings verbatim. The agent file owns the output contract
+— graded findings, then what it could not evaluate — so it is not restated
+here; two copies of one contract drift apart.

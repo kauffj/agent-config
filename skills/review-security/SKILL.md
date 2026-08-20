@@ -39,24 +39,22 @@ git diff "$BASE"
 If `CHANGED_FILES` is empty, report "No changes to review." and stop — on a
 branch with commits that means the base is wrong, not that the code is clean.
 
-## Step 2: Read Changed Files
-
-Read each file in `CHANGED_FILES` **in full** so you understand the surrounding context, not just the diff hunks.
-
-Also read any auth utilities, middleware, or session helpers that the changed code imports or interacts with.
-
-## Step 3: Run Security Review
+## Step 2: Run Security Review
 
 Launch the agent defined in `$HOME/.claude/agents/security-reviewer.md`. Provide:
-- The full content of all changed files
-- The diff for context on what specifically changed
-- Instructions to also read any auth utilities or middleware the changed code interacts with
+- The changed files, as **paths** (`CHANGED_FILES`) — the agent has Read/Grep/Glob
+  and reads them itself, in its own context. Do not read them here and paste the
+  contents in: that spends the main conversation's context on exactly the work
+  being delegated, pays for every file twice, and caps how large a change can be
+  reviewed at all.
+- The diff, for what specifically changed
+- The instruction to also read any auth utilities, middleware, or session
+  helpers the changed code imports or interacts with — reaching past the diff is
+  the whole job here, since the vulnerability is usually in what the change
+  *assumes* rather than in the changed lines.
 
-## Step 4: Present Findings
+## Step 3: Present Findings
 
-Display the agent's findings directly. The output will be structured as:
-
-### MUST FIX
-### SHOULD FIX
-### CONSIDER
-### What I couldn't evaluate
+Display the agent's findings verbatim. The agent file owns the output contract
+— graded findings, then what it could not evaluate — so it is not restated
+here; two copies of one contract drift apart.
