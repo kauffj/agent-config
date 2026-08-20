@@ -341,12 +341,16 @@ def resume_set(snap_path=SNAPSHOT, recovery_max_age_h=12):
     live or whose transcript no longer exists on disk (so a rolled-back id never
     spawns a dead 'No conversation found' tab).
 
+    Vendor-aware: each entry carries the `vendor` its command comes from, so a
+    Codex or Grok tab is reopened with that vendor's own resume verb rather
+    than handed to `claude --resume`, which would only report an unknown id.
+
     Ordered to rebuild the tab bar as it was: sessions carrying a recorded `tab`
     position come first in visual order (window, then tab index), since callers
     spawn tabs left to right. Anything without one — no pid when the snapshot was
     taken, a session outside WezTerm, a pre-feature recovery file — sorts by cwd
     after them. Returns [{sessionId, cwd, tab?}]."""
-    live = set(live_sessions())
+    live = set(live_sessions()) | set(other_vendor_sessions())
     sources = [_snap_meta(snap_path).get("sessions", [])]
     rec = _snap_meta(RECOVERY_SNAP)
     preserved = rec.get("preservedAt", 0)
@@ -359,10 +363,19 @@ def resume_set(snap_path=SNAPSHOT, recovery_max_age_h=12):
             sid, cwd = s.get("sessionId"), s.get("cwd")
             if not sid or not cwd or sid in seen or sid in live:
                 continue
-            if not (os.path.isdir(cwd) and transcript_exists(sid, cwd)):
+            if not os.path.isdir(cwd):
+                continue
+            # Another vendor's transcript is nowhere near ~/.claude/projects,
+            # so the snapshot records its path and that is what gets checked.
+            vendor = s.get("vendor") or "claude"
+            transcript = s.get("transcript")
+            if vendor == "claude":
+                if not transcript_exists(sid, cwd):
+                    continue
+            elif not (transcript and os.path.exists(transcript)):
                 continue
             seen.add(sid)
-            entry = {"sessionId": sid, "cwd": cwd}
+            entry = {"sessionId": sid, "cwd": cwd, "vendor": vendor}
             tab = s.get("tab")
             if (isinstance(tab, list) and len(tab) == 2
                     and all(isinstance(v, int) for v in tab)):
@@ -550,3 +563,19 @@ def other_vendor_sessions():
         except Exception:
             continue          # one broken vendor must never blank the picker
     return out
+
+
+# How each vendor reopens a session by id. Kept beside the adapters so a new
+# vendor lands in one place: discovery and resurrection are the same fact.
+VENDOR_RESUME = {
+    "claude": "claude --resume %s",
+    "codex": "codex resume %s",
+    "grok": "grok --resume %s",
+}
+
+
+def resume_command(sid, vendor="claude"):
+    """Shell command that reopens this session, or None if the vendor has no
+    known resume verb — better to skip a tab than spawn one that errors."""
+    template = VENDOR_RESUME.get(vendor or "claude")
+    return template % sid if template else None

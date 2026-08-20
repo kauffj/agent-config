@@ -24,7 +24,8 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from _claude_sessions_lib import (  # noqa: E402
-    clear_recovery, live_sessions, recent_transcript_sessions, resume_set,
+    clear_recovery, live_sessions, recent_transcript_sessions, resume_command,
+    resume_set,
 )
 
 
@@ -68,8 +69,18 @@ def main():
     spawned = 0
     for s in todo:
         sid, cwd = s["sessionId"], s["cwd"]
+        vendor = s.get("vendor") or "claude"
+        # Each vendor reopens a session its own way; an unknown one is skipped
+        # rather than handed to `claude --resume`, which would only report an
+        # id it has never seen.
+        cmd = resume_command(sid, vendor)
+        tag = "" if vendor == "claude" else "  <%s>" % vendor
+        if cmd is None:
+            print("skipped %s  %s  :: no resume command for %s"
+                  % (sid[:8], cwd, vendor))
+            continue
         if dry:
-            print("would spawn  %s  %s" % (sid[:8], cwd))
+            print("would spawn  %s  %s%s  ::  %s" % (sid[:8], cwd, tag, cmd))
             continue
         r = subprocess.run(
             ["wezterm", "cli", "spawn", "--cwd", cwd, "--",
@@ -78,12 +89,13 @@ def main():
              # tab that inherits it hands the spawning session's id to anything
              # reading the environment (claude-open, /proc-based tooling).
              "unset CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ID; "
-             "claude --resume %s; exec bash" % sid],
+             "%s; exec bash" % cmd],
             capture_output=True, text=True)
         ok = r.returncode == 0
         spawned += ok
-        print("%s %s  %s%s" % ("spawned" if ok else "FAILED ", sid[:8], cwd,
-                               "" if ok else "  :: " + r.stderr.strip()))
+        print("%s %s  %s%s%s" % ("spawned" if ok else "FAILED ", sid[:8], cwd,
+                                 tag,
+                                 "" if ok else "  :: " + r.stderr.strip()))
 
     # Consume the recovery point once we've actually brought everything back, so
     # the next run doesn't re-suggest the same set. Keep it if any spawn failed.

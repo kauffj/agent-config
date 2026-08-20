@@ -187,8 +187,11 @@ def main():
     _reap_dead_state(set(live) | set(others), _restorable_ids())
     _reopen_due()
 
+    # Vendor sessions ride in the snapshot too, carrying the transcript path
+    # resume_set() needs (theirs live outside ~/.claude/projects), so a reboot
+    # brings the whole fleet back and not just the Claude half.
     sessions = sorted(
-        live.values(),
+        list(live.values()) + list(others.values()),
         key=lambda s: (s.get("cwd") or "", s["sessionId"]),
     )
     _attach_tab_positions(sessions)

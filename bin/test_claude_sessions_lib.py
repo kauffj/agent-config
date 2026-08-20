@@ -177,5 +177,56 @@ class TestVendorAdapters(unittest.TestCase):
             L.VENDOR_ADAPTERS.clear()
             L.VENDOR_ADAPTERS.update(real)
 
+
+class TestVendorResume(unittest.TestCase):
+    """A reboot has to bring the whole fleet back, not just the Claude half —
+    and must never hand another vendor's id to `claude --resume`."""
+
+    def test_each_vendor_has_its_own_resume_verb(self):
+        self.assertEqual(L.resume_command("S", "claude"), "claude --resume S")
+        self.assertEqual(L.resume_command("S", "codex"), "codex resume S")
+        self.assertEqual(L.resume_command("S", "grok"), "grok --resume S")
+
+    def test_unknown_vendor_has_no_command(self):
+        # Skipping the tab beats spawning one that reports an unknown id.
+        self.assertIsNone(L.resume_command("S", "venice"))
+
+    def test_missing_vendor_defaults_to_claude(self):
+        self.assertEqual(L.resume_command("S"), "claude --resume S")
+        self.assertEqual(L.resume_command("S", None), "claude --resume S")
+
+    def _snapshot(self, sessions):
+        import json as _json, tempfile, time as _time
+        f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+        _json.dump({"capturedAt": int(_time.time()), "sessions": sessions}, f)
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        return f.name
+
+    def test_vendor_transcript_is_checked_where_it_actually_lives(self):
+        # The claude check looks under ~/.claude/projects; a vendor transcript
+        # is nowhere near it, so the recorded path is what gets verified.
+        import tempfile
+        cwd = os.path.expanduser("~")
+        good = tempfile.NamedTemporaryFile(suffix=".jsonl", delete=False)
+        good.close()
+        self.addCleanup(os.unlink, good.name)
+        snap = self._snapshot([
+            {"sessionId": "vendor-alive", "cwd": cwd, "vendor": "codex",
+             "transcript": good.name},
+            {"sessionId": "vendor-gone", "cwd": cwd, "vendor": "codex",
+             "transcript": "/nonexistent/rollout.jsonl"},
+        ])
+        got = {e["sessionId"]: e for e in L.resume_set(snap_path=snap)}
+        self.assertIn("vendor-alive", got)
+        self.assertEqual(got["vendor-alive"]["vendor"], "codex")
+        self.assertNotIn("vendor-gone", got)
+
+    def test_claude_entries_still_gated_on_the_projects_tree(self):
+        snap = self._snapshot([
+            {"sessionId": "claude-bogus", "cwd": os.path.expanduser("~")},
+        ])
+        self.assertEqual(L.resume_set(snap_path=snap), [])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
