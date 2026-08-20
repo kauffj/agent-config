@@ -37,6 +37,23 @@ Extract `$STACK`, `$DEPLOY_MODEL`, `$BUILD_CMD`.
 
 ---
 
+## Step 0: Explore from a current tree
+
+The Plan agent reads whatever is on disk. A checkout 21 commits behind the remote once
+led it to plan around a feature that had already shipped — the exploration is only as good
+as the tree it runs on. Before launching it, in `$CWD`:
+
+```bash
+git fetch --quiet origin
+git status --short --branch | head -1   # how far behind is this tree?
+```
+
+If the tree is behind its upstream and clean, fast-forward it (`git merge --ff-only @{u}`).
+If it is behind but dirty, do NOT touch it — say so in the plan's assumptions, so a stale
+conclusion is visible rather than silent.
+
+---
+
 ## Step 1: Plan
 
 Launch an Agent (subagent_type: "Plan") with:
