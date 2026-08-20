@@ -83,6 +83,21 @@ database, and a state record — created, resumed, and torn down as a unit. The
 other skills (`/feature`, `/propose`, `/review-pr`) call it instead of each
 reimplementing worktree setup.
 
+**The review agents** (`agents/`, `skills/review-*`). Five specialist reviewers —
+security, simplicity, UI, visual, QA — that share one contract rather than one
+prompt. Each declares its **authority** (what it may and may not do: the QA
+tester never reads source, the simplicity reviewer never questions requirements
+that were already agreed), carries a single **core question** it asks of every
+file, grades findings **MUST FIX / SHOULD FIX / CONSIDER**, and ends with **"what
+I couldn't evaluate"** — the blind-spot disclosure that makes a clean review
+trustworthy instead of merely quiet. `/review-pr` runs them over a PR, a
+worktree, or an explicit file list; each also runs standalone.
+
+The simplicity and UI reviewers read their criteria from files in this repo
+(`hickey-principles.md`, `ui-design-principles.md`, pointed at by `$HICKEY_PRINCIPLES`
+and `$UI_PRINCIPLES` in `settings.json`), so the standard being applied is
+editable text rather than something buried in a prompt.
+
 **`lib/doctor.mjs`**. Resolves every cross-reference in the config — file paths
 embedded in skills, agents, and hooks, `settings.json` env values, the `~/.claude`
 symlink — against what is actually on disk. It runs at session start and on
