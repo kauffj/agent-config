@@ -33,6 +33,8 @@ TREES = [
     (LIVE, BACKUP),
     (os.path.join(HOME, ".codex", "sessions"),
      os.path.join(HOME, ".claude", "vendor-backup", "codex")),
+    (os.path.join(HOME, ".grok", "sessions"),
+     os.path.join(HOME, ".claude", "vendor-backup", "grok")),
 ]
 WINDOW = 300  # seconds; only touch files modified this recently (keeps each run cheap)
 SHRINK_LOG = os.path.join(HOME, ".claude", "transcript-shrink.log")

@@ -9,6 +9,7 @@ session id from the process argv (--resume / --session-id / -r).
 import glob
 import json
 import os
+from urllib.parse import quote
 import re
 import time
 from datetime import datetime
@@ -481,7 +482,63 @@ def codex_sessions():
     return out
 
 
-VENDOR_ADAPTERS = {"codex": codex_sessions}
+GROK_SESSIONS_DIR = os.path.join(HOME, ".grok", "sessions")
+
+
+def _grok_session_for_cwd(cwd):
+    """Grok's newest session for one working directory.
+
+    Layout is self-describing: sessions/<percent-encoded cwd>/<uuid>/, so the
+    cwd needs no file read, the directory name IS the session id, and
+    summary.json carries a written title — the one vendor that hands us a topic
+    instead of making us parse for one."""
+    root = os.path.join(GROK_SESSIONS_DIR, quote(cwd, safe=""))
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return None
+    best = None
+    for sid in entries:
+        chat = os.path.join(root, sid, "chat_history.jsonl")
+        try:
+            mtime = os.path.getmtime(chat)
+        except OSError:
+            continue
+        if best is None or mtime > best[0]:
+            best = (mtime, sid, chat)
+    if best is None:
+        return None
+    _, sid, chat = best
+    topic = ""
+    try:
+        with open(os.path.join(root, sid, "summary.json"),
+                  encoding="utf-8", errors="ignore") as f:
+            topic = (json.load(f).get("session_summary") or "").strip()
+    except (OSError, ValueError):
+        pass
+    return {"sessionId": sid, "cwd": cwd, "transcript": chat, "topic": topic}
+
+
+def grok_sessions():
+    """Live Grok sessions, matched to their chat history by working directory."""
+    out = {}
+    for pid in _pids():
+        argv = _proc_argv(pid)
+        if not argv or os.path.basename(argv[0]) not in ("grok", "agent"):
+            continue
+        cwd = _proc_cwd(pid)
+        if not cwd:
+            continue
+        found = _grok_session_for_cwd(cwd)
+        if not found or found["sessionId"] in out:
+            continue
+        found.update({"pid": pid, "status": None, "source": "proc",
+                      "vendor": "grok"})
+        out[found["sessionId"]] = found
+    return out
+
+
+VENDOR_ADAPTERS = {"codex": codex_sessions, "grok": grok_sessions}
 
 
 def other_vendor_sessions():

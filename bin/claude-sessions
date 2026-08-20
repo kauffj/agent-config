@@ -240,8 +240,13 @@ def records():
             "branch": branch,
             "label": meta.get("label") or _label(sid, cwd, branch),
             "vendor": vendor,
+            # Each vendor says what a session is about differently: Claude has
+            # an ai-title event, Grok writes summary.json (handed over by the
+            # adapter), Codex has neither so its opening prompt is parsed.
             "topic": (_topic(sid, cwd) if vendor == "claude"
-                      else _codex_topic(info.get("transcript") or "")),
+                      else _clip(info["topic"], 44) if info.get("topic")
+                      else _codex_topic(info.get("transcript") or "")
+                      if vendor == "codex" else ""),
             "pid": info.get("pid"),
             "source": info.get("source"),
             "status": status,

@@ -127,5 +127,55 @@ class TestStateReap(unittest.TestCase):
             self.assertTrue(exists("sessions-snapshot.json"))
 
 
+
+class TestVendorAdapters(unittest.TestCase):
+    """Adapters must return the record shape every view already speaks. These
+    read the real on-disk stores rather than fixtures, for the same reason the
+    transcript-dir tests do: the point is agreeing with what the vendors
+    actually write."""
+
+    def test_grok_resolves_a_session_from_its_cwd(self):
+        # Grok encodes the cwd into the directory name, so the session for a
+        # directory is findable without reading a single transcript byte.
+        import os as _os
+        root = L.GROK_SESSIONS_DIR
+        if not _os.path.isdir(root):
+            self.skipTest("no grok sessions on this machine")
+        encoded = next((d for d in _os.listdir(root)
+                        if d.startswith("%2F")), None)
+        if not encoded:
+            self.skipTest("no grok session directories")
+        from urllib.parse import unquote
+        cwd = unquote(encoded)
+        rec = L._grok_session_for_cwd(cwd)
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["cwd"], cwd)
+        self.assertTrue(rec["transcript"].endswith("chat_history.jsonl"))
+        self.assertIn(rec["sessionId"], rec["transcript"])
+
+    def test_grok_unknown_cwd_is_none(self):
+        self.assertIsNone(L._grok_session_for_cwd("/nonexistent/project/xyz"))
+
+    def test_adapters_agree_on_the_record_shape(self):
+        required = {"sessionId", "cwd", "pid", "status", "source", "vendor"}
+        for name, adapter in L.VENDOR_ADAPTERS.items():
+            for sid, rec in adapter().items():
+                self.assertTrue(required.issubset(rec),
+                                "%s record missing %s"
+                                % (name, required - set(rec)))
+                self.assertEqual(rec["vendor"], name)
+                self.assertEqual(rec["sessionId"], sid)
+
+    def test_one_broken_adapter_cannot_blank_the_picker(self):
+        real = dict(L.VENDOR_ADAPTERS)
+        def boom():
+            raise RuntimeError("vendor exploded")
+        L.VENDOR_ADAPTERS["boom"] = boom
+        try:
+            L.other_vendor_sessions()      # must not raise
+        finally:
+            L.VENDOR_ADAPTERS.clear()
+            L.VENDOR_ADAPTERS.update(real)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
