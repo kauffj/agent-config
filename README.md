@@ -148,3 +148,8 @@ directories, and content matching known key formats.
 If you clone this, note that `skills/kauffj-voice` and `skills/writing` encode
 one person's voice and writing process. They are here as worked examples of
 encoding a preference into a skill, not as something to use as-is.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Take what is useful; attribution appreciated but
+the license is the agreement.
