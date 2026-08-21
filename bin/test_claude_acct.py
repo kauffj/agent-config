@@ -274,12 +274,18 @@ class TestArgHandling(unittest.TestCase):
     def setUp(self):
         # capability is normally sniffed off the real disk (this machine's
         # default Brave really does have the extension) — pin it for the
-        # flag-logic tests below
-        self._real = L.has_extension
+        # flag-logic tests below. browser_running() is pinned for the same
+        # reason: browser_capable() prefers accounts whose browser is actually
+        # up, so without this the result depends on which browsers happen to be
+        # open while the suite runs — it passed only because both were.
+        self._real_ext = L.has_extension
+        self._real_running = L.browser_running
         L.has_extension = lambda acct: False
+        L.browser_running = lambda acct: True
 
     def tearDown(self):
-        L.has_extension = self._real
+        L.has_extension = self._real_ext
+        L.browser_running = self._real_running
 
     def test_extract_acct_flag_forms(self):
         self.assertEqual(L.extract_acct_flag(["--acct", "alt", "--resume", "x"]),
