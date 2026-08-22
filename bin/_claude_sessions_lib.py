@@ -438,7 +438,11 @@ def _codex_rollouts(limit=60):
 
 
 def _codex_meta(path):
-    """First line of a rollout is a session_meta event carrying id and cwd."""
+    """First line of a rollout is a session_meta event carrying id and cwd.
+
+    `subagent` marks the threads Codex spawns off a session: they are rollouts
+    of their own, written at the same time and in the same directory as the
+    conversation that owns them, and only `thread_source` tells them apart."""
     try:
         with open(path, encoding="utf-8", errors="ignore") as f:
             ev = json.loads(f.readline())
@@ -451,16 +455,54 @@ def _codex_meta(path):
     if not sid:
         return None
     return {"sessionId": sid, "cwd": payload.get("cwd") or "",
-            "transcript": path}
+            "transcript": path,
+            "subagent": bool(payload.get("parent_thread_id")
+                             or payload.get("thread_source") == "subagent")}
+
+
+def _open_rollouts(pid):
+    """(mtime, path) for every rollout a process holds open.
+
+    Codex appends to its session's rollout for as long as the session lives, so
+    the file is right there in /proc/<pid>/fd — no guessing required. A resumed
+    or forked session keeps its ancestors open too, hence the mtime: the one
+    being written is the one most recently written to."""
+    found, fddir = [], "/proc/%s/fd" % pid
+    try:
+        names = os.listdir(fddir)
+    except OSError:
+        return found
+    prefix = CODEX_SESSIONS_DIR.rstrip(os.sep) + os.sep
+    for name in names:
+        try:
+            target = os.readlink(os.path.join(fddir, name))
+        except OSError:
+            continue
+        base = os.path.basename(target)
+        if not (target.startswith(prefix)
+                and base.startswith("rollout-") and base.endswith(".jsonl")):
+            continue
+        try:
+            found.append((os.path.getmtime(target), target))
+        except OSError:
+            continue
+    return found
 
 
 def codex_sessions():
-    """Live Codex sessions, matched to their rollout transcript by cwd.
+    """Live Codex sessions, identified by the rollout each one holds open.
 
-    Codex keeps no pid registry, so liveness comes from /proc and identity from
-    the newest rollout whose session_meta names the same cwd — the same
-    attribution trick _attribute_fresh() uses for an unregistered claude."""
-    procs = {}
+    Codex keeps no pid registry, so liveness comes from /proc. Identity used to
+    come from the newest rollout whose session_meta named the same cwd, which
+    broke as soon as two Codex tabs shared a directory: they collapsed into one
+    session, and the survivor was handed the *other* tab's transcript — so the
+    status published from it (and with it the tab colour and CTRL+SHIFT+A) was
+    the wrong tab's. The process already knows which session it is; ask it.
+
+    Grouped by pane rather than cwd because the pane is what a session occupies
+    here — and the TUI and its vendored child share one, so they fold together
+    without a pid-tree walk."""
+    groups = {}
     for pid in _pids():
         argv = _proc_argv(pid)
         if not argv:
@@ -476,22 +518,54 @@ def codex_sessions():
         cwd = _proc_cwd(pid)
         if not cwd:
             continue
-        procs.setdefault(cwd, pid)     # one session per cwd, earliest pid wins
+        # No pane means Codex is not running in a WezTerm tab; fall back to the
+        # cwd, which is all the old attribution ever had anyway.
+        pane = proc_pane_id(pid)
+        g = groups.setdefault(("pane", pane) if pane else ("cwd", cwd),
+                              {"pid": pid, "cwd": cwd, "rollouts": []})
+        g["pid"] = min(g["pid"], pid)      # the TUI, not its vendored child
+        g["rollouts"].extend(_open_rollouts(pid))
 
-    if not procs:
-        return {}
-    metas = [m for m in (_codex_meta(p) for p in _codex_rollouts()) if m]
-    out, claimed = {}, set()
-    for cwd, pid in procs.items():
-        for m in metas:
-            if m["cwd"] == cwd and m["sessionId"] not in claimed:
-                claimed.add(m["sessionId"])
-                out[m["sessionId"]] = {
-                    "sessionId": m["sessionId"], "cwd": cwd, "pid": pid,
+    out, claimed, blind = {}, set(), []
+    for g in groups.values():
+        if not g["rollouts"]:
+            blind.append(g)               # /proc/<pid>/fd unreadable
+            continue
+        # A working session holds its subagents' rollouts open alongside its
+        # own, all of them being appended to at once, so "newest" picks a
+        # different thread from one second to the next. The conversation in
+        # the tab is the one thread that nothing spawned.
+        threads = []
+        for mtime, path in g["rollouts"]:
+            meta = _codex_meta(path)
+            if meta:
+                threads.append((mtime, meta))
+        own = [t for t in threads if not t[1]["subagent"]] or threads
+        if not own:
+            blind.append(g)
+            continue
+        meta = max(own, key=lambda t: t[0])[1]
+        sid = meta["sessionId"]
+        if not _looks_like_session_id(sid) or sid in claimed:
+            continue
+        claimed.add(sid)
+        out[sid] = {"sessionId": sid, "cwd": g["cwd"], "pid": g["pid"],
                     "status": None, "source": "proc", "vendor": "codex",
-                    "transcript": m["transcript"],
-                }
-                break
+                    "transcript": meta["transcript"]}
+
+    # Last resort for anything /proc would not name: the old cwd match.
+    if blind:
+        metas = [m for m in (_codex_meta(p) for p in _codex_rollouts()) if m]
+        for g in blind:
+            for m in metas:
+                if m["cwd"] == g["cwd"] and m["sessionId"] not in claimed:
+                    claimed.add(m["sessionId"])
+                    out[m["sessionId"]] = {
+                        "sessionId": m["sessionId"], "cwd": g["cwd"],
+                        "pid": g["pid"], "status": None, "source": "proc",
+                        "vendor": "codex", "transcript": m["transcript"],
+                    }
+                    break
     return out
 
 

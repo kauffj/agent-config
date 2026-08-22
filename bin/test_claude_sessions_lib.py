@@ -178,6 +178,102 @@ class TestVendorAdapters(unittest.TestCase):
             L.VENDOR_ADAPTERS.update(real)
 
 
+class TestCodexAttribution(unittest.TestCase):
+    """Which Codex conversation is in which tab.
+
+    Attribution used to be "the newest rollout whose session_meta names this
+    cwd", which is not an identity: two Codex tabs open on one project
+    collapsed into a single session, and the one that survived was handed the
+    other tab's transcript. Everything downstream reads that — so the tab
+    colour and CTRL+SHIFT+A were reporting the wrong tab's status, and the
+    second tab, having no state file at all, was permanently "idle" and the
+    attend key kept landing on it mid-task (2026-08-22)."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.saved = {n: getattr(L, n) for n in
+                      ("_pids", "_proc_argv", "_proc_cwd", "proc_pane_id",
+                       "_open_rollouts")}
+        self.procs = {}          # pid -> (cwd, pane, [rollout path, ...])
+        L._pids = lambda: list(self.procs)
+        L._proc_argv = lambda pid: ["node", "/usr/bin/codex"]
+        L._proc_cwd = lambda pid: self.procs[pid][0]
+        L.proc_pane_id = lambda pid: self.procs[pid][1]
+        L._open_rollouts = lambda pid: [
+            (os.path.getmtime(r), r) for r in self.procs[pid][2]]
+
+    def tearDown(self):
+        import shutil
+        for n, f in self.saved.items():
+            setattr(L, n, f)
+        shutil.rmtree(self.dir, ignore_errors=True)
+
+    def rollout(self, sid, cwd, parent=None, mtime=None):
+        """A rollout file on disk, real enough for _codex_meta to read."""
+        import json as _json
+        path = os.path.join(
+            self.dir, "rollout-2026-08-22T00-00-00-%s.jsonl" % sid)
+        payload = {"id": sid, "session_id": parent or sid, "cwd": cwd}
+        if parent:
+            payload.update({"parent_thread_id": parent,
+                            "thread_source": "subagent"})
+        with open(path, "w") as f:
+            f.write(_json.dumps({"type": "session_meta",
+                                 "payload": payload}) + "\n")
+        if mtime:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    ID_A = "01a02922-fd73-73e2-a2de-f522db382782"
+    ID_B = "01a025ab-47c3-7f21-9e0e-6d185bc57689"
+    ID_SUB = "01a02929-0e0f-7951-a8eb-4539d3bc06dd"
+
+    def test_two_tabs_in_one_directory_are_two_sessions(self):
+        # The regression: same cwd, different panes.
+        cwd = "/home/you/projects/thing"
+        self.procs = {
+            100: (cwd, "5", [self.rollout(self.ID_A, cwd)]),
+            200: (cwd, "43", [self.rollout(self.ID_B, cwd)]),
+        }
+        got = L.codex_sessions()
+        self.assertEqual(sorted(got), sorted([self.ID_A, self.ID_B]))
+        self.assertEqual(got[self.ID_A]["pid"], 100)
+        self.assertEqual(got[self.ID_B]["pid"], 200)
+
+    def test_each_tab_gets_its_own_transcript(self):
+        # Status is derived from how long the transcript has been silent, so a
+        # transcript belonging to the other tab is worse than none at all.
+        cwd = "/home/you/projects/thing"
+        a = self.rollout(self.ID_A, cwd)
+        b = self.rollout(self.ID_B, cwd)
+        self.procs = {100: (cwd, "5", [a]), 200: (cwd, "43", [b])}
+        got = L.codex_sessions()
+        self.assertEqual(got[self.ID_A]["transcript"], a)
+        self.assertEqual(got[self.ID_B]["transcript"], b)
+
+    def test_a_spawned_subagent_is_not_the_session(self):
+        # A working session holds its subagents' rollouts open and all of them
+        # are being appended to, so the newest is whichever wrote last — the
+        # session id would flap every tick. Nothing spawned the conversation.
+        cwd = "/home/you/projects/thing"
+        own = self.rollout(self.ID_A, cwd, mtime=1000)
+        sub = self.rollout(self.ID_SUB, cwd, parent=self.ID_A, mtime=9000)
+        self.procs = {100: (cwd, "5", [own, sub])}
+        got = L.codex_sessions()
+        self.assertEqual(list(got), [self.ID_A])
+        self.assertEqual(got[self.ID_A]["transcript"], own)
+
+    def test_the_tui_and_its_vendored_child_are_one_session(self):
+        # `node .../bin/codex` execs a vendored binary that holds the fds; both
+        # match the process filter and both sit in the same pane.
+        cwd = "/home/you/projects/thing"
+        own = self.rollout(self.ID_A, cwd)
+        self.procs = {100: (cwd, "5", []), 101: (cwd, "5", [own])}
+        got = L.codex_sessions()
+        self.assertEqual(list(got), [self.ID_A])
+        self.assertEqual(got[self.ID_A]["pid"], 100)   # the TUI, not the child
+
+
 class TestVendorResume(unittest.TestCase):
     """A reboot has to bring the whole fleet back, not just the Claude half —
     and must never hand another vendor's id to `claude --resume`."""
