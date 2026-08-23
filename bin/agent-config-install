@@ -1,0 +1,205 @@
+#!/usr/bin/env node
+
+const {
+  lstatSync,
+  mkdirSync,
+  readlinkSync,
+  realpathSync,
+  renameSync,
+  unlinkSync,
+  statSync,
+  symlinkSync,
+} = require('node:fs');
+const { randomUUID } = require('node:crypto');
+const { dirname, isAbsolute, join, relative, resolve } = require('node:path');
+const { pathToFileURL } = require('node:url');
+
+function usage() {
+  process.stdout.write('Usage: agent-config-install [--check]\n');
+}
+
+function lstatOrNull(path) {
+  try {
+    return lstatSync(path);
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+function displayPath(home, path) {
+  return `~/${relative(home, path)}`;
+}
+
+function quoted(value) {
+  return JSON.stringify(value);
+}
+
+function validateHome(rawHome) {
+  if (!rawHome || !isAbsolute(rawHome)) throw new Error('HOME must be an absolute path');
+  const normalized = resolve(rawHome);
+  if (normalized !== rawHome || normalized === '/') {
+    throw new Error('HOME must be a canonical, non-root path');
+  }
+
+  let home;
+  try { home = realpathSync(rawHome); }
+  catch { throw new Error('HOME must be an existing directory'); }
+  if (home !== normalized) throw new Error('HOME must not be a symbolic link');
+
+  const stat = statSync(home);
+  if (!stat.isDirectory()) throw new Error('HOME must be a directory');
+  return home;
+}
+
+function inspectLink(spec, classifyTarget) {
+  const stat = lstatOrNull(spec.linkPath);
+  if (stat === null) return { kind: 'missing', message: 'missing' };
+  if (!stat.isSymbolicLink()) {
+    return {
+      kind: 'conflict',
+      message: stat.isDirectory() ? 'is a directory, not a symbolic link' : 'is not a symbolic link',
+    };
+  }
+
+  const linkTarget = readlinkSync(spec.linkPath);
+  let resolvedTarget = null;
+  try {
+    resolvedTarget = realpathSync(spec.linkPath);
+  } catch {
+    // A dangling compatibility link cannot satisfy the expected target.
+  }
+  const kind = classifyTarget(spec, linkTarget, resolvedTarget);
+  if (kind !== 'conflict') return { kind, linkTarget };
+  return {
+    kind: 'conflict',
+    linkTarget,
+    message: `points to ${quoted(linkTarget)}, not ${quoted(spec.targetPath)}`,
+  };
+}
+
+function inspectParent(home, linkPath) {
+  const parent = dirname(linkPath);
+  const rel = relative(home, parent);
+  if (rel === '') return null;
+
+  let cursor = home;
+  for (const part of rel.split('/')) {
+    cursor = join(cursor, part);
+    const entry = lstatOrNull(cursor);
+    if (entry === null) return null;
+    if (entry.isSymbolicLink()) {
+      return `${displayPath(home, cursor)} must not be a symbolic link`;
+    }
+    if (!entry.isDirectory()) return `${displayPath(home, cursor)} is not a directory`;
+  }
+  return null;
+}
+
+function putLink(spec, replace, classifyTarget) {
+  mkdirSync(dirname(spec.linkPath), { recursive: true });
+  if (!replace) {
+    symlinkSync(spec.targetPath, spec.linkPath);
+    return;
+  }
+
+  // Parent paths are real directories. Revalidate the allowlisted link at the
+  // mutation boundary so ordinary concurrent changes fail closed rather than
+  // being overwritten.
+  if (inspectLink(spec, classifyTarget).kind !== 'legacy') {
+    throw new Error(`${quoted(spec.linkPath)} changed during migration; left untouched`);
+  }
+
+  // Rename a prepared sibling over the allowlisted legacy link so migration
+  // cannot leave the instruction path absent if creating the replacement fails.
+  const temporary = join(dirname(spec.linkPath), `.${spec.id}.agent-config-${randomUUID()}`);
+  let temporaryCreated = false;
+  try {
+    symlinkSync(spec.targetPath, temporary);
+    temporaryCreated = true;
+    renameSync(temporary, spec.linkPath);
+    temporaryCreated = false;
+  } finally {
+    if (temporaryCreated) unlinkSync(temporary);
+  }
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  if (args.includes('--help') || args.includes('-h')) {
+    usage();
+    process.exit(args.length === 1 ? 0 : 2);
+  }
+  if (args.length > 1 || (args.length === 1 && args[0] !== '--check')) {
+    usage();
+    process.exit(2);
+  }
+
+  const home = validateHome(process.env.HOME);
+
+  const scriptPath = realpathSync(__filename);
+  const repo = realpathSync(resolve(dirname(scriptPath), '..'));
+  const layoutUrl = pathToFileURL(join(repo, 'lib/harness-layout.mjs')).href;
+  const { classifyHarnessLinkTarget, resolveHarnessLinks } = await import(layoutUrl);
+  const links = resolveHarnessLinks(repo, home);
+  const parentChecks = links.map((spec) => ({
+    spec,
+    problem: inspectParent(home, spec.linkPath),
+  }));
+  const parentProblems = [...new Set(parentChecks.map(({ problem }) => problem).filter(Boolean))];
+  const findings = parentChecks
+    .filter(({ problem }) => problem === null)
+    .map(({ spec }) => ({ spec, status: inspectLink(spec, classifyHarnessLinkTarget) }));
+
+  if (args[0] === '--check') {
+    const problems = findings.filter(({ status }) => status.kind !== 'correct');
+    if (problems.length === 0 && parentProblems.length === 0) {
+      process.stdout.write('agent-config: all discovery links are configured\n');
+      return;
+    }
+    process.stdout.write('agent-config check:\n');
+    for (const problem of parentProblems) process.stdout.write(`  - ${problem}\n`);
+    for (const { spec, status } of problems) {
+      const suffix = status.kind === 'legacy'
+        ? `uses the legacy target ${quoted(status.linkTarget)}`
+        : status.message;
+      process.stdout.write(`  - ${displayPath(home, spec.linkPath)}: ${suffix}\n`);
+    }
+    process.exitCode = 1;
+    return;
+  }
+
+  const conflicts = findings.filter(({ status }) => status.kind === 'conflict');
+  if (conflicts.length > 0 || parentProblems.length > 0) {
+    process.stderr.write('agent-config: refusing to change conflicting paths:\n');
+    for (const problem of parentProblems) process.stderr.write(`  - ${problem}\n`);
+    for (const { spec, status } of conflicts) {
+      process.stderr.write(`  - ${displayPath(home, spec.linkPath)}: ${status.message}\n`);
+    }
+    process.exitCode = 1;
+    return;
+  }
+
+  let created = 0;
+  let migrated = 0;
+  for (const { spec, status } of findings) {
+    if (status.kind === 'missing') {
+      putLink(spec, false, classifyHarnessLinkTarget);
+      created += 1;
+    } else if (status.kind === 'legacy') {
+      putLink(spec, true, classifyHarnessLinkTarget);
+      migrated += 1;
+    }
+  }
+
+  if (created === 0 && migrated === 0) {
+    process.stdout.write('agent-config: discovery links already configured\n');
+  } else {
+    process.stdout.write(`agent-config: created ${created} link(s), migrated ${migrated} legacy link(s)\n`);
+  }
+}
+
+main().catch((error) => {
+  process.stderr.write(`agent-config: ${error.message}\n`);
+  process.exitCode = 1;
+});

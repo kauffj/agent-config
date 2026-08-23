@@ -1,9 +1,9 @@
 # claude-config
 
-A complete, opinionated Claude Code configuration: the whole `~/.claude`
-directory as a git repo. It is installed by symlinking the repo *onto* the
-config directory, so the thing you edit and the thing Claude Code reads are the
-same files.
+An opinionated agent configuration with shared instructions and skills for
+Claude Code, Codex, and Grok. Claude still consumes the whole repository as its
+`~/.claude` directory; thin discovery links let the other harnesses read the
+same policy and skill sources without duplicating them.
 
 Two ideas run through all of it:
 
@@ -30,7 +30,8 @@ Windows without work, and the interesting parts assume all three.
 | `bin/` | 18 command-line tools behind the above. |
 | `lib/` | Shared libraries behind the skills — among them `doctor.mjs` (config integrity), `workspace.mjs` (worktree state, port allocation) and `project.mjs` (project profile). |
 | `systemd/user/` | 9 units — the timers that make durability and resurrection actually run. |
-| `CLAUDE.md` | The standing instructions. Workflow orchestration, core principles, and a section on the economics of an agent's time vs. yours. |
+| `instructions/AGENTS.md` | The canonical standing instructions. Workflow orchestration, core principles, and a section on the economics of an agent's time vs. yours. |
+| `CLAUDE.md`, `AGENTS.md` | Thin harness-facing files: the Claude/Grok compatibility import and repository-local Codex guidance. |
 | `hickey-principles.md`, `ui-design-principles.md` | Reference docs the instructions point at instead of restating. |
 
 ## The parts most worth stealing
@@ -101,16 +102,18 @@ and `$UI_PRINCIPLES` in `settings.json`), so the standard being applied is
 editable text rather than something buried in a prompt.
 
 **`lib/doctor.mjs`**. Resolves every cross-reference in the config — file paths
-embedded in skills, agents, and hooks, `settings.json` env values, and the
-Claude/Codex symlinks — against what is actually on disk. It runs at session start and on
-pre-commit, turning silent breakage (a renamed agent file, a moved doc) into a
-loud, early failure.
+embedded in skills, agents, hooks, and instructions, `settings.json` env values,
+and all harness discovery links — against what is actually on disk. It runs at
+session start and on pre-commit, turning silent breakage (a renamed agent file,
+a moved doc, a missing Codex link) into a loud, early failure.
 
 ## Install
 
 ```bash
 git clone <this repo> ~/projects/claude-config
-ln -s ~/projects/claude-config ~/.claude
+~/projects/claude-config/bin/agent-config-install
+~/projects/claude-config/bin/agent-config-install --check
+
 mkdir -p ~/.claude/state ~/.codex ~/.config/wezterm
 ln -s ~/.claude/codex/hooks.json ~/.codex/hooks.json
 ln -s ~/.claude/wezterm/wezterm.lua ~/.config/wezterm/wezterm.lua
@@ -129,6 +132,16 @@ ln -sf ../../hooks/pre-commit ~/.claude/.git/hooks/pre-commit
 git -C ~/.claude config filter.strip-automode.clean "node lib/strip-automode.mjs"
 ```
 
+The installer derives the repository path from its own location and creates
+exactly four links: the neutral `~/.config/agent-config` source alias,
+`~/.claude`, Codex's `~/.codex/AGENTS.md`, and the shared
+`~/.agents/skills`. It is idempotent and refuses to replace unrecognized files,
+directories, or links. The only automatic migration is the former
+`~/.codex/AGENTS.md -> ../.claude/CLAUDE.md` link. It deliberately creates no
+`~/.grok/AGENTS.md`: Grok already discovers the canonical policy through its
+Claude compatibility layer and the shared skills path. It refuses noncanonical
+HOME paths and symlinked or non-directory configuration parents.
+
 **That last line matters.** Auto mode writes a summary of this machine's
 infrastructure — production hostnames, where secrets live, how deploys work —
 into `settings.json` under `autoMode.environment`. It belongs in the working
@@ -139,8 +152,9 @@ the commit as a backstop when the filter isn't configured. Both are needed: the
 filter is per-clone git config, which a fresh clone does not inherit.
 
 `settings.json` wires Claude's hooks and status line; `codex/hooks.json` wires
-the corresponding Codex lifecycle events. Codex requires one-time review of a
-new or changed hook definition through `/hooks` before it will run.
+the corresponding Codex lifecycle events. Shared reference paths use the
+neutral `~/.config/agent-config` alias. Codex requires one-time review of a new
+or changed hook definition through `/hooks` before it will run.
 
 **Requirements:** WezTerm, `python3`, `jq`, `node`, systemd-user, and ideally
 `ripgrep` (plain `grep` is the fallback).
@@ -165,6 +179,17 @@ tested by `hooks/test-on-pre-tool.sh`) plus `autoMode.soft_deny`. Defense in
 depth, not the primary control — if you want a real one, narrow `Bash(*)`. `wezterm/families.example.json` is an
 example; copy it to `~/.claude/fleet/families.json` and use absolute paths (the
 `cwd` is handed to WezTerm verbatim — no `~` or `$HOME` expansion).
+
+## Portability boundary
+
+This installation makes instruction and skill *discovery* reproducible across
+Claude, Codex, and Grok. It does not pretend their runtime contracts are the
+same. Follow-on work remains deliberately separate: fixing fleet consumers that
+drop vendor metadata; removing Claude-specific paths and tool names from shared
+skill bodies; adding native agent manifests, normalized hook adapters, and MCP
+capability mappings; and migrating project repositories to canonical
+`AGENTS.md` files. Neutral command aliases or moving runtime state can wait
+until either has a concrete benefit.
 
 ## Not in this repo
 

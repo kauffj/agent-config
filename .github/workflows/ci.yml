@@ -11,6 +11,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   check:
     runs-on: ubuntu-latest
@@ -41,7 +44,12 @@ jobs:
           printf '%s\n' "${files[@]}" | sort -u | xargs python3 -m py_compile
 
       - name: Node syntax
-        run: git ls-files '*.mjs' '*.js' | xargs -r -n1 node --check
+        run: |
+          git ls-files '*.mjs' '*.js' | xargs -r -n1 node --check
+          node --check bin/agent-config-install
+
+      - name: Agent discovery installation
+        run: node --test lib/test-agent-config-install.mjs
 
       - name: Shell syntax
         run: |

@@ -1,7 +1,7 @@
 {
   "env": {
-    "HICKEY_PRINCIPLES": "$HOME/.claude/hickey-principles.md",
-    "UI_PRINCIPLES": "$HOME/.claude/ui-design-principles.md",
+    "HICKEY_PRINCIPLES": "$HOME/.config/agent-config/hickey-principles.md",
+    "UI_PRINCIPLES": "$HOME/.config/agent-config/ui-design-principles.md",
     "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1"
   },
   "attribution": {
