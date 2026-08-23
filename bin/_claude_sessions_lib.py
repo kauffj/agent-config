@@ -653,3 +653,95 @@ def resume_command(sid, vendor="claude"):
     known resume verb — better to skip a tab than spawn one that errors."""
     template = VENDOR_RESUME.get(vendor or "claude")
     return template % sid if template else None
+
+
+# ── conversation text, vendor-agnostic ──────────────────────────────────────
+# Every vendor writes its own JSONL schema, and each one replays scaffolding
+# into the transcript as if a human had typed it. Search results are only
+# readable once both are handled, so the "what did a person actually say"
+# question lives here rather than being re-answered per tool.
+
+REMINDER_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.S)
+QUERY_RE = re.compile(r"<user_query>(.*?)</user_query>", re.S)
+
+# Preambles a vendor injects as a "user" turn. Identical in every session, and
+# nothing anyone typed — matching them is noise, not a hit.
+INJECTED = ("# AGENTS.md", "<INSTRUCTIONS>", "<environment_context>",
+            "<user_instructions>", "<user_info>", "<system-reminder>",
+            "<local-command-stdout>")
+
+# A slash command replays as a user turn wrapped in <command-message>,
+# <command-name>, <command-args>… — matched by shape so a new wrapper tag does
+# not silently start reading as something a person typed.
+COMMAND_RE = re.compile(r"^<command-[a-z]+>")
+
+
+def clean_prompt(txt):
+    """The part of a user turn a human actually typed, or '' if it is machinery."""
+    txt = (txt or "").strip()
+    m = QUERY_RE.search(txt)          # grok wraps the real prompt
+    if m:
+        txt = m.group(1).strip()
+    txt = REMINDER_RE.sub("", txt).strip()
+    if not txt or txt.startswith(INJECTED) or COMMAND_RE.match(txt):
+        return ""
+    return txt
+
+
+def _blocks(content):
+    """Text out of either shape a content field takes: a bare string, or a list
+    of blocks of which only the text ones carry conversation."""
+    if isinstance(content, str):
+        return [content]
+    return [b.get("text", "") for b in content or []
+            if isinstance(b, dict) and b.get("type") in (None, "text", "input_text",
+                                                         "output_text")]
+
+
+def conversation_turns(path):
+    """Yield (role, text) for the human-readable turns of a transcript, in
+    order, for any vendor. Tool calls, sidechains and injected preambles are
+    skipped: this is what the user could have scrolled past in the terminal."""
+    codex = path.startswith(CODEX_SESSIONS_DIR)
+    grok = path.startswith(GROK_SESSIONS_DIR)
+    try:
+        with open(path, encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if codex:
+                    if e.get("type") != "response_item":
+                        continue
+                    payload = e.get("payload") or {}
+                    if payload.get("type") != "message":
+                        continue
+                    role, texts = payload.get("role"), _blocks(payload.get("content"))
+                elif grok:
+                    if e.get("synthetic_reason"):
+                        continue
+                    role, texts = e.get("type"), _blocks(e.get("content"))
+                else:
+                    if e.get("isSidechain") or e.get("isMeta"):
+                        continue
+                    role = e.get("type")
+                    texts = _blocks((e.get("message") or {}).get("content"))
+                if role not in ("user", "assistant"):
+                    continue
+                for txt in texts:
+                    txt = clean_prompt(txt) if role == "user" else (txt or "").strip()
+                    if txt:
+                        yield role, txt
+    except OSError:
+        return
+
+
+def first_prompt(path, limit=100):
+    """The opening human prompt of a session — what identifies its terminal
+    window to the person looking for it. '' when the transcript has none."""
+    for role, txt in conversation_turns(path):
+        if role == "user":
+            one = " ".join(txt.split())
+            return one[:limit] + ("…" if len(one) > limit else "")
+    return ""

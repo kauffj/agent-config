@@ -15,28 +15,34 @@ active sessions and remember only a fragment of what was said.
 
 ## Tool
 
-Use the search script (no other transcript spelunking needed):
+Use the search script that ships with this config (no other transcript
+spelunking needed):
 
 ```
-$HOME/projects/claude-beep/claude-grep [--since 6h|2d|1w] [--all] [-m N] PATTERN
+$HOME/.claude/bin/claude-search PATTERN [--all] [--since 6h|2d|1w] [-m N] [--paths]
 ```
 
-- Searches user + assistant text of session transcripts (what the user could
-  scroll through in a terminal), newest first.
-- PATTERN is a Python regex; smart-case (case-insensitive unless it contains
-  an uppercase letter).
-- Default window is the last 2 days. Exit code is nonzero with a "no matches"
-  message when nothing hits.
-- Each hit prints the project dir, git branch, last-active age, first prompt,
-  matching lines, and a `claude --resume <session-id>` command.
-- Hits that are currently open in a terminal tab are annotated
-  `open on pts/N` with a `mark tab:` command.
-- `claude-grep --mark <session-id-prefix>` renames that session's terminal
-  tab to `🎯 <project> — FOUND 🎯` and rings its bell, so the user can spot
-  it in their tab bar. `claude-grep --unmark <prefix>` restores the title
-  (`<branch> <project>`). Both write to the tab's tty; they may need
-  sandbox override / permission approval. If the user says they found the
-  tab (or asks to clean up), unmark it.
+- Searches the user + assistant text of session transcripts — what the user
+  could scroll through in a terminal, not tool payloads — across Claude, Codex
+  and Grok.
+- PATTERN is a Python regex, always case-insensitive.
+- **Scope defaults to LIVE sessions only.** Pass `--all` to sweep history; that
+  is the right default for "find the session where we…" questions about
+  anything older than the tabs open right now.
+- `--since 6h|2d|1w` limits by how recently the transcript was touched.
+- Each hit prints the session id, project directory, match count, last-active
+  age, the opening prompt (this is what identifies the terminal window),
+  matching lines, and the exact command that reopens it.
+- Exit code is nonzero with a "no matches" message when nothing hits.
+
+**Optional local extra.** If `$HOME/projects/claude-beep/claude-grep` exists on
+this machine, it can additionally point at the tab:
+`claude-grep --mark <session-id-prefix>` renames that session's terminal tab to
+`🎯 <project> — FOUND 🎯` and rings its bell; `--unmark <prefix>` restores the
+title. It writes to the tab's tty and may need sandbox override / permission
+approval. It is a separate personal tool, **not part of this config** — check it
+exists (`test -x`) before reaching for it, and just skip the marking step if it
+does not. If the user says they found the tab, unmark it.
 
 ## Approach
 
@@ -55,29 +61,32 @@ $HOME/projects/claude-beep/claude-grep [--since 6h|2d|1w] [--all] [-m N] PATTERN
    "disk full" → `disk space`, `df -h`, `100%.*use`, `filled up`). Use
    alternation (`foo|bar`) to keep the number of runs small.
 
-3. **Widen if needed.** If the default 2-day window yields nothing or only
-   weak hits, retry with `--since 1w`, then `--all`. If the user's wording
-   implies age ("a while back", "last month"), start wider.
+3. **Widen if needed.** Start with `--all --since 2d` for a recent-sounding
+   query; widen to `--since 1w`, then to a bare `--all`, when that yields
+   nothing or only weak hits. If the user's wording implies age ("a while
+   back", "last month"), start wide. Drop `--all` only when the user says the
+   session is open right now.
 
 4. **Merge and rank.** Combine hits across patterns by session (the resume
    id). Rank by: number of distinct patterns that hit > recency > match
    count. A session matched by several independent patterns is almost
    certainly the one.
 
-5. **Point at the tab.** If the best match is annotated `open on pts/N` and
-   it is clearly the session the user described (one strong match, or
-   several patterns agree), run `claude-grep --mark <id-prefix>` on it so
-   its tab lights up — that is usually what the user actually wants. If
-   multiple candidates are equally plausible, don't mark; list them and let
-   the user choose.
+5. **Point at the tab.** A session that still appears in a default (live)
+   `claude-search` run is open right now. If the best match is clearly the
+   session the user described (one strong match, or several patterns agree)
+   and the optional `claude-grep` is installed, run `claude-grep --mark
+   <id-prefix>` so its tab lights up — that is usually what the user actually
+   wants. If multiple candidates are equally plausible, don't mark; list them
+   and let the user choose.
 
 ## Output
 
 Lead with the best match. For each candidate (best first, at most ~5):
 
-- Project directory and branch, how recently it was active
-- Whether it's open right now (`open on pts/N`) and, if you marked it, that
-  its tab is now named `🎯 <project> — FOUND 🎯`
+- Project directory, how recently it was active
+- Whether it's open right now (it appears in a live-scope search) and, if you
+  marked it, that its tab is now named `🎯 <project> — FOUND 🎯`
 - Its first prompt (this is what identifies the terminal window)
 - The one or two most telling matching lines
 - The exact resume command: `claude --resume <session-id>`

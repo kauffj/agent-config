@@ -1,30 +1,53 @@
 #!/usr/bin/env python3
-"""Search transcript content across Claude sessions.
+"""Search transcript content across Claude, Codex and Grok sessions.
 
-  claude-search PATTERN          only LIVE sessions (default)
-  claude-search PATTERN --all    all historical transcripts
+  claude-search PATTERN               only LIVE sessions (default)
+  claude-search PATTERN --all         every historical transcript
+  claude-search PATTERN --since 2d    transcripts touched in the last 6h/2d/1w
+  claude-search PATTERN -m 5          up to 5 matching lines per session
+  claude-search PATTERN --paths       just the transcript paths (for scripting)
 
 Live search joins live_sessions() with their transcript files, so it answers
-"which session I have open right now is the one about X" — the live-scoped
-sibling of the /find-session skill.
+"which session I have open right now is the one about X". `--all` sweeps every
+vendor's store, which is what /find-session runs when the answer is older than
+the tabs currently open.
+
+Each hit prints the session, its project directory, how long since it was
+touched, the opening prompt (what identifies the terminal window), the matching
+lines, and the exact command that reopens it.
 
 Uses ripgrep when on PATH, else falls back to grep (ripgrep bundled with Claude
 Code is not on the user's PATH, so we can't assume `rg`).
 """
 import os
+import re
 import shutil
 from urllib.parse import unquote
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from _claude_sessions_lib import (live_sessions, other_vendor_sessions,  # noqa: E402
-                                  _project_dir, PROJECTS_DIR, CODEX_SESSIONS_DIR,
-                                  GROK_SESSIONS_DIR)
+                                  _project_dir, _transcript_cwd, _codex_meta,
+                                  PROJECTS_DIR, CODEX_SESSIONS_DIR,
+                                  GROK_SESSIONS_DIR, conversation_turns,
+                                  first_prompt, resume_command)
 
 # Cross-session search stops being cross-session the moment half the fleet runs
 # somewhere else, so --all sweeps every vendor's transcript store.
 ALL_ROOTS = [PROJECTS_DIR, CODEX_SESSIONS_DIR, GROK_SESSIONS_DIR]
+
+BOLD, DIM, CYAN, RESET = "\033[1m", "\033[2m", "\033[36m", "\033[0m"
+SINCE_UNITS = {"m": 60, "h": 3600, "d": 86400, "w": 604800}
+
+
+def _vendor_of(path):
+    if path.startswith(CODEX_SESSIONS_DIR):
+        return "codex"
+    if path.startswith(GROK_SESSIONS_DIR):
+        return "grok"
+    return "claude"
 
 
 def _label_for(path):
@@ -37,21 +60,48 @@ def _label_for(path):
         parent = os.path.basename(os.path.dirname(path))
         grand = os.path.basename(os.path.dirname(os.path.dirname(path)))
         if parent.startswith("%2F"):       # per-directory file, not a session
-            return ("%s <grok>" % stem, unquote(parent))
+            return (stem, unquote(parent))
         if grand.startswith("%2F"):        # sessions/<cwd>/<uuid>/file.jsonl
-            return ("%s <grok>" % parent[:8], unquote(grand))
-        return ("%s <grok>" % stem[:8], path)
+            return (parent, unquote(grand))
+        return (stem, "")
     if path.startswith(CODEX_SESSIONS_DIR):
         # rollout-<iso>-<uuid>.jsonl
         parts = stem.split("-")
-        return ("%s <codex>" % (parts[-5][:8] if len(parts) >= 5 else stem[:8]),
-                path)
-    return (stem[:8], path)
+        return (("-".join(parts[-5:]) if len(parts) >= 5 else stem), "")
+    return (stem, "")
+
+
+def cwd_of(path):
+    """Where the session ran. Each vendor records it somewhere different, and a
+    hit without a project directory is most of the way to useless."""
+    if path.startswith(CODEX_SESSIONS_DIR):
+        meta = _codex_meta(path)
+        return (meta or {}).get("cwd") or ""
+    if path.startswith(GROK_SESSIONS_DIR):
+        return _label_for(path)[1]
+    return _transcript_cwd(path) or ""
 
 
 def _roots():
-    """Only the stores that exist — a missing vendor dir is not an error."""
-    return [r for r in ALL_ROOTS if os.path.isdir(r)] or [PROJECTS_DIR]
+    """Only the stores that exist — a missing vendor dir is not an error.
+    Empty when no vendor has ever run here; callers must not hand that to grep,
+    which then fails with a bare ENOENT and exit 2 instead of "no matches"."""
+    return [r for r in ALL_ROOTS if os.path.isdir(r)]
+
+
+def parse_since(text):
+    """'6h' / '2d' / '1w' -> seconds. Anything else is a usage error."""
+    m = re.fullmatch(r"(\d+)([mhdw])", (text or "").strip())
+    if not m:
+        sys.exit("claude-search: --since wants a window like 6h, 2d or 1w")
+    return int(m.group(1)) * SINCE_UNITS[m.group(2)]
+
+
+def human_age(seconds):
+    for unit, size in (("w", 604800), ("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= size:
+            return "%d%s ago" % (seconds // size, unit)
+    return "just now"
 
 
 def build_cmd(pattern, all_, targets):
@@ -67,28 +117,70 @@ def build_cmd(pattern, all_, targets):
     return [grep, "-i", "-c", "-H", pattern, *targets]
 
 
+def snippets(path, rx, limit):
+    """Matching lines as a human would have read them on screen. The raw JSONL
+    line is a whole turn of minified JSON — printing it is unreadable and leaks
+    tool payloads, so match against the extracted conversation text instead."""
+    out = []
+    for role, txt in conversation_turns(path):
+        for line in txt.splitlines():
+            if rx.search(line):
+                one = " ".join(line.split())
+                if len(one) > 160:
+                    hit = rx.search(one)
+                    start = max(0, hit.start() - 60)
+                    one = ("…" if start else "") + one[start:start + 160] + "…"
+                out.append(("❯" if role == "user" else "·", one))
+                if len(out) >= limit:
+                    return out
+    return out
+
+
 def main():
     args = sys.argv[1:]
     all_ = "--all" in args
-    pats = [a for a in args if not a.startswith("--")]
+    paths_only = "--paths" in args
+    since = None
+    max_lines = 3
+    pats = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--since":
+            i += 1
+            since = parse_since(args[i] if i < len(args) else "")
+        elif a == "-m":
+            i += 1
+            max_lines = int(args[i]) if i < len(args) and args[i].isdigit() else 3
+        elif not a.startswith("-"):
+            pats.append(a)
+        i += 1
     if not pats:
-        print("usage: claude-search PATTERN [--all]")
+        print("usage: claude-search PATTERN [--all] [--since 6h|2d|1w] [-m N] [--paths]")
         sys.exit(2)
     pattern = pats[0]
+    try:
+        rx = re.compile(pattern, re.I)
+    except re.error as e:
+        sys.exit("claude-search: bad pattern (%s)" % e)
 
     label_by_path = {}
     targets = []
-    if not all_:
+    if all_:
+        if not _roots():
+            print("no transcript stores on this machine "
+                  "(looked in ~/.claude/projects, ~/.codex/sessions, ~/.grok/sessions)")
+            sys.exit(1)
+    else:
         for sid, info in live_sessions().items():
             p = os.path.join(_project_dir(info.get("cwd") or ""), "%s.jsonl" % sid)
             if os.path.exists(p):
-                label_by_path[p] = (sid[:8], info.get("cwd") or "")
+                label_by_path[p] = (sid, info.get("cwd") or "")
         # Other vendors record where their transcript is, so no path guessing.
         for sid, info in other_vendor_sessions().items():
             p = info.get("transcript")
             if p and os.path.exists(p):
-                label_by_path[p] = ("%s <%s>" % (sid[:8], info["vendor"]),
-                                    info.get("cwd") or "")
+                label_by_path[p] = (sid, info.get("cwd") or "")
         if not label_by_path:
             print("no live sessions with transcripts")
             return
@@ -100,6 +192,7 @@ def main():
         sys.stderr.write(res.stderr)
         sys.exit(res.returncode)
 
+    now = time.time()
     rows = []
     for line in res.stdout.splitlines():
         if not line:
@@ -107,15 +200,50 @@ def main():
         path, _, count = line.rpartition(":")
         if not count.isdigit() or int(count) == 0:   # grep -c emits :0 for misses
             continue
+        try:
+            age = now - os.path.getmtime(path)
+        except OSError:
+            continue
+        if since is not None and age > since:
+            continue
         sid, cwd = label_by_path.get(path) or _label_for(path)
-        rows.append((int(count), sid, cwd))
+        rows.append((int(count), age, sid, cwd or cwd_of(path), path))
 
     if not rows:
-        print("no matches for %r in %s sessions" % (pattern, "all" if all_ else "live"))
+        scope = "all" if all_ else "live"
+        window = " in the last %s" % human_age(since).replace(" ago", "") if since else ""
+        print("no matches for %r in %s sessions%s" % (pattern, scope, window))
+        sys.exit(1)
+
+    rows.sort(key=lambda r: (-r[0], r[1]))
+    if paths_only:
+        for _, _, _, _, path in rows:
+            print(path)
         return
-    width = max(len(sid) for _, sid, _ in rows)
-    for count, sid, cwd in sorted(rows, reverse=True):
-        print("%4d  %-*s  %s" % (count, width, sid, cwd))
+
+    color = sys.stdout.isatty() and "NO_COLOR" not in os.environ
+    b, d, c, r = (BOLD, DIM, CYAN, RESET) if color else ("", "", "", "")
+    for count, age, sid, cwd, path in rows:
+        vendor = _vendor_of(path)
+        tag = "" if vendor == "claude" else " <%s>" % vendor
+        print("%s%s%s%s  %s%s · %d match%s · %s%s" % (
+            b, sid[:8], tag, r, d, cwd or "?", count,
+            "" if count == 1 else "es", human_age(int(age)), r))
+        opener = first_prompt(path)
+        if opener:
+            print("  %s%s%s" % (d, opener, r))
+        hits = snippets(path, rx, max_lines)
+        for mark, text in hits:
+            print("  %s%s%s %s" % (c, mark, r, text))
+        if not hits:
+            # The count comes from grepping raw JSONL, the lines from the
+            # conversation text — so a session can match only inside tool calls
+            # or file contents. Say so rather than showing a bare count.
+            print("  %s(matched only in tool output, not in the conversation)%s" % (d, r))
+        cmd = resume_command(sid, vendor)
+        if cmd:
+            print("  %s%s%s" % (d, cmd, r))
+        print()
 
 
 if __name__ == "__main__":
