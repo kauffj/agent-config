@@ -8,9 +8,41 @@ case "$TOOL" in
     Bash)
         CMD=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 
-        # Block destructive patterns
-        if echo "$CMD" | grep -qE '(rm\s+-rf\s+/|rm\s+-rf\s+\.|--force(\s|$)\s*push|push\s+--force(\s|$)|reset\s+--hard|DROP\s+(TABLE|DATABASE)|TRUNCATE\s|:\(\)\s*\{|fork\s*\()'; then
-            echo "Blocked: destructive command pattern detected" >&2
+        # ── Destructive commands, judged by TARGET rather than by substring ──
+        # One regex used to cover all of these, and it matched far too much:
+        # 'rm -rf /' was a PREFIX, so every absolute path was blocked
+        # ('rm -rf /tmp/build'); '.' caught './node_modules' and
+        # '.workspaces/...'; and a bare 'DROP DATABASE' blocked both /workspace's
+        # own teardown step and any grep for the phrase. A guard that fires on
+        # routine work gets worked around, which is worse than no guard — so each
+        # check below names the target that actually makes the command dangerous.
+
+        # 1. Recursive delete of a root-ish target, matched as a WHOLE argument.
+        #    A named path underneath one ('/tmp/build', './node_modules') is
+        #    ordinary work and stays allowed.
+        RM_TARGET='(/|/\*|\*|\.|\.\.|\./\*|~|~/|\$HOME|\$HOME/|\$\{HOME\}|\$\{HOME\}/)'
+        RM_RECURSIVE='(^|[;&|[:space:]])rm([[:space:]]+-[[:alnum:]-]+)*[[:space:]]+(-[[:alnum:]]*[rR][[:alnum:]]*|--recursive)'
+        if echo "$CMD" | grep -qE "(^|[;&|[:space:]])rm([[:space:]]+-[[:alnum:]-]+)*[[:space:]]+${RM_TARGET}([[:space:]]|;|&|\||$)" \
+           && echo "$CMD" | grep -qE "$RM_RECURSIVE"; then
+            echo "Blocked: recursive delete of a root-level target ('/', '~', '.', '*'). Name the directory you mean." >&2
+            exit 2
+        fi
+
+        # 2. Destructive SQL — but only when a client is actually EXECUTING it.
+        #    Grepping a migration for the phrase is reading, not dropping. A
+        #    per-workspace database (…_ws_<name>) is exempt: /workspace creates
+        #    it and is expected to drop it again at teardown.
+        if echo "$CMD" | grep -qE '(^|[;&|[:space:]])(psql|mysql|mariadb|sqlite3|mongosh|clickhouse-client)([[:space:]]|$)' \
+           && echo "$CMD" | grep -qiE '(DROP[[:space:]]+(TABLE|DATABASE|SCHEMA)|TRUNCATE[[:space:]])' \
+           && ! echo "$CMD" | grep -q '_ws_'; then
+            echo "Blocked: destructive SQL against a database that is not a /workspace clone (…_ws_<name>)." >&2
+            exit 2
+        fi
+
+        # 3. History rewrites and fork bombs. '--force-with-lease' is deliberately
+        #    NOT matched — it is the safe form of the same intent.
+        if echo "$CMD" | grep -qE '(git[[:space:]]+push[^;&|]*[[:space:]](--force|-f)([[:space:]]|$)|git[[:space:]]+reset[[:space:]]+--hard|:\(\)[[:space:]]*\{)'; then
+            echo "Blocked: force-push, hard reset, or fork bomb" >&2
             exit 2
         fi
 
