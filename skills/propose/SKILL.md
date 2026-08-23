@@ -33,7 +33,8 @@ Also load the project profile so the plan knows the stack:
 node $HOME/.claude/lib/project.mjs load
 ```
 
-Extract `$STACK`, `$DEPLOY_MODEL`, `$BUILD_CMD`.
+Extract `$STACK`, `$DEPLOY_MODEL`, `$BUILD_CMD`. A `null` command means the
+project has no such step — take it at face value.
 
 ---
 

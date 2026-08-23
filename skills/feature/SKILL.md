@@ -108,6 +108,12 @@ Delegate to `/workspace remove <NAME>`. **Stop.**
    ```
    Extract `$BUILD_CMD`, `$DEV_CMD`, `$INSTALL_CMD`, `$STACK`, `$DEPLOY_MODEL`, `$HAS_SCREENSHOTS`, `$DEFAULT_BRANCH`.
 
+   **A command field can be `null`** — it means the project genuinely has no such
+   step (no `build` script, not a Django app). Skip that step rather than
+   inventing a command; a `null` is a detected fact, not a detection failure. If
+   it is wrong, correct it once in `.workspaces/project.json` under `overrides`
+   (it survives re-detection) instead of working around it each run.
+
 Update pipeline progress:
 
 ```bash
@@ -161,8 +167,8 @@ Launch an Agent (subagent_type: "general-purpose"):
 > - Do NOT add unnecessary abstractions, comments, or over-engineering
 >
 > **Verification (required before returning):**
-> 1. Run `cd $WORKTREE_PATH && $BUILD_CMD` and confirm zero errors. If there are build errors, fix them.
-> 2. Start the dev server (`cd $WORKTREE_PATH && PORT=$PORT $DEV_CMD`) and verify each affected URL loads without errors at `http://localhost:$PORT/...`. Check the terminal output for server-side errors.
+> 1. If `$BUILD_CMD` is not null, run `cd $WORKTREE_PATH && $BUILD_CMD` and confirm zero errors. If there are build errors, fix them.
+> 2. If `$DEV_CMD` is not null, start the dev server (`cd $WORKTREE_PATH && PORT=$PORT $DEV_CMD`) and verify each affected URL loads without errors at `http://localhost:$PORT/...`. Check the terminal output for server-side errors. If it is null, verify by the project's own test command instead and say so.
 > 3. Walk through the acceptance criteria from the plan and confirm each one is met. If any aren't met, fix the implementation.
 >
 > **Output:**
@@ -194,6 +200,7 @@ Ensure the dev server is running:
 
 ```bash
 : "${WORKTREE_PATH:?set WORKTREE_PATH first}" "${PORT:?PORT is empty}"
+[ "$DEV_CMD" = "null" ] && { echo "no dev command for this project — skipping server checks"; exit 0; }
 cd "$WORKTREE_PATH" && PORT=$PORT $DEV_CMD &
 for i in $(seq 1 30); do curl -s -o /dev/null -w "%{http_code}" http://localhost:$PORT && break || sleep 1; done
 ```
@@ -248,7 +255,7 @@ Launch an Agent to address the review feedback:
 > - **CONSIDER**: Document your decision; these are optional.
 >
 > Make the changes, then:
-> 1. Run `cd $WORKTREE_PATH && $BUILD_CMD` and confirm zero errors.
+> 1. If `$BUILD_CMD` is not null, run `cd $WORKTREE_PATH && $BUILD_CMD` and confirm zero errors.
 > 2. Output a summary of what you changed and any CONSIDER items you chose not to address (with reasoning).
 > 3. List any files where you changed CSS, JS, or view-related code.
 
@@ -286,7 +293,7 @@ Present to the user via `AskUserQuestion`:
 
 If the user provides feedback:
 1. Launch an Agent to address it, working in `$WORKTREE_PATH`.
-2. Run `$BUILD_CMD` to verify build still passes.
+2. Run `$BUILD_CMD` (when it is not null) to verify the build still passes.
 3. Loop back to the top of this step.
 
 Max 3 feedback rounds. After 3, ask the user whether to proceed as-is or keep iterating.
