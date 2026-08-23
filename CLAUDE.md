@@ -64,6 +64,12 @@ Every production site runs on one shared droplet. **`~/projects/server-config/SE
 - **Never edit `server-config`'s `etc/ usr/ var/ home/ opt/ secrets/`** — one-way live→repo mirror; your edit is reverted. Repo-root `*.md` and `snapshot.sh` *are* source of truth.
 - **Never commit a Claude Code transcript.** `/export` writes into the cwd; transcripts contain connection strings and keys.
 
+### Temporary server lifetime
+
+- Launch every temporary development, preview, test, or static-file server through `~/.claude/bin/agent-session-server -- <command>`. Run the wrapper as a foreground long-running tool command; use the tool's background/session facility when work must continue. Do not use shell `&`, `nohup`, `disown`, or a daemon mode.
+- The wrapper owns the server process group and stops it when the nearest Claude or Codex CLI process exits. Production services that intentionally outlive the agent session are outside this rule.
+- Stop temporary servers explicitly when review ends, then verify that their listening port closed. Session-bound cleanup is the final safety net, not a substitute for ordinary cleanup.
+
 
 ## Writing
 

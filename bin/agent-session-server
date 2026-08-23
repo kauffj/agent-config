@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Run a temporary server for exactly as long as its agent session lives."""
+
+import argparse
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+
+
+AGENT_PROCESS_NAMES = {"claude", "codex"}
+POLL_SECONDS = 0.1
+TERM_GRACE_SECONDS = 2.0
+
+
+def proc_stat(pid):
+    """Return (parent pid, state, start ticks), or None when pid is gone."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return None
+    fields = raw[raw.rfind(")") + 2 :].split()
+    return int(fields[1]), fields[0], int(fields[19])
+
+
+def proc_name(pid):
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return ""
+
+
+def find_agent_process(start_pid):
+    pid = start_pid
+    seen = set()
+    while pid > 1 and pid not in seen:
+        seen.add(pid)
+        info = proc_stat(pid)
+        if info is None:
+            break
+        if proc_name(pid) in AGENT_PROCESS_NAMES:
+            return pid, info[2]
+        pid = info[0]
+    return None
+
+
+def process_is_alive(identity):
+    pid, start_ticks = identity
+    info = proc_stat(pid)
+    return info is not None and info[1] != "Z" and info[2] == start_ticks
+
+
+def process_group_exists(pgid):
+    try:
+        os.killpg(pgid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def stop_process_group(pgid):
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+
+    deadline = time.monotonic() + TERM_GRACE_SECONDS
+    while process_group_exists(pgid) and time.monotonic() < deadline:
+        time.sleep(POLL_SECONDS)
+
+    if process_group_exists(pgid):
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Run a temporary server and stop its process group when the agent exits."
+    )
+    parser.add_argument(
+        "--session-pid",
+        type=int,
+        help="process to watch instead of auto-detecting Claude/Codex (mainly for tests)",
+    )
+    parser.add_argument("command", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+    if args.command[:1] == ["--"]:
+        args.command = args.command[1:]
+    if not args.command:
+        parser.error("a server command is required after --")
+    return args
+
+
+def main():
+    args = parse_args()
+    if args.session_pid is not None:
+        info = proc_stat(args.session_pid)
+        session = None if info is None else (args.session_pid, info[2])
+    else:
+        session = find_agent_process(os.getppid())
+
+    if session is None:
+        print(
+            "agent-session-server: no live Claude/Codex session process found; "
+            "refusing to launch an unmanaged server",
+            file=sys.stderr,
+        )
+        return 2
+
+    requested_signal = [None]
+
+    def request_stop(signum, _frame):
+        requested_signal[0] = signum
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+    # A tool terminal may close while the agent session continues. The watched
+    # agent PID, rather than that terminal, is the server's source of truth.
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+    child = subprocess.Popen(args.command, start_new_session=True)
+    print(
+        f"agent-session-server: server pid={child.pid}; session pid={session[0]}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+    child_status = None
+    session_ended = False
+    try:
+        while child_status is None:
+            child_status = child.poll()
+            if child_status is not None:
+                break
+            if requested_signal[0] is not None or not process_is_alive(session):
+                session_ended = True
+                break
+            time.sleep(POLL_SECONDS)
+    finally:
+        stop_process_group(child.pid)
+        try:
+            child.wait(timeout=TERM_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            pass
+
+    if requested_signal[0] is not None:
+        return 128 + requested_signal[0]
+    if session_ended:
+        return 0
+    if child_status is not None and child_status < 0:
+        return 128 - child_status
+    return child_status or 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

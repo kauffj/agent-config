@@ -168,7 +168,7 @@ Launch an Agent (subagent_type: "general-purpose"):
 >
 > **Verification (required before returning):**
 > 1. If `$BUILD_CMD` is not null, run `cd $WORKTREE_PATH && $BUILD_CMD` and confirm zero errors. If there are build errors, fix them.
-> 2. If `$DEV_CMD` is not null, start the dev server (`cd $WORKTREE_PATH && PORT=$PORT $DEV_CMD`) and verify each affected URL loads without errors at `http://localhost:$PORT/...`. Check the terminal output for server-side errors. If it is null, verify by the project's own test command instead and say so.
+> 2. If `$DEV_CMD` is not null, start the dev server as a foreground long-running tool command (`cd "$WORKTREE_PATH" && PORT="$PORT" "$HOME/.claude/bin/agent-session-server" -- bash -lc "$DEV_CMD"`) and verify each affected URL loads without errors at `http://localhost:$PORT/...`. Use the tool's background/session facility while continuing work; do not append shell `&`. Check the terminal output for server-side errors. If it is null, verify by the project's own test command instead and say so.
 > 3. Walk through the acceptance criteria from the plan and confirm each one is met. If any aren't met, fix the implementation.
 >
 > **Output:**
@@ -196,12 +196,19 @@ node $HOME/.claude/lib/workspace.mjs update $NAME '{"pipeline":{"step":3}}'
 
 Skip this step if `$HAS_SCREENSHOTS` is false.
 
-Ensure the dev server is running:
+Ensure the dev server is running. If it is not, start this as a foreground
+long-running tool command and use the tool's background/session facility while
+continuing; do not append shell `&`:
 
 ```bash
 : "${WORKTREE_PATH:?set WORKTREE_PATH first}" "${PORT:?PORT is empty}"
 [ "$DEV_CMD" = "null" ] && { echo "no dev command for this project — skipping server checks"; exit 0; }
-cd "$WORKTREE_PATH" && PORT=$PORT $DEV_CMD &
+cd "$WORKTREE_PATH" && PORT="$PORT" "$HOME/.claude/bin/agent-session-server" -- bash -lc "$DEV_CMD"
+```
+
+Then wait for it from a separate tool call:
+
+```bash
 for i in $(seq 1 30); do curl -s -o /dev/null -w "%{http_code}" http://localhost:$PORT && break || sleep 1; done
 ```
 
