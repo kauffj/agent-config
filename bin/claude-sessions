@@ -183,6 +183,8 @@ def _glyph(status, age, ceiling):
     """Graduated urgency, matching the tab bar's relative model instead of turning
     everything red after 10 minutes: band a log-scaled fraction of `ceiling`
     (= max(2h, longest current wait)) into green -> yellow -> orange -> red."""
+    if status == "delegating":
+        return "◐"                    # parked on subagents; wakes itself
     if status != "waiting":
         return "·"                    # · working
     if age <= 0 or ceiling <= 1:
@@ -227,6 +229,12 @@ def records():
         st = _load(os.path.join(STATE_DIR, "%s.json" % sid))
         meta = _load(os.path.join(META_DIR, "%s.json" % sid))
         status = st.get("status") or "working"
+        # Stale-delegating degrade (same 30m window as wezterm.lua's
+        # DELEGATE_STALE_S): a delegating claim whose `updated` stopped moving
+        # means the hook's agents counter is stuck — surface it as waiting
+        # rather than letting the session sleep un-pinged forever.
+        if status == "delegating" and now - (st.get("updated") or now) > 1800:
+            status = "waiting"
         since = st.get("since")
         age = int(now - since) if since else 0
         if status == "waiting" and age > maxwait:

@@ -65,6 +65,9 @@ jobs:
       - name: PreToolUse guard
         run: bash hooks/test-on-pre-tool.sh
 
+      - name: Session-state status machine
+        run: bash hooks/test-session-state.sh
+
       - name: settings.json clean filter
         run: bash lib/test-strip-automode.sh
 

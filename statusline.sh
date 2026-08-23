@@ -23,17 +23,27 @@ rel_dir="${rel_dir:-/}"
 # Wait-escalation glyph, read from the session's state file (written by
 # hooks/session-state.sh). The longer a session sits waiting on you, the louder
 # it gets:  ○ waiting <2m  →  ● yellow <10m  →  ● red ≥10m. Working/unknown shows
-# nothing, so a live session stays quiet.
+# nothing, so a live session stays quiet. `delegating` (parked on N background
+# subagents) shows a dim ◐(×N) — it isn't asking anything of you — unless it has
+# gone stale (>30m with no event, same window as wezterm.lua's DELEGATE_STALE_S:
+# the counter is stuck), in which case it degrades to the waiting escalation.
 wait_glyph=""
 state_file="$HOME/.claude/state/${session_id}.json"
 if [[ -n "$session_id" && -f "$state_file" ]]; then
-    read -r st since < <(jq -r '"\(.status // "") \(.since // 0)"' "$state_file" 2>/dev/null)
+    read -r st since updated agents < <(jq -r '"\(.status // "") \(.since // 0) \(.updated // 0) \(.agents // 0)"' "$state_file" 2>/dev/null)
+    now=$(printf '%(%s)T' -1)
+    if [[ "$st" == "delegating" && "$updated" =~ ^[0-9]+$ ]] && (( now - updated > 1800 )); then
+        st=waiting
+    fi
     if [[ "$st" == "waiting" && -n "$since" && "$since" != "0" ]]; then
-        age=$(( $(printf '%(%s)T' -1) - since ))
+        age=$(( now - since ))
         if   (( age >= 600 )); then wait_glyph="\033[31m●\033[0m "   # red ≥10m
         elif (( age >= 120 )); then wait_glyph="\033[33m●\033[0m "   # yellow <10m
         else                        wait_glyph="○ "                  # waiting <2m
         fi
+    elif [[ "$st" == "delegating" ]]; then
+        n=""; [[ "$agents" =~ ^[0-9]+$ && "$agents" -gt 1 ]] && n="$agents"
+        wait_glyph="\033[2m◐${n}\033[0m "
     fi
 fi
 

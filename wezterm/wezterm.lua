@@ -2,7 +2,7 @@
 --
 -- Consumes the (terminal-agnostic) data layer built in ~/.claude:
 --   * $HOME/.claude/bin/claude-sessions --json   -> urgency-sorted session records
---   * $HOME/.claude/state/<sid>.json             -> {status, since, wezterm_pane}
+--   * $HOME/.claude/state/<sid>.json             -> {status, since, agents, wezterm_pane}
 --
 -- Provides four things on top of WezTerm:
 --   1. Tab colors that ESCALATE the longer a session waits (format-tab-title).
@@ -85,6 +85,15 @@ local AWAKE_GAP_CAP = 120            -- inter-tick gap over this = suspend; not 
 local WAIT_CACHE    = HOME .. '/.cache/wezterm-fleet-wait.json'
 local TAB_ORDER_CACHE = HOME .. '/.cache/wezterm-fleet-tab-order.json'
 local SAVE_EVERY    = 15             -- persist the awake clock at most this often (s)
+
+-- A `delegating` status (turn parked on background subagents — see
+-- hooks/session-state.sh) is only as fresh as its last event: every SubagentStop
+-- bumps `updated`, so silence beyond this window means the agents counter is
+-- stuck (killed subagent, lost event). Degrade it to waiting so the worst drift
+-- is a LATE ping, never a tab that sleeps forever. statusline.sh and
+-- bin/claude-sessions apply the same window.
+local DELEGATE_STALE_S = 30 * 60
+
 local awake = 0
 local awake_last = nil
 local last_save = 0
@@ -324,6 +333,11 @@ wezterm.on('update-status', function(window, pane)
     if d and d.wezterm_pane then
       local pane_id = tostring(d.wezterm_pane)
       local upd = tonumber(d.updated) or 0
+      -- Stale-delegating degrade, applied at ingest so it's a SINGLE point: the
+      -- wait gradient, Attend, and the hidden-watcher all read the result.
+      if d.status == 'delegating' and (now - upd) > DELEGATE_STALE_S then
+        d.status = 'waiting'
+      end
       -- Pane ids get reused and dead sessions' state files linger, so two files can
       -- claim one pane. The live session keeps writing, so newest `updated` wins —
       -- this is the stale-pane guard the old ●-in-title check used to provide.
@@ -476,7 +490,7 @@ local function trunc(s, n)
 end
 
 -- A one-char status glyph. The hook-owned STATE is authoritative (waiting -> '●',
--- working -> '✳'); we fall back to parsing the title only when there's no state,
+-- working -> '✳', delegating -> '◐'); we fall back to parsing the title only when there's no state,
 -- because Claude Code rewrites the title ('✳ <task>') and can't be trusted to carry
 -- the '●' marker. Surfaced right after the tab number so right-edge truncation can
 -- never swallow it. Idle/clean/unknown -> a dim dot.
@@ -488,15 +502,17 @@ end
 local function status_glyph(st, t)
   if st and st.status == 'waiting' then return '●' end
   if st and st.status == 'working' then return '✳' end
+  if st and st.status == 'delegating' then return '◐' end
   t = t or ''
   if t:match('●%s*$') then return '●' end
+  if t:match('◐%s*$') then return '◐' end
   if t:match('^%s*✳') or t:match('^%s*%*') then return '✳' end
   return '·'
 end
 
 -- Strip the status glyphs so the label spends its columns on real text.
 local function compact_label(t)
-  return (t or ''):gsub('%s*●%s*$', ''):gsub('^%s*✳%s*', ''):gsub('^%s*%*%s*', '')
+  return (t or ''):gsub('%s*●%s*$', ''):gsub('%s*◐%s*$', ''):gsub('^%s*✳%s*', ''):gsub('^%s*%*%s*', '')
 end
 
 -- Branch names that carry no signal when every tab is on them.
@@ -1294,15 +1310,18 @@ config.keys = {
       }, pane)
     end) },
   -- Attend: jump to the left-most tab that is NOT working — a waiting '●' or idle
-  -- '·' tab (same status_glyph the tab bar renders). If already on it, advance to
-  -- the next one, so repeated presses skip past tabs you've decided to leave.
+  -- '·' tab (same status_glyph the tab bar renders). Delegating '◐' tabs are
+  -- skipped like working ones: they wake themselves when their subagents finish.
+  -- If already on it, advance to the next one, so repeated presses skip past
+  -- tabs you've decided to leave.
   { key = 'a',     mods = 'CTRL|SHIFT', action = wezterm.action_callback(function(win, pane)
       local active_id = win:active_tab() and win:active_tab():tab_id() or nil
       local idle, on_first = {}, false
       for i, t in ipairs(win:mux_window():tabs()) do
         local ap = t:active_pane()
         local st = ap and pane_state[tostring(ap:pane_id())] or nil
-        if status_glyph(st, ap and ap:get_title() or '') ~= '✳' then
+        local g = status_glyph(st, ap and ap:get_title() or '')
+        if g ~= '✳' and g ~= '◐' then
           idle[#idle + 1] = i - 1
           if #idle == 1 and t:tab_id() == active_id then on_first = true end
         end

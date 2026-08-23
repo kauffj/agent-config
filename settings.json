@@ -141,6 +141,16 @@
           }
         ]
       }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/session-state.sh"
+          }
+        ]
+      }
     ]
   },
   "worktree": {

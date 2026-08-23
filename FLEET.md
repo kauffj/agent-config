@@ -13,7 +13,7 @@ The visible tab bar is only a front-end. It renders a small, terminal-agnostic
 **data layer** that any tool could consume.
 
 ```
-Claude Code hooks ──► ~/.claude/state/<session_id>.json   {status, since, wezterm_pane, cwd}
+Claude Code hooks ──► ~/.claude/state/<session_id>.json   {status, since, agents, wezterm_pane, cwd}
         │                          ▲
         │                 bin/claude-snapshot  (60s systemd timer)
         │                   • snapshot live sessions for crash recovery
@@ -29,12 +29,24 @@ Claude Code hooks ──► ~/.claude/state/<session_id>.json   {status, since, 
 **Layer 1 — the data layer (works in any terminal).**
 
 - **`hooks/session-state.sh`** is wired into Claude Code's hooks (`SessionStart`,
-  `Stop`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `Notification`).
-  On each event it writes `~/.claude/state/<session_id>.json` with the session's
-  `status` (`working` / `waiting`), `since` (when that status last *changed* — it
-  only moves on a real transition, so "waiting 14m" stays truthful), `wezterm_pane`,
-  and `cwd`. It also sets the terminal tab title with a trailing `●` when the
-  session is waiting on you.
+  `Stop`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `Notification`,
+  `SubagentStop`). On each event it writes `~/.claude/state/<session_id>.json`
+  with the session's `status` (`working` / `waiting` / `delegating`), `since`
+  (when that status last *changed* — it only moves on a real transition, so
+  "waiting 14m" stays truthful), `agents`, `wezterm_pane`, and `cwd`. It also
+  sets the terminal tab title with a trailing `●` when the session is waiting
+  on you, or `◐` when it is `delegating`.
+
+  `delegating` means the turn ended but background subagents are still running —
+  the task notification will wake the session, so it is *not* waiting on you: no
+  ding, no `●`, Attend skips it. The `agents` counter drives it (PreToolUse of
+  the Task/Agent tool increments, `SubagentStop` decrements). Because a killed
+  subagent never fires `SubagentStop`, the counter can only stick *high*, which
+  would silence a tab forever — so every renderer (tab bar, statusline, picker)
+  degrades a `delegating` whose `updated` has been silent >30m back to
+  `waiting`: the worst drift is a late ping, never a missed one. Known gaps that
+  still read as `waiting`: background Bash tasks and Workflow runs, which have
+  no completion event the hook can see.
 - **`bin/claude-sessions --json`** joins those state files into an urgency-sorted
   registry — the list the picker shows.
 - **`bin/claude-search <text>`** greps the transcripts of *live* sessions (ripgrep
