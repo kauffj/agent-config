@@ -15,7 +15,7 @@
 ### 3. Self-Improvement Loop
 - After ANY correction from the user: update `tasks/lessons.md` with a rule that would have prevented the mistake
 - Lessons are injected automatically at session start (SessionStart hook in settings.json); if they didn’t arrive, read `tasks/lessons.md` yourself
-- When a lesson keeps proving itself, graduate it into `instructions/AGENTS.md` — lessons.md is the inbox, not the archive
+- When a lesson keeps proving itself, graduate it into the current project's `AGENTS.md`; update the global canonical instructions only when the lesson is genuinely global — lessons.md is the inbox, not the archive
 
 ### 4. Verification Before Done
 - Never mark a task complete without proving it works: run tests, check logs, demonstrate correctness
@@ -46,6 +46,11 @@
 - Exhaust automated testing and automated review before asking for human review.
 - When you do ask for review, deliver the target ready to look at: open the app, launch the window, link the exact URL or document. Never "go to X and click Y."
 
+### 9. Portable Project Instructions
+- Author shared project guidance in the nearest `AGENTS.md`
+- Keep `CLAUDE.md` as `@AGENTS.md` plus only genuinely Claude-specific behavior
+- Do not create project instruction files when the project has no local guidance, and do not copy global policy into every repository
+
 
 ## Core Principles
 
@@ -58,11 +63,11 @@
 
 ## Deploys & Servers
 
-Every production site runs on one shared droplet. **`~/projects/server-config/SERVER.md` is the single reference** — read it before touching deploys, nginx, systemd, cron, DNS, or backups for any project. Point at it from a project CLAUDE.md; never restate it, or the two copies drift.
+Every production site runs on one shared droplet. **`~/projects/server-config/SERVER.md` is the single reference** — read it before touching deploys, nginx, systemd, cron, DNS, or backups for any project. Point at it from a project's `AGENTS.md`; never restate it, or the two copies drift.
 
 - **Pushing to GitHub `main` IS deploying.** The box self-pulls `main` every minute — a commit ships no matter where it came from. Know this before you push; check the SERVER.md inventory for sites not yet on self-pull.
 - **Never edit `server-config`'s `etc/ usr/ var/ home/ opt/ secrets/`** — one-way live→repo mirror; your edit is reverted. Repo-root `*.md` and `snapshot.sh` *are* source of truth.
-- **Never commit a Claude Code transcript.** `/export` writes into the cwd; transcripts contain connection strings and keys.
+- **Never commit an agent transcript.** Claude Code's `/export` and equivalent harness exports can write into the cwd; transcripts contain connection strings and keys.
 
 
 ## Writing
