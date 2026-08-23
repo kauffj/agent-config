@@ -36,7 +36,9 @@ done <<< "$STAGED"
 if git diff --cached --name-only | grep -qx 'settings.json'; then
     if git show :settings.json | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("autoMode",{}).get("environment") else 1)' 2>/dev/null; then
         fail "settings.json contains autoMode.environment" \
-             "That block is a generated infra dossier (prod hosts, secret locations, deploy mechanics). Strip it with:
+             "That block is a generated infra dossier (prod hosts, secret locations, deploy mechanics). Reaching this message means the clean filter is not configured in this clone — wire it up once and this stops happening:
+     git config filter.strip-automode.clean \"node lib/strip-automode.mjs\"
+   Or strip it by hand this time:
      python3 -c 'import json,collections as c;p=\"settings.json\";d=json.load(open(p),object_pairs_hook=c.OrderedDict);d.get(\"autoMode\",{}).pop(\"environment\",None);open(p,\"w\").write(json.dumps(d,indent=2,ensure_ascii=False)+chr(10))'"
     fi
 fi
