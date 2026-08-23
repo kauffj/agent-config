@@ -8,8 +8,9 @@
 - Use plan mode for verification steps, not just building
 
 ### 2. Subagent Strategy
-- Use subagents liberally — offload research, exploration, and parallel analysis to keep the main context window clean
-- One task per subagent for focused execution; for complex problems, throw more compute at it
+- Use subagents for work that is **read-heavy or parallel**: research, exploration, sweeping many files, independent analyses that can run at once. The win is keeping their output out of the main context, not the delegation itself
+- Do the work directly when you already know which file to open, when the task is a single edit, or when you'd spend more context briefing the agent than doing it. Reaching for one by default is its own kind of ceremony
+- One task per subagent for focused execution; for genuinely hard problems, throw more compute at it
 
 ### 3. Self-Improvement Loop
 - After ANY correction from the user: update `tasks/lessons.md` with a rule that would have prevented the mistake

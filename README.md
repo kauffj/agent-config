@@ -121,7 +121,19 @@ systemctl --user enable --now claude-snapshot.timer claude-transcript-sync.timer
 # integrity check + the pre-commit leak guard
 node ~/.claude/lib/doctor.mjs
 ln -sf ../../hooks/pre-commit ~/.claude/.git/hooks/pre-commit
+
+# keep auto mode's generated infra dossier out of git (see below)
+git -C ~/.claude config filter.strip-automode.clean "node lib/strip-automode.mjs"
 ```
+
+**That last line matters.** Auto mode writes a summary of this machine's
+infrastructure — production hostnames, where secrets live, how deploys work —
+into `settings.json` under `autoMode.environment`. It belongs in the working
+file and never in a public repo. The clean filter (`lib/strip-automode.mjs`,
+wired up by `.gitattributes`) strips it on the way into git, so staging
+`settings.json` cannot carry it even if you forget; `hooks/pre-commit` refuses
+the commit as a backstop when the filter isn't configured. Both are needed: the
+filter is per-clone git config, which a fresh clone does not inherit.
 
 `settings.json` already wires the hooks and the status line; it is read from
 `~/.claude/settings.json`, which the symlink provides.
@@ -129,10 +141,24 @@ ln -sf ../../hooks/pre-commit ~/.claude/.git/hooks/pre-commit
 **Requirements:** WezTerm, `python3`, `jq`, `node`, systemd-user, and ideally
 `ripgrep` (plain `grep` is the fallback).
 
+**Optional, not included:** `claude-grep` (from a separate personal repo at
+`~/projects/claude-beep`) marks a found session's terminal tab. `/find-session`
+searches with the bundled `bin/claude-search` and only reaches for `claude-grep`
+when it is present, so nothing here breaks without it.
+
 **Caveats.** This is one person's live config, published because parts of it are
 generally useful — not a framework. It assumes a `~/projects/<name>` layout, and
 `settings.json` runs with a broad permission allowlist and `defaultMode: auto`,
-which you should read before adopting. `wezterm/families.example.json` is an
+which you should read before adopting.
+
+**On permissions.** The allowlist grants `Bash(*)` — every shell command,
+unprompted. That is a deliberate trade for an autonomous single-operator machine,
+not an oversight, and it is the setting to change first if you adopt this. It
+used to sit above forty specific `Bash(...)` entries that it already subsumed;
+those are gone, because a list that grants nothing reads like the real boundary
+and isn't. The actual boundary is `hooks/on-pre-tool.sh` (target-aware refusals,
+tested by `hooks/test-on-pre-tool.sh`) plus `autoMode.soft_deny`. Defense in
+depth, not the primary control — if you want a real one, narrow `Bash(*)`. `wezterm/families.example.json` is an
 example; copy it to `~/.claude/fleet/families.json` and use absolute paths (the
 `cwd` is handed to WezTerm verbatim — no `~` or `$HOME` expansion).
 

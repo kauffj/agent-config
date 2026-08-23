@@ -14,11 +14,18 @@ Runs review agents in parallel over a set of changed files with context. Works a
 When a running dev server and/or screenshot directory are provided, also runs functional-QA and visual-review agents.
 
 **Agents** (in `$HOME/.claude/agents/`):
-- `security-reviewer.md` — always
-- `simplicity-reviewer.md` — always
+- `security-reviewer.md` — whenever any executable code changed
+- `simplicity-reviewer.md` — whenever any executable code changed
 - `ui-reviewer.md` — if any frontend files changed
 - `qa-tester.md` — if `--server <url>` provided
 - `visual-reviewer.md` — if `--screenshots <dir>` provided
+
+**On gating.** The only gate on the security and simplicity reviewers is
+mechanical: did any executable code change at all (Step 2)? Deciding by topic —
+"this diff doesn't touch auth, skip security" — requires having done the review
+to know, and the cost of being wrong is asymmetric: a wasted agent versus a
+missed vulnerability. Prose-only changes are the one case that needs no judgment
+to rule out.
 
 **Reference files:**
 - `$HICKEY_PRINCIPLES` and `$UI_PRINCIPLES` are set via settings.json env
@@ -80,9 +87,23 @@ Parse comma-separated paths from `--files`. Each path is relative to the current
 
 ---
 
-## Step 2: Identify frontend files
+## Step 2: Classify the changed files
 
-Frontend files = `.tsx`, `.jsx`, `.ts`/`.js` under `components/`, `app/`, or `pages/`, `.css`, `.scss`, `.vue`, `.svelte`. If any changed, the UI reviewer runs.
+**Is there any code at all?** *Prose-only* = every changed path is documentation
+or an asset: `.md`, `.txt`, `.rst`, `LICENSE`, `.gitignore`, or an image
+(`.png`, `.jpg`, `.svg`, `.gif`, `.webp`).
+
+If the change is prose-only, skip the security and simplicity reviewers, say so
+in one line ("prose-only change — no code reviewers run"), and go to Step 4 with
+whatever agents the flags enabled. Otherwise both run.
+
+That is the whole gate. Do not narrow it further by guessing which *kind* of code
+changed — a config file, a migration, and a one-line helper are all places a real
+finding lives.
+
+**Are there frontend files?** `.tsx`, `.jsx`, `.ts`/`.js` under `components/`,
+`app/`, or `pages/`, `.css`, `.scss`, `.vue`, `.svelte`. If any changed, the UI
+reviewer runs.
 
 ---
 
@@ -90,7 +111,7 @@ Frontend files = `.tsx`, `.jsx`, `.ts`/`.js` under `components/`, `app/`, or `pa
 
 **Launch all applicable agents in a single message.** Each agent's persona + criteria are in its agent file — read the file and use it as the base prompt, then append the context listed below.
 
-### 3a. Security Review (always)
+### 3a. Security Review (unless prose-only, per Step 2)
 
 Agent: `$HOME/.claude/agents/security-reviewer.md`
 
@@ -99,7 +120,7 @@ Append:
 - Diff for context: [INSERT DIFF]
 - Instruction: also read any auth utilities, middleware, or session helpers the changed code interacts with.
 
-### 3b. Simplicity Review (always)
+### 3b. Simplicity Review (unless prose-only, per Step 2)
 
 Agent: `$HOME/.claude/agents/simplicity-reviewer.md`
 
