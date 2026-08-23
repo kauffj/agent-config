@@ -34,7 +34,6 @@ On first run after upgrading, the helpers auto-relocate any legacy state from `.
   "status": "active|done|abandoned",
   "dbName": "myapp_dev_ws_member_event_rsvp",
   "dbIsolation": "template|none",
-  "dbAdminUrl": "postgresql://user:pass@localhost:5432/postgres",
   "pipeline": { "skill": "feature", "step": 4, "plan": "..." },
   "createdAt": "...",
   "updatedAt": "..."
@@ -43,7 +42,9 @@ On first run after upgrading, the helpers auto-relocate any legacy state from `.
 
 Status is one of three: `active`, `done`, `abandoned`. The `pipeline` sub-object is caller-owned (e.g. `/feature` stores its step and approved plan there). `/workspace` doesn't interpret it.
 
-The `db*` fields track an isolated per-workspace database (see Create Step 6 and the shared **Clean up workspace resources** teardown). `dbName` is null when no DB was provisioned (`dbIsolation: "none"`, or `--db shared`). `dbAdminUrl` is the maintenance connection (the `postgres` DB) used to drop the workspace DB at teardown, derived once at create time so teardown never re-parses the env.
+The `db*` fields track an isolated per-workspace database (see Create Step 6 and the shared **Clean up workspace resources** teardown). `dbName` is null when no DB was provisioned (`dbIsolation: "none"`, or `--db shared`).
+
+**No connection string is ever stored in the record.** The maintenance URL used to drop the database carries the dev password, and this record is printed verbatim by `/workspace get` — into the transcript, and from there into anything that exports one. It is derived on demand instead, by the same two lines in Create and in teardown, from `$ENV_FILE` in the MAIN checkout.
 
 ---
 
@@ -119,18 +120,19 @@ Parse `--kind` (default `feature`), `--name` (default: derive from description),
    : "${DB_TEMPLATE:?dbTemplate is empty}" "${DB_URL_VARS:?dbUrlVars is empty}"
    # Per-workspace DB name: <template>_ws_<name>, sanitized + truncated to 63 chars.
    DB_NAME=$(printf '%s_ws_%s' "$DB_TEMPLATE" "$NAME" | tr -c 'a-zA-Z0-9_' '_' | cut -c1-63)
-   # Admin URL = primary DB URL with the path swapped to the `postgres` maintenance DB.
-   PRIMARY_URL=$(grep -E "^\s*DATABASE_URL\s*=" "$ENV_FILE" | head -1 | sed -E 's/^[^=]*=\s*//; s/^["'"'"']//; s/["'"'"']$//')
-   DB_ADMIN_URL=$(node -e 'const u=new URL(process.argv[1]); u.pathname="/postgres"; console.log(u.href)' "$PRIMARY_URL")
+   DB_ADMIN_URL=$(db_admin_url)   # see "Derive the admin URL" below
    ```
 
    Provision the clone. Postgres refuses `TEMPLATE` while anything else is
    connected to the template, and on a working machine something usually is (a
    dev server on :3000 holds a pool against `$DB_TEMPLATE`). That is the common
    case, not the exception — so terminate IDLE connections and retry once before
-   giving up. If it still fails (no `psql`, no `CREATEDB` privilege, an ACTIVE
-   query), **do not abort** — warn, fall back to the shared DB, and clear
-   `DB_NAME`:
+   giving up.
+
+   **If it still fails, FAIL CLOSED.** Isolation was asked for; silently handing
+   back a worktree wired to the shared dev DB looks identical to success and is
+   discovered later, as colliding migrations. Tear the half-built workspace down
+   and stop, naming the one command that proceeds deliberately:
    ```bash
    create_db() {
      psql "$DB_ADMIN_URL" -v ON_ERROR_STOP=1 \
@@ -146,31 +148,46 @@ Parse `--kind` (default `feature`), `--name` (default: derive from description),
      if create_db; then
        node $HOME/.claude/lib/workspace.mjs rewrite-env-db "$WORKTREE_PATH/$ENV_FILE" "$DB_NAME" $DB_URL_VARS
      else
-       echo "WARN: DB provisioning failed — worktree will use the shared dev DB ($DB_TEMPLATE)."
-       DB_NAME=""
+       git worktree remove "$WORKTREE_PATH" --force 2>/dev/null
+       echo "ABORTED: could not create an isolated database for '$NAME'." >&2
+       echo "Something holds an ACTIVE query against $DB_TEMPLATE, or psql/CREATEDB is unavailable." >&2
+       echo "Stop that process and retry, or run deliberately without isolation:" >&2
+       echo "  /workspace new \"$DESCRIPTION\" --name $NAME --db shared" >&2
+       exit 1
      fi
    fi
    ```
    (Terminating an idle pool connection is safe — the dev server reconnects on
-   its next query. If it still fails, something holds an ACTIVE query against
-   `$DB_TEMPLATE`: stop that process and retry, or proceed with `--db shared`.
-   Falling back means the worktree shares the dev DB, so concurrent migrations
-   can collide — see the drizzle-cursor failure `npm run db:audit` catches.)
+   its next query. The workspace record is not written until step 8, so an abort
+   here leaves nothing behind but the branch.)
 
-7. **Install deps** in the worktree:
+   **Derive the admin URL** (`db_admin_url`) — the `postgres` maintenance
+   database on the same server as the dev DB. Used here and again at teardown;
+   never stored:
    ```bash
-   : "${WORKTREE_PATH:?set WORKTREE_PATH before installing}"
-   cd "$WORKTREE_PATH" && $INSTALL_CMD
+   db_admin_url() {
+     local env_file="${1:-$ENV_FILE}"
+     local primary
+     primary=$(grep -E "^\s*DATABASE_URL\s*=" "$env_file" | head -1 | sed -E 's/^[^=]*=\s*//; s/^["'"'"']//; s/["'"'"']$//')
+     [ -n "$primary" ] || return 1
+     node -e 'const u=new URL(process.argv[1]); u.pathname="/postgres"; console.log(u.href)' "$primary"
+   }
    ```
 
-8. **Record** the workspace. When a DB was provisioned, include `dbName`/`dbIsolation`/`dbAdminUrl`; otherwise leave them null:
+7. **Install deps** in the worktree. `$INSTALL_CMD` is `null` for a project
+   with no dependency step — skip this rather than inventing one:
+   ```bash
+   : "${WORKTREE_PATH:?set WORKTREE_PATH before installing}"
+   [ "$INSTALL_CMD" = "null" ] || (cd "$WORKTREE_PATH" && $INSTALL_CMD)
+   ```
+
+8. **Record** the workspace. When a DB was provisioned, include `dbName`/`dbIsolation`; otherwise leave them null:
    ```bash
    node $HOME/.claude/lib/workspace.mjs create "$(jq -n --arg n "$NAME" --arg k "$KIND" --arg d "$DESCRIPTION" --arg b "$BRANCH" --arg w "$WORKTREE_PATH" --argjson p $PORT --arg e "$ENV_FILE" --arg s "/tmp/${REPO_NAME}-screenshots-${NAME}" \
-     --arg db "$DB_NAME" --arg dba "$DB_ADMIN_URL" \
+     --arg db "$DB_NAME" \
      '{name:$n, kind:$k, description:$d, branch:$b, worktreePath:$w, port:$p, envFile:$e, screenshotDir:$s, status:"active",
        dbName:(if $db=="" then null else $db end),
-       dbIsolation:(if $db=="" then "none" else "template" end),
-       dbAdminUrl:(if $db=="" then null else $dba end)}')"
+       dbIsolation:(if $db=="" then "none" else "template" end)}')"
    ```
 
 9. **Report.** Tell the user the workspace name, worktree path, and port. Callers that need to consume the record programmatically should read it back with `node $HOME/.claude/lib/workspace.mjs get <NAME>` — that's the source of truth.
@@ -237,7 +254,7 @@ Returns non-zero if not found.
        # Re-point at the EXISTING per-workspace DB only; never provision on resume.
        [ -n "$DB_NAME" ] && node $HOME/.claude/lib/workspace.mjs rewrite-env-db "<worktreePath>/$ENV_FILE" "$DB_NAME" $DB_URL_VARS
      fi
-     (cd "<worktreePath>" && $INSTALL_CMD)
+     [ "$INSTALL_CMD" = "null" ] || (cd "<worktreePath>" && $INSTALL_CMD)
      ```
    - Branch gone → say: "Both worktree and branch are gone for '<name>'. Consider `/workspace remove <name>`." **Stop.**
 
@@ -251,14 +268,20 @@ Returns non-zero if not found.
 
 Shared teardown used by **Abandon**, **Remove**, and **Done**. Idempotent — safe to run more than once.
 
-1. **Drop the isolated database** if the record has one. Read `dbName`/`dbAdminUrl` from the record (do not re-parse any env file — teardown is a pure function of the stored record):
+1. **Drop the isolated database** if the record has one. The record supplies the
+   identity (`dbName`); the connection is derived from the MAIN checkout's env
+   with the same `db_admin_url` helper Create uses, so no credential is ever
+   stored. Run this from the main checkout:
    ```bash
    REC=$(node $HOME/.claude/lib/workspace.mjs get <NAME>)
    DB_NAME=$(echo "$REC" | jq -r '.dbName // empty')
-   DB_ADMIN_URL=$(echo "$REC" | jq -r '.dbAdminUrl // empty')
+   ENV_FILE=$(node $HOME/.claude/lib/project.mjs load | jq -r '.envFile // empty')
+   DB_ADMIN_URL=$([ -n "$ENV_FILE" ] && [ -f "$ENV_FILE" ] && db_admin_url "$ENV_FILE")
    if [ -n "$DB_NAME" ] && [ -n "$DB_ADMIN_URL" ]; then
      psql "$DB_ADMIN_URL" -c "DROP DATABASE IF EXISTS \"$DB_NAME\" WITH (FORCE);" \
        || echo "WARN: could not drop database $DB_NAME — drop it manually if it lingers."
+   elif [ -n "$DB_NAME" ]; then
+     echo "WARN: $DB_NAME was not dropped — no usable DATABASE_URL in the main checkout's $ENV_FILE."
    fi
    ```
    (`WITH (FORCE)` terminates the worktree dev server's lingering connections; requires PostgreSQL 13+.)
