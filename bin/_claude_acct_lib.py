@@ -982,7 +982,10 @@ def cmd_status():
 
 # ------------------------------------------------------- credential collection
 
-BROWSER_SHIM = CLAUDE_DIR / "bin" / "claude-acct-browser"
+# Resolved from this file, not from ~/.claude: the shim is this module's
+# sibling, so it is found whether the repo is reached through the symlink, from
+# a plain checkout, or by CI — where $HOME is not an install at all.
+BROWSER_SHIM = Path(__file__).resolve().parent / "claude-acct-browser"
 BROWSER_ROOT = Path.home() / ".claude-browsers"
 BRAVE_DIR = Path.home() / ".config" / "BraveSoftware" / "Brave-Browser"
 HOST_NAME = "com.anthropic.claude_code_browser_extension"

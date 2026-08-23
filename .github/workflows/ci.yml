@@ -1,0 +1,74 @@
+name: CI
+
+# What a fresh clone must satisfy. Everything here runs against the checkout
+# alone: no ~/.claude symlink, no runtime state, no installed timers. That is
+# deliberate — the failure this catches is "works on the author's machine",
+# which is exactly the shape of bug an installed-in-place config invites.
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Python test suites
+        run: |
+          python3 bin/test_claude_sessions_lib.py -v
+          python3 bin/test_claude_acct.py
+
+      - name: Python syntax
+        run: |
+          # Tracked .py files, plus the extensionless scripts with a python shebang.
+          mapfile -t files < <(git ls-files '*.py')
+          while IFS= read -r f; do
+            head -1 "$f" | grep -q '^#!.*python' && files+=("$f")
+          done < <(git ls-files 'bin/*' | grep -v '\.')
+          printf '%s\n' "${files[@]}" | sort -u | xargs python3 -m py_compile
+
+      - name: Node syntax
+        run: git ls-files '*.mjs' '*.js' | xargs -r -n1 node --check
+
+      - name: Shell syntax
+        run: |
+          mapfile -t files < <(git ls-files '*.sh')
+          while IFS= read -r f; do
+            head -1 "$f" | grep -qE '^#!.*(bash|sh)$' && files+=("$f")
+          done < <(git ls-files 'bin/*' 'hooks/*' | grep -v '\.')
+          printf '%s\n' "${files[@]}" | sort -u | xargs -r -n1 bash -n
+
+      - name: ShellCheck
+        # Errors only for now: the existing scripts carry style/info findings
+        # that are not worth a red build. Raise the severity when they're clean.
+        run: git ls-files '*.sh' | xargs -r shellcheck --severity=error
+
+      - name: JSON parses
+        run: |
+          git ls-files '*.json' | while read -r f; do
+            python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$f" \
+              || { echo "invalid JSON: $f"; exit 1; }
+          done
+
+      - name: PreToolUse guard
+        run: bash hooks/test-on-pre-tool.sh
+
+      - name: settings.json clean filter
+        run: bash lib/test-strip-automode.sh
+
+      - name: Config integrity (doctor)
+        # Must be clean on a bare checkout: references to runtime paths are
+        # warnings, only a genuinely dangling source reference is an error.
+        run: node lib/doctor.mjs
