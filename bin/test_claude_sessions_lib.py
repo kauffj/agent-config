@@ -8,6 +8,7 @@ Claude actually names transcript directories on this disk, so the end-to-end
 test reads the real ones rather than inventing them.
 """
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -368,6 +369,99 @@ class TestVendorTranscriptReader(unittest.TestCase):
             self.assertIn(os.path.basename(root.rstrip("/")) and "session",
                           text.split("\n")[0])
             self.assertNotIn("<INSTRUCTIONS>", text)
+
+class TestSessionTopic(unittest.TestCase):
+    """The picker's topic column must honor /rename: the custom-title event
+    beats the generated ai-title, which Claude Code KEEPS re-emitting after a
+    rename (2026-08-24: rename showed no effect in the picker because the
+    scan returned the first ai-title and never read custom-title at all)."""
+
+    @classmethod
+    def setUpClass(cls):
+        from importlib.machinery import SourceFileLoader
+        cls.cs = SourceFileLoader(
+            "cs", os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                               "claude-sessions")).load_module()
+
+    def _write(self, events, pad_bytes=0):
+        f = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
+        self.addCleanup(os.unlink, f.name)
+        if pad_bytes:
+            filler = {"type": "assistant", "message": {"content": "x" * 512}}
+            line = json.dumps(filler) + "\n"
+            for _ in range(pad_bytes // len(line) + 1):
+                f.write(line)
+        for ev in events:
+            f.write(json.dumps(ev) + "\n")
+        f.close()
+        return f.name
+
+    def test_rename_beats_a_later_ai_title(self):
+        # Observed transcript shape: custom-title and the stale ai-title are
+        # re-emitted as adjacent pairs, ai-title last.
+        path = self._write([
+            {"type": "ai-title", "aiTitle": "Generated title"},
+            {"type": "custom-title", "customTitle": "my-name"},
+            {"type": "ai-title", "aiTitle": "Generated title"},
+        ])
+        self.assertEqual(self.cs._current_titles(path),
+                         ("my-name", "Generated title"))
+
+    def test_newest_rename_wins(self):
+        path = self._write([
+            {"type": "custom-title", "customTitle": "first"},
+            {"type": "custom-title", "customTitle": "second"},
+        ])
+        self.assertEqual(self.cs._current_titles(path)[0], "second")
+
+    def test_titles_are_read_from_the_tail_of_a_big_file(self):
+        path = self._write([{"type": "custom-title", "customTitle": "deep"}],
+                           pad_bytes=self.cs._TITLE_TAIL_BYTES + 4096)
+        self.assertEqual(self.cs._current_titles(path), ("deep", None))
+
+    def test_a_title_beyond_the_tail_reads_as_none(self):
+        # Claude re-emits titles every few turns, so "nothing in the tail"
+        # means "no title" — the fallback (founding input) takes over.
+        f = tempfile.NamedTemporaryFile("w", suffix=".jsonl", delete=False)
+        self.addCleanup(os.unlink, f.name)
+        f.write('{"type": "ai-title", "aiTitle": "buried"}\n')
+        line = '{"type": "assistant", "message": {"content": "%s"}}\n' % ("x" * 512)
+        for _ in range(self.cs._TITLE_TAIL_BYTES // len(line) + 2):
+            f.write(line)
+        f.close()
+        self.assertEqual(self.cs._current_titles(f.name), (None, None))
+
+    def test_harness_commands_are_not_a_founding_input(self):
+        # "/model fable" identifies nothing; the real prompt in the next
+        # event is the session's identity.
+        ev = {"type": "user", "message": {"role": "user", "content":
+              "<command-name>/model</command-name><command-args>fable</command-args>"}}
+        self.assertIsNone(self.cs._founding_input(ev))
+
+    def test_substantive_commands_still_count(self):
+        ev = {"type": "user", "message": {"role": "user", "content":
+              "<command-name>/plan</command-name><command-args>migrate auth</command-args>"}}
+        self.assertEqual(self.cs._founding_input(ev), "/plan migrate auth")
+
+    def test_image_paste_caveat_does_not_hide_the_prompt(self):
+        # An image paste puts a caveat text block ahead of the typed text;
+        # only reading the first block made such sessions topicless.
+        ev = {"type": "user", "message": {"role": "user", "content": [
+            {"type": "text", "text": "Caveat: the messages below were pasted"},
+            {"type": "image", "source": {}},
+            {"type": "text", "text": "fix the login flow"},
+        ]}}
+        self.assertEqual(self.cs._founding_input(ev), "fix the login flow")
+
+    def test_clip_cuts_at_a_word_with_ellipsis(self):
+        s = "one two three four five six seven eight nine ten eleven twelve"
+        out = self.cs._clip(s, 44)
+        self.assertTrue(out.endswith("…"))
+        body = out[:-1]
+        self.assertTrue(body and s.startswith(body))
+        self.assertFalse(body.endswith(" "))
+        self.assertEqual(self.cs._clip("short", 44), "short")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

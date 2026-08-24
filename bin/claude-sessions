@@ -38,9 +38,19 @@ def _load(path):
 _CMD_RE = re.compile(r"<command-name>(.*?)</command-name>", re.S)
 _ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.S)
 
+TOPIC_LIMIT = 60
 
-def _clip(s, limit):
-    return " ".join((s or "").split())[:limit]
+
+def _clip(s, limit=TOPIC_LIMIT):
+    """Squeeze whitespace and cut to `limit` — at a word boundary when one is
+    reasonably near, with an ellipsis so a cut never reads as the whole."""
+    s = " ".join((s or "").split())
+    if len(s) <= limit:
+        return s
+    cut = s[:limit]
+    if " " in cut[limit // 2:]:
+        cut = cut[:cut.rfind(" ")]
+    return cut + "…"
 
 
 def _plain(txt):
@@ -54,31 +64,49 @@ def _plain(txt):
     return txt
 
 
-def _user_text(ev):
+def _user_texts(ev):
     c = (ev.get("message") or {}).get("content")
     if isinstance(c, str):
-        return c
+        return [c]
     if isinstance(c, list):
-        for b in c:
-            if isinstance(b, dict) and b.get("type") == "text":
-                return b.get("text") or ""
-    return ""
+        return [b.get("text") or "" for b in c
+                if isinstance(b, dict) and b.get("type") == "text"]
+    return []
+
+
+# Commands that configure the harness rather than say what the session is
+# for: as a founding input they identify nothing ("/model fable" could open
+# any session), so scanning continues past them to the first substantive one.
+_NOISE_CMDS = frozenset((
+    "clear", "compact", "config", "context", "cost", "doctor", "exit",
+    "export", "fast", "help", "hooks", "ide", "login", "logout", "mcp",
+    "memory", "model", "output-style", "permissions", "quit", "rc",
+    "release-notes", "rename", "resume", "status", "statusline",
+    "terminal-setup", "usage", "vim",
+))
 
 
 def _founding_input(ev):
-    """The session's first substantive input, for sessions with no ai-title: a
-    slash-command invocation ('/plan migrate auth'), a human-typed prompt, or a
-    queued prompt. None if this event isn't one of those."""
+    """The session's first substantive input, for sessions with no title: a
+    slash-command invocation ('/plan migrate auth'), a human-typed prompt, or
+    a queued prompt. None if this event isn't one of those. Every text block
+    is tried, not just the first — an image paste puts a caveat block ahead
+    of what the person actually typed."""
     t = ev.get("type")
     if t == "user" and not ev.get("isMeta"):
-        txt = _user_text(ev)
-        m = _CMD_RE.search(txt)
-        if m:
-            args = _ARGS_RE.search(txt)
-            return ("%s %s" % (m.group(1).strip(),
-                               args.group(1).strip() if args else "")).strip()
-        return _plain(txt) or None
-    if t == "queue-operation" and ev.get("operation") == "enqueue":
+        for txt in _user_texts(ev):
+            m = _CMD_RE.search(txt)
+            if m:
+                cmd = m.group(1).strip()
+                if cmd.lstrip("/") in _NOISE_CMDS:
+                    continue
+                args = _ARGS_RE.search(txt)
+                return ("%s %s" % (cmd, args.group(1).strip() if args else "")
+                        ).strip()
+            txt = _plain(txt)
+            if txt:
+                return txt
+    elif t == "queue-operation" and ev.get("operation") == "enqueue":
         return _plain(ev.get("content")) or None
     return None
 
@@ -89,7 +117,7 @@ _CODEX_INJECTED = ("# AGENTS.md", "<INSTRUCTIONS>", "<environment_context>",
                    "<user_instructions>")
 
 
-def _codex_topic(path, limit=44):
+def _codex_topic(path, limit=TOPIC_LIMIT):
     """First real user turn of a Codex rollout. Codex writes no title event, so
     the opening prompt is the only thing that says what the session is about —
     once the injected instruction preamble is skipped."""
@@ -117,37 +145,70 @@ def _codex_topic(path, limit=44):
     return ""
 
 
-def _topic(sid, cwd, limit=44):
-    """Claude Code's generated session title, so same-project/same-branch sessions
-    are distinguishable by what they're actually about. Read from the first
-    'ai-title' event in the transcript (set early, so we can stop there and keep
-    picker latency low). Command-started sessions (/plan, /feature, ...) often
-    never get an ai-title, so fall back to the session's founding input — the
-    first slash-command invocation, human-typed prompt, or queued prompt. The
-    substring gates keep the scan cheap: once a fallback is banked, only
-    ai-title lines are parsed."""
+# Claude Code re-emits the title event(s) every few turns, so the CURRENT
+# title always sits near EOF (measured 2026-08-24: within ~31KB across every
+# live transcript) and the read stays O(tail) however big the file grows.
+_TITLE_TAIL_BYTES = 256 * 1024
+_FOUNDING_SCAN_LINES = 400   # founding input, if any, is in the first turns
+
+
+def _current_titles(path):
+    """(custom, ai): the newest custom-title (/rename) and ai-title events in
+    the transcript's tail. (None, None) when the tail has neither — which,
+    given the re-emission, means the session has no title at all."""
+    custom = ai = None
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - _TITLE_TAIL_BYTES))
+            lines = f.read().split(b"\n")
+        if size > _TITLE_TAIL_BYTES:
+            lines = lines[1:]          # partial first line
+        for raw in lines:
+            if b'"custom-title"' not in raw and b'"ai-title"' not in raw:
+                continue
+            try:
+                ev = json.loads(raw)
+            except ValueError:
+                continue
+            if ev.get("type") == "custom-title" and ev.get("customTitle"):
+                custom = ev["customTitle"]
+            elif ev.get("type") == "ai-title" and ev.get("aiTitle"):
+                ai = ev["aiTitle"]
+    except OSError:
+        pass
+    return custom, ai
+
+
+def _topic(sid, cwd, limit=TOPIC_LIMIT):
+    """What a session is about, by authority: the user's /rename
+    (custom-title) beats Claude Code's generated ai-title — which keeps being
+    re-emitted AFTER a rename, so precedence is by type, not recency — and
+    either beats the fallback, the session's founding input (command-started
+    sessions often never get a title)."""
     if not cwd:
         return ""
     path = os.path.join(_project_dir(cwd), sid + ".jsonl")
+    custom, ai = _current_titles(path)
+    if custom or ai:
+        return _clip(custom or ai, limit)
     fallback = None
     try:
         with open(path, encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                if '"ai-title"' in line:
-                    try:
-                        ev = json.loads(line)
-                    except ValueError:
-                        continue
-                    if ev.get("type") == "ai-title" and ev.get("aiTitle"):
-                        return _clip(ev["aiTitle"], limit)
-                elif fallback is None and ('"user"' in line
-                                           or "command-name" in line
-                                           or "queue-operation" in line):
+            for _ in range(_FOUNDING_SCAN_LINES):
+                line = f.readline()
+                if not line:
+                    break
+                if ('"user"' in line or "command-name" in line
+                        or "queue-operation" in line):
                     try:
                         ev = json.loads(line)
                     except ValueError:
                         continue
                     fallback = _founding_input(ev)
+                    if fallback:
+                        break
     except OSError:
         return ""
     return _clip(fallback, limit)
@@ -252,7 +313,7 @@ def records():
             # an ai-title event, Grok writes summary.json (handed over by the
             # adapter), Codex has neither so its opening prompt is parsed.
             "topic": (_topic(sid, cwd) if vendor == "claude"
-                      else _clip(info["topic"], 44) if info.get("topic")
+                      else _clip(info["topic"]) if info.get("topic")
                       else _codex_topic(info.get("transcript") or "")
                       if vendor == "codex" else ""),
             "pid": info.get("pid"),
