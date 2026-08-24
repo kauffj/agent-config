@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+// Single-user bootstrap: paths are validated before mutation, but another
+// same-user process can edit these files directly and must not race this one.
+
 const {
   lstatSync,
   mkdirSync,
@@ -74,7 +77,9 @@ function inspectLink(spec, classifyTarget) {
   return {
     kind: 'conflict',
     linkTarget,
-    message: `points to ${quoted(linkTarget)}, not ${quoted(spec.targetPath)}`,
+    message: resolvedTarget === null
+      ? `is dangling (target ${quoted(linkTarget)})`
+      : `points to ${quoted(linkTarget)}, not ${quoted(spec.targetPath)}`,
   };
 }
 
@@ -96,8 +101,26 @@ function inspectParent(home, linkPath) {
   return null;
 }
 
+function inspectSource(spec) {
+  let resolvedTarget;
+  let stat;
+  try {
+    resolvedTarget = realpathSync(spec.targetPath);
+    stat = statSync(spec.targetPath);
+  }
+  catch (error) {
+    if (error.code === 'ENOENT' || error.code === 'ENOTDIR') return 'does not exist';
+    throw error;
+  }
+  if (resolvedTarget !== spec.targetPath) {
+    return `resolves to ${quoted(resolvedTarget)}, not its canonical source path`;
+  }
+  const correctType = spec.targetType === 'directory' ? stat.isDirectory() : stat.isFile();
+  return correctType ? null : `is not a ${spec.targetType}`;
+}
+
 function putLink(spec, replace, classifyTarget) {
-  mkdirSync(dirname(spec.linkPath), { recursive: true });
+  mkdirSync(dirname(spec.linkPath), { recursive: true, mode: 0o700 });
   if (!replace) {
     symlinkSync(spec.targetPath, spec.linkPath);
     return;
@@ -142,6 +165,9 @@ async function main() {
   const layoutUrl = pathToFileURL(join(repo, 'lib/harness-layout.mjs')).href;
   const { classifyHarnessLinkTarget, resolveHarnessLinks } = await import(layoutUrl);
   const links = resolveHarnessLinks(repo, home);
+  const sourceProblems = links
+    .map((spec) => ({ spec, problem: inspectSource(spec) }))
+    .filter(({ problem }) => problem !== null);
   const parentChecks = links.map((spec) => ({
     spec,
     problem: inspectParent(home, spec.linkPath),
@@ -153,17 +179,29 @@ async function main() {
 
   if (args[0] === '--check') {
     const problems = findings.filter(({ status }) => status.kind !== 'correct');
-    if (problems.length === 0 && parentProblems.length === 0) {
+    if (problems.length === 0 && parentProblems.length === 0 && sourceProblems.length === 0) {
       process.stdout.write('agent-config: all discovery links are configured\n');
       return;
     }
     process.stdout.write('agent-config check:\n');
+    for (const { spec, problem } of sourceProblems) {
+      process.stdout.write(`  - source ${quoted(spec.targetPath)}: ${problem}\n`);
+    }
     for (const problem of parentProblems) process.stdout.write(`  - ${problem}\n`);
     for (const { spec, status } of problems) {
       const suffix = status.kind === 'legacy'
         ? `uses the legacy target ${quoted(status.linkTarget)}`
         : status.message;
       process.stdout.write(`  - ${displayPath(home, spec.linkPath)}: ${suffix}\n`);
+    }
+    process.exitCode = 1;
+    return;
+  }
+
+  if (sourceProblems.length > 0) {
+    process.stderr.write('agent-config: refusing to install from invalid source targets:\n');
+    for (const { spec, problem } of sourceProblems) {
+      process.stderr.write(`  - ${quoted(spec.targetPath)}: ${problem}\n`);
     }
     process.exitCode = 1;
     return;

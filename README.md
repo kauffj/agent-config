@@ -130,14 +130,20 @@ git -C ~/.claude config filter.strip-automode.clean "node lib/strip-automode.mjs
 ```
 
 The installer derives the repository path from its own location and creates
-exactly four links: the neutral `~/.config/agent-config` source alias,
-`~/.claude`, Codex's `~/.codex/AGENTS.md`, and the shared
-`~/.agents/skills`. It is idempotent and refuses to replace unrecognized files,
-directories, or links. The only automatic migration is the former
-`~/.codex/AGENTS.md -> ../.claude/CLAUDE.md` link. It deliberately creates no
-`~/.grok/AGENTS.md`: Grok already discovers the canonical policy through its
-Claude compatibility layer and the shared skills path. It refuses noncanonical
-HOME paths and symlinked or non-directory configuration parents.
+exactly five links: the neutral `~/.config/agent-config` source alias,
+`~/.claude`, Codex's `~/.codex/AGENTS.md`, Grok's `~/.grok/AGENTS.md`, and the
+shared `~/.agents/skills`. Codex and Grok both point directly to the canonical
+policy; Grok discovers Claude instruction files but does not expand Claude's
+`@...` imports. The installer is idempotent and refuses to replace unrecognized
+files, directories, or links. The only automatic migration is the former
+`~/.codex/AGENTS.md -> ../.claude/CLAUDE.md` link. It refuses noncanonical HOME
+paths, invalid source targets, and symlinked or non-directory configuration
+parents before changing the home directory.
+
+Run it as the target user, never through `sudo`. It is a single-user bootstrap
+tool and assumes another process is not concurrently rewriting the same
+configuration paths; it is not a security boundary against processes already
+running as that user.
 
 **That last line matters.** Auto mode writes a summary of this machine's
 infrastructure — production hostnames, where secrets live, how deploys work —
@@ -179,13 +185,18 @@ example; copy it to `~/.claude/fleet/families.json` and use absolute paths (the
 ## Portability boundary
 
 This installation makes instruction and skill *discovery* reproducible across
-Claude, Codex, and Grok. It does not pretend their runtime contracts are the
-same. Follow-on work remains deliberately separate: fixing fleet consumers that
-drop vendor metadata; removing Claude-specific paths and tool names from shared
-skill bodies; adding native agent manifests, normalized hook adapters, and MCP
-capability mappings; and migrating project repositories to canonical
-`AGENTS.md` files. Neutral command aliases or moving runtime state can wait
-until either has a concrete benefit.
+Claude, Codex, and Grok. Project files, branches, worktrees, task plans, and
+commits are the durable state shared between them; each harness keeps and
+resumes its own sessions. This repository does not translate transcripts or
+try to make one harness resume another's session.
+
+Follow-on work should stay thin and evidence-driven: migrate project guidance
+to canonical `AGENTS.md` files, remove unnecessary Claude-specific paths and
+tool names from otherwise shared skills, and add a vendor adapter only where a
+real incompatibility requires one. Hooks, permissions, session stores, and UI
+preferences remain native to each harness. Existing standards and tools should
+be preferred over a new session daemon, plugin runtime, or terminal/worktree
+manager.
 
 ## Not in this repo
 
