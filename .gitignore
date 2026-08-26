@@ -26,8 +26,15 @@ image-cache/
 projects/
 todos/
 plans/
-tasks/
 .workspaces/
+
+# tasks/ is per-task scratch and stays local — EXCEPT lessons.md, which is
+# the self-improvement inbox that graduates into CLAUDE.md. That is
+# accumulated judgment, not runtime state, and it is the one file here that
+# cannot be regenerated, so it gets version control rather than one disk.
+# (papercuts.md stays local: it names properties this repo is scrubbed of.)
+tasks/*
+!tasks/lessons.md
 
 # Installed plugins (managed by Claude Code)
 plugins/

@@ -23,11 +23,11 @@ Windows without work, and the interesting parts assume all three.
 |---|---|
 | **[`FLEET.md`](FLEET.md)** | The fleet control plane — a terminal-agnostic data layer, and a WezTerm tab bar that renders it. Wait-color escalation, fuzzy session picker, transcript search, snooze-and-reopen. |
 | **[`bin/README.md`](bin/README.md)** | Durability and resurrection — fsync'ing transcripts against unclean shutdowns, restoring ones that vanished, and reopening the sessions that were live before a reboot. |
-| `skills/` | 13 skills — `workspace`, `feature`, `propose`, `review-pr`, `explore`, `fix-ci`, `humanizer`, and others. |
+| `skills/` | 14 skills — `workspace`, `feature`, `propose`, `review-pr`, `explore`, `fix-ci`, `humanizer`, and others. |
 | `agents/` | 5 review subagents — security, simplicity, UI, visual, QA. |
-| `hooks/` | 7 hooks — session state, a destructive-command guard, auto-format, lessons injection, transcript fsync, and a pre-commit leak guard. |
-| `bin/` | 16 command-line tools behind the above. |
-| `lib/` | `doctor.mjs` (config integrity), `workspace.mjs` (worktree state), `project.mjs` (project profile). |
+| `hooks/` | 8 hooks — session state, a destructive-command guard, auto-format, lessons injection, transcript fsync, and a pre-commit leak guard. |
+| `bin/` | 18 command-line tools behind the above. |
+| `lib/` | Shared libraries behind the skills — among them `doctor.mjs` (config integrity), `workspace.mjs` (worktree state, port allocation) and `project.mjs` (project profile). |
 | `systemd/user/` | 9 units — the timers that make durability and resurrection actually run. |
 | `CLAUDE.md` | The standing instructions. Workflow orchestration, core principles, and a section on the economics of an agent's time vs. yours. |
 | `hickey-principles.md`, `ui-design-principles.md` | Reference docs the instructions point at instead of restating. |

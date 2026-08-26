@@ -20,6 +20,8 @@
 ### 4. Verification Before Done
 - Never mark a task complete without proving it works: run tests, check logs, demonstrate correctness
 - Diff behavior between main and your changes when relevant
+- A verification stamp is a factual claim about your own conduct, and it carries the same weight as the result it certifies. Run the check, paste its output into the draft, write the sentence from what is on the page, then delete the paste — never compose the evidence and the conclusion in the same keystroke
+- A wrong conclusion invites the next reader to test it; a fabricated verification tells them not to bother
 
 ### 5. Demand Elegance (Balanced)
 - For non-trivial changes: pause and ask “is there a more elegant way?”
