@@ -98,11 +98,15 @@ Parse `--kind` (default `feature`), `--name` (default: derive from description),
    ```
    `$WORKTREE_PATH` = absolute path of the new worktree (`$(pwd)/.workspaces/worktrees/$NAME`).
 
-5. **Allocate port** starting at 3000:
+5. **Allocate port.** Derived from `$WORKTREE_PATH`, so the same workspace gets the same port on every machine and after every reboot:
    ```bash
-   PORT=3000
-   while ss -tlnp 2>/dev/null | grep -q ":${PORT} "; do PORT=$((PORT + 1)); done
+   PORT=$(node $HOME/.claude/lib/workspace.mjs port "$WORKTREE_PATH" | jq -r .port)
    ```
+   Do **not** scan upward from 3000. That asked `ss` what was *listening*, which
+   cannot see a workspace whose dev server is stopped — its port is still baked
+   into its `.env`, so the scan handed the same number to two workspaces and the
+   collision only appeared later, as a bind failure. `port` reads the claimed
+   ports out of the state file and bind-tests the candidate.
 
 6. **Copy env file and rewrite URLs** (if `$ENV_FILE` is set):
    ```bash
@@ -223,9 +227,18 @@ Returns non-zero if not found.
 
 ## Resume — `/workspace resume <name>`
 
-1. Fetch the record:
+1. Fetch the record **and bind the variables step 3 uses.** The block below
+   writes `$PORT`/`$ENV_FILE`/`$DB_NAME` into the restored env file; printing the
+   record does not set them, and an unset `$PORT` silently writes
+   `APP_URL=http://localhost:` — same shape as the teardown block further down:
    ```bash
-   node $HOME/.claude/lib/workspace.mjs get <NAME>
+   REC=$(node $HOME/.claude/lib/workspace.mjs get <NAME>)
+   PORT=$(echo "$REC" | jq -r '.port // empty')
+   ENV_FILE=$(echo "$REC" | jq -r '.envFile // empty')
+   DB_NAME=$(echo "$REC" | jq -r '.dbName // empty')
+   PROFILE=$(node $HOME/.claude/lib/project.mjs load)
+   DB_URL_VARS=$(echo "$PROFILE" | jq -r '.dbUrlVars // [] | join(" ")')
+   INSTALL_CMD=$(echo "$PROFILE" | jq -r '.installCmd // "null"')
    ```
    If not found: "No workspace named '<name>'." **Stop.**
 
