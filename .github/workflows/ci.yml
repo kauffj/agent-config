@@ -85,6 +85,7 @@ jobs:
 
       - name: Session-state status machine
         run: |
+          bash bin/test-agent-tab-shell.sh
           bash hooks/test-session-state.sh
           bash hooks/test-codex-hooks.sh
 

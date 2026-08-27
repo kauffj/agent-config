@@ -23,6 +23,7 @@ SNAPSHOT = os.path.join(CLAUDE_DIR, "sessions-snapshot.json")
 # death) and never clobbered by the timer's honest-state writes. The durable record
 # a freeze can't erase before you restore. See claude-snapshot and resume_set().
 RECOVERY_SNAP = os.path.join(CLAUDE_DIR, "sessions-recovery.json")
+SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
 def pid_alive(pid):
@@ -68,7 +69,7 @@ def proc_pane_id(pid):
 
 def _looks_like_session_id(s):
     # UUIDs: 36 chars with dashes. Be lenient but reject flags/paths.
-    return s and len(s) >= 32 and "-" in s and "/" not in s and not s.startswith("-")
+    return bool(s and len(s) >= 32 and "-" in s and SESSION_ID_RE.fullmatch(s))
 
 
 def _from_registry():
@@ -650,7 +651,10 @@ VENDOR_RESUME = {
 
 def resume_command(sid, vendor="claude"):
     """Shell command that reopens this session, or None if the vendor has no
-    known resume verb — better to skip a tab than spawn one that errors."""
+    known resume verb or the id is not a shell-safe token. Better to skip a tab
+    than execute runtime state as a command or spawn one that cannot resume."""
+    if not isinstance(sid, str) or not SESSION_ID_RE.fullmatch(sid):
+        return None
     template = VENDOR_RESUME.get(vendor or "claude")
     return template % sid if template else None
 

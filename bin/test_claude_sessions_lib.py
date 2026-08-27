@@ -388,6 +388,12 @@ class TestVendorResume(unittest.TestCase):
         # Skipping the tab beats spawning one that reports an unknown id.
         self.assertIsNone(L.resume_command("S", "venice"))
 
+    def test_unsafe_session_id_has_no_command(self):
+        for sid in ("-flag", "has space", "x; touch /tmp/pwned", "$(id)",
+                    "x\nclaude"):
+            with self.subTest(sid=sid):
+                self.assertIsNone(L.resume_command(sid, "codex"))
+
     def test_missing_vendor_defaults_to_claude(self):
         self.assertEqual(L.resume_command("S"), "claude --resume S")
         self.assertEqual(L.resume_command("S", None), "claude --resume S")

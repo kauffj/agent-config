@@ -21,7 +21,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from _claude_sessions_lib import (live_sessions, other_vendor_sessions,  # noqa: E402
-                                  proc_pane_id, CLAUDE_DIR, _project_dir)
+                                  proc_pane_id, resume_command,
+                                  CLAUDE_DIR, _project_dir)
 
 STATE_DIR = os.path.join(CLAUDE_DIR, "state")
 META_DIR = os.path.join(CLAUDE_DIR, "meta")
@@ -309,6 +310,7 @@ def records():
             "branch": branch,
             "label": meta.get("label") or _label(sid, cwd, branch),
             "vendor": vendor,
+            "resume_command": resume_command(sid, vendor),
             # Each vendor says what a session is about differently: Claude has
             # an ai-title event, Grok writes summary.json (handed over by the
             # adapter), Codex has neither so its opening prompt is parsed.

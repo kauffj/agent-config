@@ -119,12 +119,12 @@ highlighted so the focused session is unmistakable.
 For long-running tasks that are blocked for days, `Ctrl+Shift+S` **closes the tab
 now and schedules it to reopen at a chosen time** (`1h`, `tomorrow 9am`, `3 days`,
 or a precise datetime). This is just a *scheduled resurrection*: closing ends the
-process but the transcript survives, and `claude --resume` brings the conversation
+process but the transcript survives, and the vendor's native resume command brings the conversation
 back exactly.
 
 - **`bin/claude-schedule`** owns `~/.claude/scheduled.json` — `add` / `list` /
   `cancel` / `reopen-due`. It parses the time, and `reopen-due` spawns any overdue
-  session back as a tab (the same `wezterm cli spawn … claude --resume` that
+  session back as a tab (the same clean `wezterm cli spawn` boundary that
   `claude-resume` uses), dropping entries that are already live and keeping ones
   whose spawn fails so they retry.
 - **`bin/claude-snapshot`** calls `reopen-due` on its existing 60s tick, so a

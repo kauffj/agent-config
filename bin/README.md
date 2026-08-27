@@ -55,8 +55,8 @@ shrink the window system-wide.)
   sort by cwd after the rest.
 - **`claude-resume`** — the on-demand restore command. Takes the resume set
   (snapshot ∪ recovery, minus sessions already live or whose transcript is gone)
-  and spawns a `claude --resume <id>` tab per session via `wezterm cli spawn`, in
-  remembered tab order.
+  and spawns each session through its vendor's native resume command via
+  `wezterm cli spawn`, in remembered tab order.
   Run it from inside WezTerm. `--snapshot PATH` restores from a specific snapshot
   (e.g. the `.prev` backup); `--from-transcripts [N]` ignores the snapshot and
   reconstructs the N most-recently-active sessions from transcript files — the
@@ -65,6 +65,14 @@ shrink the window system-wide.)
 It skips any session whose transcript no longer exists, so a rolled-back id never
 spawns a dead "No conversation found" tab — run `claude-restore-transcripts` first
 to pull survivors out of backup.
+
+Every fleet/picker/snooze spawn crosses **`agent-tab-shell`**. It clears the
+calling pane's Claude account binding plus Codex config/auth overrides and both
+harnesses' session identity before the native resume command runs, then does the
+same before leaving an interactive shell behind. Without that boundary, a Codex
+tab opened from an alternate-account Claude session inherits
+`CLAUDE_CONFIG_DIR`; the next `claude` in that shell bypasses account selection
+and keeps spending the same account.
 
 ## Reading (the scrollback-mangle escape hatch)
 
@@ -297,9 +305,11 @@ command claude               # bypass the wrapper entirely
   `file-history/`, `plans/`, `paste-cache/`, `todos/`, `tasks/`, `chrome/`.
 - Maintenance subcommands (`auth mcp plugin update doctor install project agents
   setup-token …`) always run on the default account and skip the health gate — they
-  are how a broken account gets fixed. A preexisting `CLAUDE_CONFIG_DIR` (daemon
-  respawns, in-session children) bypasses everything, as do non-interactive shells
-  (they never see the function).
+  are how a broken account gets fixed. A preexisting `CLAUDE_CONFIG_DIR` in a
+  direct daemon respawn or in-session child bypasses everything, as do
+  non-interactive shells (they never see the function). Fleet-created tabs clear
+  inherited bindings at their explicit launch boundary so this exception cannot
+  leak into a later interactive shell.
 - Runtime state: `state/acct-usage.json` (snapshot + probe cache),
   `state/acct-ledger.jsonl` (launch log, self-truncating), `state/acct-login.lock`.
 - A duplicate-subscription check warns if two accounts sign in as the same email —

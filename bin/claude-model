@@ -188,12 +188,13 @@ def main():
     # may be the one with the most headroom again.
     resume = ("claude --resume %s" % sid if cont
               else "claude --model %s --resume %s" % (model, sid))
-    inner = ("unset CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ID; "
-             "echo 'claude-model: waiting for the current session (pid %d) to exit "
+    inner = ("echo 'claude-model: waiting for the current session (pid %d) to exit "
              "— run /exit in its tab'; "
              "while kill -0 %d 2>/dev/null; do sleep 0.5; done; "
-             "%s; exec bash" % (pid, pid, resume))
-    cmd = ["wezterm", "cli", "spawn", "--cwd", cwd, "--", "bash", "-lic", inner]
+             "%s" % (pid, pid, resume))
+    tab_shell = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                             "agent-tab-shell")
+    cmd = ["wezterm", "cli", "spawn", "--cwd", cwd, "--", tab_shell, inner]
 
     if cont:
         print("session %s  →  %s (capped here, room there)"

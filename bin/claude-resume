@@ -67,6 +67,8 @@ def main():
         sys.exit(1)
 
     spawned = 0
+    tab_shell = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                             "agent-tab-shell")
     for s in todo:
         sid, cwd = s["sessionId"], s["cwd"]
         vendor = s.get("vendor") or "claude"
@@ -84,12 +86,7 @@ def main():
             continue
         r = subprocess.run(
             ["wezterm", "cli", "spawn", "--cwd", cwd, "--",
-             "bash", "-lic",
-             # CLAUDE_CODE_SESSION_ID too: it is exported into this process, and a
-             # tab that inherits it hands the spawning session's id to anything
-             # reading the environment (claude-open, /proc-based tooling).
-             "unset CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ID; "
-             "%s; exec bash" % cmd],
+             tab_shell, cmd],
             capture_output=True, text=True)
         ok = r.returncode == 0
         spawned += ok

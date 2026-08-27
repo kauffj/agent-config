@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Run one agent command in a clean login environment, then leave a clean shell.
+#
+# WezTerm creates tabs on behalf of whichever pane asked. That client process
+# can be a Claude session bound to an alternate account, or another harness
+# carrying its own config, auth, and session state. Inheriting those values
+# makes a resumed Codex tab look like that Claude process and, after the agent
+# exits, pins the shell's next `claude` launch to CLAUDE_CONFIG_DIR instead of
+# the account router.
+
+set -u
+
+if [[ $# -ne 1 || -z "$1" ]]; then
+    echo "usage: agent-tab-shell '<agent command>'" >&2
+    exit 2
+fi
+
+clean_agent_identity() {
+    # BROWSER is account-specific only when claude-acct installed the matching
+    # profile binding. Preserve an unrelated user-selected browser.
+    if [[ -n "${CLAUDE_ACCT_BROWSER_PROFILE:-}" \
+          && "${BROWSER:-}" == *claude-acct-browser ]]; then
+        unset BROWSER
+    fi
+    unset CLAUDE_CONFIG_DIR CLAUDE_ACCT CLAUDE_ACCT_BROWSER_PROFILE
+    unset CLAUDECODE CLAUDE_PID
+    unset CLAUDE_CODE_CHILD_SESSION CLAUDE_CODE_SESSION_ID
+    unset CLAUDE_CODE_BRIDGE_SESSION_ID CLAUDE_CODE_ENTRYPOINT
+    unset CLAUDE_CODE_EXECPATH CLAUDE_CODE_MESSAGING_SOCKET
+    unset CLAUDE_CODE_MESSAGING_TOKEN
+    unset CODEX_SESSION_ID CODEX_THREAD_ID CODEX_CI
+    unset CODEX_HOME CODEX_SQLITE_HOME CODEX_API_KEY CODEX_ACCESS_TOKEN
+    unset OPENAI_FEDERATION_RULE_ID OPENAI_IDENTITY_TOKEN_FILE
+    unset OPENAI_WORKLOAD_IDENTITY_CONTEXT
+    unset CODEX_MANAGED_BY_NPM CODEX_MANAGED_PACKAGE_ROOT
+}
+
+command=$1
+clean_agent_identity
+
+# A login + interactive shell reconstructs PATH and shell functions exactly as
+# a terminal launch does (`claude` is the account-routing shell function).
+bash -lic "$command"
+status=$?
+
+clean_agent_identity
+if [[ -t 0 && -t 1 ]]; then
+    exec bash -l
+fi
+exit "$status"

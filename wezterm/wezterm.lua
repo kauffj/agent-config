@@ -18,6 +18,7 @@ local wezterm = require 'wezterm'
 local act = wezterm.action
 local config = wezterm.config_builder()
 local HOME = wezterm.home_dir
+local AGENT_TAB_SHELL = HOME .. '/.claude/bin/agent-tab-shell'
 
 -- ---------------------------------------------------------------------------
 -- Base config — deliberately conservative so it loads on a fresh box. Font is
@@ -857,8 +858,8 @@ local function session_pane(paneid, cwd)
   return mux_pane
 end
 
-local function activate_or_resume(win, pane, paneid, sid, cwd)
-  local mux_pane = session_pane(paneid, cwd)
+local function activate_or_resume(win, pane, rec)
+  local mux_pane = session_pane(rec.wezterm_pane, rec.cwd)
   if mux_pane then
     -- MuxPane:activate() focuses pane + its tab + window (recent WezTerm).
     -- pcall + tab-activate fallback keeps it working on older builds.
@@ -868,12 +869,20 @@ local function activate_or_resume(win, pane, paneid, sid, cwd)
         if t then t:activate() end
       end)
     end
-    return
+    return true
   end
   -- Live in the registry but no WezTerm pane (closed, or running elsewhere): resume.
+  if not rec.resume_command or rec.resume_command == '' then
+    win:toast_notification('fleet', 'cannot safely resume this session', nil, 4000)
+    return false
+  end
   win:perform_action(
-    act.SpawnCommandInNewTab { cwd = cwd, args = { 'bash', '-lic', 'unset CLAUDE_CODE_CHILD_SESSION; claude --resume ' .. sid .. '; exec bash' } },
+    act.SpawnCommandInNewTab {
+      cwd = rec.cwd,
+      args = { AGENT_TAB_SHELL, rec.resume_command },
+    },
     pane)
+  return true
 end
 
 -- Resurface a hidden (still-running) session and clear its hidden record. Preferred
@@ -885,13 +894,13 @@ end
 -- the pane is gone (WezTerm restarted, tab manually closed), drop the record and
 -- fall through to the normal resume path. Distinct from activate_or_resume: this
 -- RELOCATES a known-live pane; that one FINDS-or-RESTARTS.
-local function resurface_hidden(win, pane, paneid, sid, cwd)
+local function resurface_hidden(win, pane, rec)
   local m = hidden_map()
-  m[sid] = nil
+  m[rec.session_id] = nil
   set_hidden_map(m)
   local mux_pane
-  if paneid then
-    local ok, p = pcall(wezterm.mux.get_pane, tonumber(paneid))
+  if rec.wezterm_pane then
+    local ok, p = pcall(wezterm.mux.get_pane, tonumber(rec.wezterm_pane))
     if ok then mux_pane = p end
   end
   if mux_pane then
@@ -901,7 +910,7 @@ local function resurface_hidden(win, pane, paneid, sid, cwd)
     local ok, reattached = pcall(function()
       return wezterm.run_child_process({
         'wezterm', 'cli', 'move-pane-to-new-tab',
-        '--pane-id', tostring(paneid),
+        '--pane-id', tostring(rec.wezterm_pane),
         '--window-id', tostring(win:mux_window():window_id()),
       })
     end)
@@ -909,9 +918,9 @@ local function resurface_hidden(win, pane, paneid, sid, cwd)
       pcall(function() mux_pane:move_to_new_window(win:active_workspace()) end)  -- fallback: standalone window
     end
     pcall(function() mux_pane:activate() end)
-    return
+    return true
   end
-  activate_or_resume(win, pane, paneid, sid, cwd)
+  return activate_or_resume(win, pane, rec)
 end
 
 -- Content search (the picker's '🔍 search transcripts…' row): prompt for text,
@@ -935,7 +944,7 @@ local function session_search(window, pane)
       local by_prefix = {}
       for _, r in ipairs(recs) do by_prefix[tostring(r.session_id):sub(1, 8)] = r end
 
-      local choices, pane_by_id, cwd_by_id = {}, {}, {}
+      local choices, record_by_id = {}, {}
       for l in stdout:gmatch('[^\n]+') do
         local count, sid8, cwd = l:match('^%s*(%d+)%s+(%x+)%s+(.+)$')
         if sid8 then
@@ -945,8 +954,7 @@ local function session_search(window, pane)
             id = id,
             label = string.format('%3s×  %-28s %s', count, (r and r.label) or sid8, (r and r.project) or cwd),
           })
-          pane_by_id[id] = r and r.wezterm_pane
-          cwd_by_id[id] = (r and r.cwd) or cwd
+          record_by_id[id] = r or { session_id = id, cwd = cwd }
         end
       end
       if #choices == 0 then
@@ -958,10 +966,11 @@ local function session_search(window, pane)
         choices = choices,
         action = wezterm.action_callback(function(w2, p2, id)
           if not id then return end
+          local rec = record_by_id[id]
           if hidden_map()[id] then
-            resurface_hidden(w2, p2, pane_by_id[id], id, cwd_by_id[id])
+            resurface_hidden(w2, p2, rec)
           else
-            activate_or_resume(w2, p2, pane_by_id[id], id, cwd_by_id[id])
+            activate_or_resume(w2, p2, rec)
           end
         end),
       }, p)
@@ -1009,7 +1018,7 @@ local function session_picker(window, pane)
   end
   local blankcell = string.rep(' ', tabw + 1)
 
-  local choices, pane_by_id, cwd_by_id, seen_ids, scheduled_ids = {}, {}, {}, {}, {}
+  local choices, record_by_id, seen_ids = {}, {}, {}
   for _, r in ipairs(recs) do
     local grp = r.group and (' [' .. r.group .. ']') or ''
     -- Columns are padded by DISPLAY width (fit/column_width), not bytes, so the
@@ -1025,8 +1034,7 @@ local function session_picker(window, pane)
       .. (r.topic or '') .. grp
       .. (hid[r.session_id] and '  💤 hidden' or '')
     table.insert(choices, { id = r.session_id, label = row })
-    pane_by_id[r.session_id] = r.wezterm_pane
-    cwd_by_id[r.session_id] = r.cwd
+    record_by_id[r.session_id] = r
     seen_ids[r.session_id] = true
   end
 
@@ -1045,8 +1053,8 @@ local function session_picker(window, pane)
             label = blankcell .. fit('⏰', 2) .. ' ' .. fit(e.label or id, fw + lw + 1)
               .. '  reopens in ' .. (e.wakes_in or '?'),
           })
-          cwd_by_id[id] = e.cwd
-          scheduled_ids[id] = true
+          e.scheduled = true
+          record_by_id[id] = e
         end
       end
     end
@@ -1066,12 +1074,14 @@ local function session_picker(window, pane)
     action = wezterm.action_callback(function(win, p, id)
       if not id then return end       -- cancelled
       if id == '__search__' then return session_search(win, p) end
+      local rec = record_by_id[id]
+      local activated
       if hidden_map()[id] then
-        resurface_hidden(win, p, pane_by_id[id], id, cwd_by_id[id])
+        activated = resurface_hidden(win, p, rec)
       else
-        activate_or_resume(win, p, pane_by_id[id], id, cwd_by_id[id])
+        activated = activate_or_resume(win, p, rec)
       end
-      if scheduled_ids[id] then
+      if activated and rec.scheduled then
         wezterm.run_child_process({ HOME .. '/.claude/bin/claude-schedule', 'cancel', '--sid', id })
       end
     end),
@@ -1103,11 +1113,11 @@ local function launch_family(window, pane)
       local _, _, mux_win = wezterm.mux.spawn_window {
         workspace = id,
         cwd = first.cwd,
-        args = { 'bash', '-lic', 'unset CLAUDE_CODE_CHILD_SESSION; ' .. (first.cmd or 'claude') .. '; exec bash' },
+        args = { AGENT_TAB_SHELL, first.cmd or 'claude' },
       }
       for i = 2, #entries do
         local e = entries[i]
-        mux_win:spawn_tab { cwd = e.cwd, args = { 'bash', '-lic', 'unset CLAUDE_CODE_CHILD_SESSION; ' .. (e.cmd or 'claude') .. '; exec bash' } }
+        mux_win:spawn_tab { cwd = e.cwd, args = { AGENT_TAB_SHELL, e.cmd or 'claude' } }
       end
       win:perform_action(act.SwitchToWorkspace { name = id }, p)
     end),
@@ -1155,6 +1165,7 @@ local function snooze_do(win, pane, rec, when)
   local ok, stdout, stderr = wezterm.run_child_process({
     HOME .. '/.claude/bin/claude-schedule', 'add',
     '--sid', rec.session_id, '--cwd', rec.cwd or '',
+    '--vendor', rec.vendor or 'claude',
     '--when', when, '--label', disp ~= '' and disp or rec.session_id,
   })
   if not ok then
@@ -1238,7 +1249,7 @@ local function session_snooze(window, pane)
     if tostring(r.wezterm_pane) == pid then rec = r; break end
   end
   if not rec then
-    window:toast_notification('fleet', 'no Claude session in this tab', nil, 3000); return
+    window:toast_notification('fleet', 'no agent session in this tab', nil, 3000); return
   end
   window:perform_action(act.InputSelector {
     title = 'Sleep this tab…',

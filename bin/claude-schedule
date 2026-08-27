@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
-"""Snooze a session: close its tab now, reopen it at a scheduled time.
+"""Snooze an agent session: close its tab now, reopen it at a scheduled time.
 
-Owns ~/.claude/scheduled.json — a list of {session_id, cwd, reopen_at, label,
-created_at}. "Snooze" is just a scheduled resurrection: the tab is closed (the
-transcript survives via the durability layer), and `reopen-due` — driven every
-60s by the claude-snapshot timer — spawns `claude --resume <sid>` when the time
-arrives. Robust to suspend/reboot: an overdue reopen fires on the next tick once
-the machine and WezTerm are back.
+Owns ~/.claude/scheduled.json — a list of {session_id, vendor, cwd, reopen_at,
+label, created_at}. "Snooze" is just a scheduled resurrection: the tab is
+closed (the transcript survives via the durability layer), and `reopen-due` —
+driven every 60s by the claude-snapshot timer — spawns that vendor's native
+resume command when the time arrives. Robust to suspend/reboot: an overdue
+reopen fires on the next tick once the machine and WezTerm are back.
 
-  claude-schedule add --sid SID --cwd CWD --when "STR" [--label L]
+  claude-schedule add --sid SID --vendor V --cwd CWD --when "STR" [--label L]
   claude-schedule list [--json]
   claude-schedule cancel --sid SID
   claude-schedule reopen-due [--dry-run]
@@ -30,7 +30,8 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from _claude_sessions_lib import CLAUDE_DIR, live_sessions  # noqa: E402
+from _claude_sessions_lib import (CLAUDE_DIR, live_sessions,  # noqa: E402
+                                  other_vendor_sessions, resume_command)
 
 SCHEDULED = os.path.join(CLAUDE_DIR, "scheduled.json")
 
@@ -221,6 +222,7 @@ def cmd_add(a):
     entries = [e for e in _read() if e.get("session_id") != a.sid]
     entries.append({
         "session_id": a.sid,
+        "vendor": a.vendor,
         "cwd": a.cwd,
         "reopen_at": when,
         "label": a.label or a.sid[:8],
@@ -243,6 +245,8 @@ def cmd_list(a):
     if a.json:
         for e in entries:
             e["wakes_in"] = _wakes_in(e.get("reopen_at", 0), now)
+            e["resume_command"] = resume_command(
+                e.get("session_id"), e.get("vendor") or "claude")
         print(json.dumps(entries))
         return
     if not entries:
@@ -289,12 +293,21 @@ def cmd_reopen_due(a):
         return
     have_wezterm = shutil.which("wezterm") is not None
     win = _target_window() if have_wezterm else None
-    live = set(live_sessions())
+    live = set(live_sessions()) | set(other_vendor_sessions())
     kept, reopened, dropped, failed = [], [], 0, 0
+    tab_shell = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                             "agent-tab-shell")
     for e in entries:
         sid, cwd = e.get("session_id"), e.get("cwd") or ""
+        command = resume_command(sid, e.get("vendor") or "claude") if sid else None
         if not sid or e.get("reopen_at", 0) > now:
             kept.append(e)
+            continue
+        if command is None:
+            kept.append(e)
+            failed += 1
+            _log("REOPEN REFUSED %s unknown vendor=%s"
+                 % (sid[:8], e.get("vendor")))
             continue
         if sid in live:                      # already back (manual reopen) — drop it
             dropped += 1
@@ -308,7 +321,7 @@ def cmd_reopen_due(a):
             continue
         r = subprocess.run(
             ["wezterm", "cli", "spawn", "--window-id", str(win), "--cwd", cwd, "--",
-             "bash", "-lic", "claude --resume %s; exec bash" % sid],
+             tab_shell, command],
             capture_output=True, text=True)
         if r.returncode == 0:
             reopened.append(e)
@@ -329,7 +342,7 @@ def cmd_reopen_due(a):
 def _notify(label):
     if shutil.which("notify-send"):
         try:
-            subprocess.run(["notify-send", "Claude — tab reopened", "%s is back" % label],
+            subprocess.run(["notify-send", "Agent tab reopened", "%s is back" % label],
                            check=False)
         except Exception:
             pass
@@ -341,6 +354,7 @@ def main():
 
     pa = sub.add_parser("add"); pa.set_defaults(fn=cmd_add)
     pa.add_argument("--sid", required=True)
+    pa.add_argument("--vendor", default="claude")
     pa.add_argument("--cwd", required=True)
     pa.add_argument("--when", required=True)
     pa.add_argument("--label", default="")
