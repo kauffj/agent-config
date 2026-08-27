@@ -11,6 +11,7 @@
 - Use subagents for work that is **read-heavy or parallel**: research, exploration, sweeping many files, independent analyses that can run at once. The win is keeping their output out of the main context, not the delegation itself
 - Do the work directly when you already know which file to open, when the task is a single edit, or when you'd spend more context briefing the agent than doing it. Reaching for one by default is its own kind of ceremony
 - One task per subagent for focused execution; for genuinely hard problems, throw more compute at it
+- Concurrent agents share the filesystem. Namespace temporary/helper files by task, or give each task its own scratch directory, so one agent cannot silently overwrite another's executable input
 
 ### 3. Self-Improvement Loop
 - After ANY correction from the user: update `tasks/lessons.md` with a rule that would have prevented the mistake
@@ -48,6 +49,7 @@
 - Exhaust automated testing and automated review before asking for human review.
 - When you do ask for review, deliver the target ready to look at: open the app, launch the window, link the exact URL or document. Never "go to X and click Y."
 - Once approved work passes its verification gates, deliver and push it directly to the repository's actual default branch, then monitor CI and deployment to completion. Do not offer a PR or leave finished work on a feature branch.
+- With direct delivery there is no PR body to preserve the review. For a non-trivial commit, make the commit message the durable record: explain what was wrong, why this shape, meaningful rejected alternatives or tradeoffs when they exist, and anything expensive for the next reader to re-derive. Do not invent ceremony for a trivial commit.
 
 ### 9. Portable Project Instructions
 - Author shared project guidance in the nearest `AGENTS.md`

@@ -324,6 +324,12 @@ Max 3 feedback rounds. After 3, ask the user whether to proceed as-is or keep it
 
 ## Step 7: Commit
 
+Direct delivery has no PR body, so a non-trivial commit message is the durable
+review record. Preserve what was wrong, why this implementation has its shape,
+meaningful rejected alternatives or tradeoffs when they exist, and any
+operational fact the next reader would otherwise have to re-derive. Keep a
+trivial commit trivial; do not invent alternatives merely to fill a template.
+
 ```bash
 set -euo pipefail
 : "${WORKTREE_PATH:?set WORKTREE_PATH first}" "${BRANCH:?BRANCH is empty}"
@@ -344,7 +350,9 @@ if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
   git commit -m "$(cat <<'EOF'
 feat: <short description>
 
-<Brief summary of what was built and why.>
+<What was wrong and what changed.>
+
+<Why this shape; meaningful tradeoffs or rejected alternatives, if any.>
 EOF
 )"
 fi

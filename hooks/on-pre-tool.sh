@@ -20,6 +20,14 @@ case "$TOOL" in
     Bash)
         CMD=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 
+        # Match Git only where a shell command can begin. The old patterns
+        # searched the entire tool input, so harmless prose such as
+        # `printf '%s\n' 'git reset --hard is forbidden'` was blocked. This is
+        # an accidental-safety backstop, not a shell parser; command-boundary
+        # matching keeps it useful without making documentation unwriteable.
+        CMD_HEAD='(^|[;&|()])[[:space:]]*((if|then|elif|while|until|do|else)[[:space:]]+|![[:space:]]+)?((command|exec|sudo)[[:space:]]+)?'
+        GIT_HEAD="${CMD_HEAD}git[[:space:]]+"
+
         # ── Destructive commands, judged by TARGET rather than by substring ──
         # One regex used to cover all of these, and it matched far too much:
         # 'rm -rf /' was a PREFIX, so every absolute path was blocked
@@ -53,7 +61,7 @@ case "$TOOL" in
 
         # 3. History rewrites and fork bombs. '--force-with-lease' is deliberately
         #    NOT matched — it is the safe form of the same intent.
-        if echo "$CMD" | grep -qE '(git[[:space:]]+push[^;&|]*([[:space:]](--force|-f)([[:space:]]|$)|[[:space:]]+\+[^[:space:];&|]+)|git[[:space:]]+reset[[:space:]]+--hard|:\(\)[[:space:]]*\{)'; then
+        if echo "$CMD" | grep -qE "(${GIT_HEAD}push[^;&|]*([[:space:]](--force|-f)([[:space:]]|$)|[[:space:]]+\+[^[:space:];&|]+)|${GIT_HEAD}reset[[:space:]]+--hard|${CMD_HEAD}:\(\)[[:space:]]*\{)"; then
             echo "Blocked: force-push, hard reset, or fork bomb" >&2
             exit 2
         fi
@@ -65,7 +73,7 @@ case "$TOOL" in
         #     how fsp-app 9544bc21 reverted six commits while pushing as a clean
         #     fast-forward. The refusal ("'main' is already used by worktree at
         #     ...") is the protection; these two flags are the only ways past it.
-        if echo "$CMD" | grep -qE '(--ignore-other-worktrees|git[[:space:]]+worktree[[:space:]]+add[^;&|]*[[:space:]](--force|-f)([[:space:]]|$))'; then
+        if echo "$CMD" | grep -qE "(${GIT_HEAD}(checkout|switch)[^;&|]*--ignore-other-worktrees|${GIT_HEAD}worktree[[:space:]]+add[^;&|]*[[:space:]](--force|-f)([[:space:]]|$))"; then
             echo "Blocked: this overrides git's refusal to check one branch out in two worktrees. Two worktrees sharing a branch silently stage each other's files as deletions (fsp-app 9544bc21 lost six commits that way). If you need that branch, work in the worktree that already holds it, or start a new branch here: git worktree add <path> -b <branch> origin/main" >&2
             exit 2
         fi
