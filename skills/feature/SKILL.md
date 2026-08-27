@@ -1,20 +1,21 @@
 ---
 name: feature
-description: Build and ship a user-facing feature end-to-end — workspace → plan → implement → automated review → screenshots → manual review → commit/push → PR-or-merge. Use when asked to build, add, or implement a feature substantial enough to want a branch and a review pass (not a one-line tweak), or to list, resume, complete, abandon, or remove an in-flight feature. Thin orchestrator over /workspace, /propose, and /review-pr; stops for user approval at the plan, the manual review, and the deploy decision.
-argument-hint: "<description> | list | resume <name> | complete <name> | abandon <name> | remove <name>"
+description: Build and ship a user-facing feature end-to-end — workspace → plan → implement → automated review → screenshots → manual review → direct delivery. Use when asked to build, add, or implement a feature substantial enough to want a branch and a review pass (not a one-line tweak), or to list, resume, complete, abandon, or remove an in-flight feature. Thin orchestrator over the workspace, propose, and review-pr skills; stops for user approval at the plan and manual review, then ships directly.
 ---
 
-# /feature — feature pipeline
+# Feature pipeline
 
 Orchestrates the end-to-end flow for shipping a feature. Delegates workspace management, planning, and review to dedicated skills:
 
-- **`/workspace`** — worktree, port, env, install, state tracking
-- **`/propose`** — plan + simplicity review + user approval
-- **`/review-pr`** — parallel review agents
+- **`workspace`** — worktree, port, env, install, state tracking
+- **`propose`** — plan + simplicity review + user approval
+- **`review-pr`** — parallel review agents
 
-`/feature` itself owns: implementation agent invocation, screenshots, manual review, commit & push, deploy decision, merge gate on `complete`.
+The `feature` skill itself owns implementation delegation, screenshots, manual review, commit, direct-to-default shipping, delivery monitoring, and the completion gate.
 
-**Feature request:** $ARGUMENTS
+Treat the text supplied with the invocation as the request arguments. Bind its
+freeform feature description as `DESCRIPTION` after removing any subcommand and
+flags described below.
 
 ---
 
@@ -23,14 +24,14 @@ Orchestrates the end-to-end flow for shipping a feature. Delegates workspace man
 First, ensure any legacy state is migrated:
 
 ```bash
-node $HOME/.claude/lib/workspace.mjs migrate
+node "$HOME/.config/agent-config/lib/workspace.mjs" bootstrap
 ```
 
-Then dispatch on `$ARGUMENTS`:
+Then dispatch on the request arguments:
 
 - empty or `list` → **List features** (filter to kind=feature)
 - `resume <name>` → **Resume**
-- `complete <name>` → **Complete** (merge-gate + mark done)
+- `complete <name>` → **Complete** (delivery gate + mark done)
 - `abandon <name>` → **Abandon**
 - `remove <name>` → **Remove**
 - otherwise → **New feature** (continue to Step 0)
@@ -38,93 +39,103 @@ Then dispatch on `$ARGUMENTS`:
 ### List
 
 ```bash
-node $HOME/.claude/lib/workspace.mjs list --kind feature
+node "$HOME/.config/agent-config/lib/workspace.mjs" list --kind feature
 ```
 
 Render as a table: Name, Status, Step (from `pipeline.step`), Branch, Worktree, Port, Updated.
 
-If empty: "No features tracked. Use `/feature \"description\"` to start one." **Stop.**
+If empty: "No features tracked. Invoke `feature` with a description to start one." **Stop.**
 
 ### Resume
 
 1. Fetch the record:
    ```bash
-   node $HOME/.claude/lib/workspace.mjs get <NAME>
+   node "$HOME/.config/agent-config/lib/workspace.mjs" get <NAME>
    ```
-   **Refuse to advance a finished pipeline.** If the record's `status` is `done`
-   (or the branch is already merged), do NOT jump to a step or re-run any agent —
+   **Refuse to advance a finished pipeline.** If the record's `status` is `done`,
+   do NOT jump to a step or re-run any agent —
    a compacted resume can land here one step from re-implementing shipped work.
    Say: "Feature '<name>' is already done (status=done, step <pipeline.step>,
-   branch `<branch>` merged). Nothing to resume — use `/feature list` to see it or
-   `/feature \"…\"` to start new work." **Stop.**
-2. If worktree is missing, let `/workspace resume` handle recreation:
+   branch `<branch>` delivered). Nothing to resume — invoke `feature` with `list` to see it or
+   invoke `feature` with a description to start new work." **Stop.**
+2. If `pipeline.step == 9` and `delivery.deliveryVerified == true`, do not
+   recreate a missing worktree. Apply the `workspace` skill with `done <NAME>`
+   directly; its
+   finish operation is idempotent across partial cleanup. Propagate a refusal or,
+   on success, report completion and **stop**.
+3. If the worktree is missing, let the `workspace` skill's `resume` operation handle recreation:
    ```
-   Invoke /workspace resume <NAME>
+   Apply the `workspace` skill with `resume <NAME>`.
    ```
-3. Set variables from the record: `$WORKTREE_PATH`, `$PORT`, `$SCREENSHOT_DIR`, `$BRANCH`, `$NAME`.
-4. **Load the plan.** Prefer `pipeline.planPath` (new format) and `cat` the file. Fall back to `pipeline.plan` (legacy: plan was stored inline). Set `$PLAN`.
-5. Load project profile via `node $HOME/.claude/lib/project.mjs load`.
-6. **Jump to the step recorded in `pipeline.step`** — if 4, resume at Step 4; if 6, resume at Step 6; etc.
+4. Set variables from the record: `$WORKTREE_PATH`, `$PORT`, `$SCREENSHOT_DIR`,
+   `$BRANCH`, `$NAME`, and the semantic delivery fields `$DEPLOY_SHA` and
+   `$DELIVERY_VERIFIED`. An active branch already contained
+   in the default branch is not terminal: resume Step 8/9 to verify delivery and
+   clean up.
+5. **Load the plan.** Prefer `pipeline.planPath` (new format) and `cat` the file. Fall back to `pipeline.plan` (legacy: plan was stored inline). Set `$PLAN`.
+6. Load the project profile via `node "$HOME/.config/agent-config/lib/project.mjs" load`.
+7. **Jump to the step recorded in `pipeline.step`** — if 4, resume at Step 4; if 6, resume at Step 6; etc.
 
 ### Complete
 
 1. Fetch the record. If not found, say so and stop.
-2. **Merge gate** — verify the feature branch is merged into the default branch:
-   ```bash
-   DEFAULT_BRANCH=$(node $HOME/.claude/lib/project.mjs load | jq -r .defaultBranch)
-   git fetch origin $DEFAULT_BRANCH
-   git branch --merged origin/$DEFAULT_BRANCH | grep -q "<BRANCH>" && echo MERGED || echo NOT_MERGED
+2. Apply the `workspace` skill with `done <NAME>`; its delivery,
+   remote-default ancestry, and clean-worktree
+   checks are the authoritative completion gate:
    ```
-3. If NOT_MERGED, say: "Feature '<name>' branch `<branch>` is not yet merged into `<default>`. Merge or get the PR merged first, then run `/feature complete <name>` again." **Stop.**
-4. If MERGED, delegate cleanup to `/workspace done`:
+   Apply the `workspace` skill with `done <NAME>`.
    ```
-   Invoke /workspace done <NAME>
-   ```
-5. Say: "Feature '<name>' is merged and marked as done." **Stop.**
+3. Propagate any refusal without tearing down or claiming completion. On
+   success say: "Feature '<name>' is delivered and marked as done." **Stop.**
 
 ### Abandon
 
-Delegate to `/workspace abandon <NAME>`. **Stop.**
+Apply the `workspace` skill with `abandon <NAME>`. **Stop.**
 
 ### Remove
 
-Delegate to `/workspace remove <NAME>`. **Stop.**
+Apply the `workspace` skill with `remove <NAME>`. **Stop.**
 
 ---
 
 ## Step 0: Create workspace
 
-1. **Derive a slug** from `$ARGUMENTS` — short kebab-case, under ~40 chars. Set `$NAME` to this slug.
-2. **Invoke** `/workspace new "$ARGUMENTS" --kind feature --name $NAME`. (Passing `--name` explicitly means you already know what the workspace will be called.) `/workspace` provisions an isolated per-workspace database when the project supports it; if the user asked to share the dev DB, append `--db shared`. The feature's DB is dropped automatically when you later `complete`/`abandon` it (those delegate to `/workspace`).
+1. **Derive a slug** from `DESCRIPTION` — short kebab-case, under ~40 chars. Set `$NAME` to this slug.
+2. **Apply the `workspace` skill** with `new "<DESCRIPTION>" --kind feature --name <NAME>`. Passing `--name` explicitly means the name is already known. The workspace skill provisions an isolated per-workspace database when the project supports it; if the user asked to share the dev DB, append `--db shared`. The database is dropped automatically when the feature is completed or abandoned.
 3. **Read the record** back — this is the source of truth:
    ```bash
-   node $HOME/.claude/lib/workspace.mjs get $NAME
+   node "$HOME/.config/agent-config/lib/workspace.mjs" get "$NAME"
    ```
    Parse the JSON to get `$BRANCH`, `$WORKTREE_PATH`, `$PORT`, `$SCREENSHOT_DIR`, `$ENV_FILE`.
 
 4. **Load the project profile:**
    ```bash
-   node $HOME/.claude/lib/project.mjs load
+   node "$HOME/.config/agent-config/lib/project.mjs" load
    ```
-   Extract `$BUILD_CMD`, `$DEV_CMD`, `$INSTALL_CMD`, `$STACK`, `$DEPLOY_MODEL`, `$HAS_SCREENSHOTS`, `$DEFAULT_BRANCH`.
+   Extract `$BUILD_CMD`, `$DEV_CMD`, `$INSTALL_CMD`, `$STACK`, `$DEPLOY_MODEL`, and `$HAS_SCREENSHOTS`.
 
    **A command field can be `null`** — it means the project genuinely has no such
    step (no `build` script, not a Django app). Skip that step rather than
    inventing a command; a `null` is a detected fact, not a detection failure. If
-   it is wrong, correct it once in `.workspaces/project.json` under `overrides`
-   (it survives re-detection) instead of working around it each run.
+   it is wrong, correct it once in tracked `.agent/project.json` as a plain
+   field override (for example `{ "devCmd": "make serve" }`) instead of
+   working around it each run. The ignored `.workspaces/project.json` cache is
+   derived state and must remain disposable.
 
 Update pipeline progress:
 
 ```bash
-node $HOME/.claude/lib/workspace.mjs update $NAME '{"pipeline":{"skill":"feature","step":0}}'
+node "$HOME/.config/agent-config/lib/workspace.mjs" update "$NAME" \
+  '{"pipeline":{"skill":"feature","step":0}}'
 ```
 
 ---
 
 ## Step 1: Propose
 
-Invoke `/propose "$ARGUMENTS" --workspace $NAME`. When it returns, the approved plan is at `.workspaces/plans/$NAME.md` and the path is recorded in `pipeline.planPath` on the workspace record.
+Apply the `propose` skill with `<DESCRIPTION> --workspace <NAME>`. When it
+returns, the approved plan is at `.workspaces/plans/$NAME.md` and the path is
+recorded in `pipeline.planPath` on the workspace record.
 
 Read the plan:
 
@@ -139,7 +150,7 @@ Capture the contents as `$PLAN`.
 Update step:
 
 ```bash
-node $HOME/.claude/lib/workspace.mjs update $NAME '{"pipeline":{"step":1}}'
+node "$HOME/.config/agent-config/lib/workspace.mjs" update "$NAME" '{"pipeline":{"step":1}}'
 ```
 
 ---
@@ -147,10 +158,12 @@ node $HOME/.claude/lib/workspace.mjs update $NAME '{"pipeline":{"step":1}}'
 ## Step 2: Implement
 
 ```bash
-node $HOME/.claude/lib/workspace.mjs update $NAME '{"status":"active","pipeline":{"step":2}}'
+node "$HOME/.config/agent-config/lib/workspace.mjs" update "$NAME" '{"status":"active","pipeline":{"step":2}}'
 ```
 
-Launch an Agent (subagent_type: "general-purpose"):
+Delegate implementation to an available general-purpose subagent with this
+prompt. If the current harness cannot delegate, perform the same work in the
+current context and report that limitation:
 
 > You are a senior full-stack engineer implementing a feature. Follow this approved plan exactly:
 >
@@ -168,7 +181,7 @@ Launch an Agent (subagent_type: "general-purpose"):
 >
 > **Verification (required before returning):**
 > 1. If `$BUILD_CMD` is not null, run `cd $WORKTREE_PATH && $BUILD_CMD` and confirm zero errors. If there are build errors, fix them.
-> 2. If `$DEV_CMD` is not null, start the dev server as a foreground long-running tool command (`cd "$WORKTREE_PATH" && PORT="$PORT" "$HOME/.claude/bin/agent-session-server" -- bash -lc "$DEV_CMD"`) and verify each affected URL loads without errors at `http://localhost:$PORT/...`. Use the tool's background/session facility while continuing work; do not append shell `&`. Check the terminal output for server-side errors. If it is null, verify by the project's own test command instead and say so.
+> 2. If `$DEV_CMD` is not null, start the dev server as a foreground long-running tool command (`cd "$WORKTREE_PATH" && PORT="$PORT" "$HOME/.config/agent-config/bin/agent-session-server" -- bash -lc "$DEV_CMD"`) and verify each affected URL loads without errors at `http://localhost:$PORT/...`. Use the harness's background/session facility while continuing work; do not append shell `&`. Check the terminal output for server-side errors. If it is null, verify by the project's own test command instead and say so.
 > 3. Walk through the acceptance criteria from the plan and confirm each one is met. If any aren't met, fix the implementation.
 >
 > **Output:**
@@ -191,7 +204,7 @@ If more than 20 URLs, group by route pattern with representative examples.
 ## Step 3: Screenshots
 
 ```bash
-node $HOME/.claude/lib/workspace.mjs update $NAME '{"pipeline":{"step":3}}'
+node "$HOME/.config/agent-config/lib/workspace.mjs" update "$NAME" '{"pipeline":{"step":3}}'
 ```
 
 Skip this step if `$HAS_SCREENSHOTS` is false.
@@ -203,7 +216,7 @@ continuing; do not append shell `&`:
 ```bash
 : "${WORKTREE_PATH:?set WORKTREE_PATH first}" "${PORT:?PORT is empty}"
 [ "$DEV_CMD" = "null" ] && { echo "no dev command for this project — skipping server checks"; exit 0; }
-cd "$WORKTREE_PATH" && PORT="$PORT" "$HOME/.claude/bin/agent-session-server" -- bash -lc "$DEV_CMD"
+cd "$WORKTREE_PATH" && PORT="$PORT" "$HOME/.config/agent-config/bin/agent-session-server" -- bash -lc "$DEV_CMD"
 ```
 
 Then wait for it from a separate tool call:
@@ -227,13 +240,13 @@ Read the screenshot images from `$SCREENSHOT_DIR` so they're available for the v
 ## Step 4: Review
 
 ```bash
-node $HOME/.claude/lib/workspace.mjs update $NAME '{"status":"active","pipeline":{"step":4}}'
+node "$HOME/.config/agent-config/lib/workspace.mjs" update "$NAME" '{"status":"active","pipeline":{"step":4}}'
 ```
 
-Invoke `/review-pr` over the worktree, with server + screenshots so QA and visual agents run:
+Apply the `review-pr` skill over the worktree, with server and screenshots so QA and visual reviewers run:
 
 ```
-Invoke: /review-pr --worktree $WORKTREE_PATH --server http://localhost:$PORT --screenshots $SCREENSHOT_DIR --acceptance-criteria "<from $PLAN>"
+Apply `review-pr` with: `--worktree $WORKTREE_PATH --server http://localhost:$PORT --screenshots $SCREENSHOT_DIR --acceptance-criteria "<from $PLAN>"`
 ```
 
 Capture the `REVIEW_SUMMARY` counts and the full feedback (MUST FIX / SHOULD FIX / CONSIDER sections).
@@ -243,16 +256,17 @@ Capture the `REVIEW_SUMMARY` counts and the full feedback (MUST FIX / SHOULD FIX
 ## Step 5: Revise
 
 ```bash
-node $HOME/.claude/lib/workspace.mjs update $NAME '{"pipeline":{"step":5}}'
+node "$HOME/.config/agent-config/lib/workspace.mjs" update "$NAME" '{"pipeline":{"step":5}}'
 ```
 
-Launch an Agent to address the review feedback:
+Delegate the revision to an available implementation subagent with this prompt.
+If delegation is unavailable, perform it in the current context and report that limitation:
 
 > You are revising a feature implementation based on review feedback.
 >
 > **Working directory:** `$WORKTREE_PATH`
 >
-> Here is the consolidated feedback from `/review-pr`:
+> Here is the consolidated feedback from `review-pr`:
 >
 > [INSERT FULL REVIEW OUTPUT]
 >
@@ -273,12 +287,12 @@ If `$HAS_SCREENSHOTS` is true and view-related code changed, re-run the screensh
 ## Step 6: Manual review
 
 ```bash
-node $HOME/.claude/lib/workspace.mjs update $NAME '{"status":"active","pipeline":{"step":6}}'
+node "$HOME/.config/agent-config/lib/workspace.mjs" update "$NAME" '{"status":"active","pipeline":{"step":6}}'
 ```
 
 Ensure the dev server is still running (start if not). Wait for it to respond.
 
-Present to the user via `AskUserQuestion`:
+Yield to the user through the current harness with:
 
 > **Ready for manual review!**
 >
@@ -295,11 +309,12 @@ Present to the user via `AskUserQuestion`:
 > - CONSIDER: [count] suggestions ([count] addressed, [count] skipped)
 >
 > Reply:
-> - **"approved"** → proceed to commit & push
+> - **"approved"** → proceed to commit and ship
 > - **anything else** → I'll make changes and re-present
 
 If the user provides feedback:
-1. Launch an Agent to address it, working in `$WORKTREE_PATH`.
+1. Delegate the requested revision to an available implementation subagent,
+   working in `$WORKTREE_PATH`; if delegation is unavailable, do it directly.
 2. Run `$BUILD_CMD` (when it is not null) to verify the build still passes.
 3. Loop back to the top of this step.
 
@@ -307,89 +322,190 @@ Max 3 feedback rounds. After 3, ask the user whether to proceed as-is or keep it
 
 ---
 
-## Step 7: Commit & push
+## Step 7: Commit
 
 ```bash
-node $HOME/.claude/lib/workspace.mjs update $NAME '{"pipeline":{"step":7}}'
-```
-
-```bash
+set -euo pipefail
 : "${WORKTREE_PATH:?set WORKTREE_PATH first}" "${BRANCH:?BRANCH is empty}"
+MAIN_CHECKOUT=$(git worktree list --porcelain | awk '
+  index($0, "worktree ") == 1 { print substr($0, 10); exit }
+')
 cd "$WORKTREE_PATH"
-git add <specific files...>
-git commit -m "$(cat <<'EOF'
+CURRENT_BRANCH=$(git branch --show-current)
+[ "$CURRENT_BRANCH" = "$BRANCH" ] || {
+  echo "REFUSED: expected $BRANCH, found ${CURRENT_BRANCH:-detached HEAD}." >&2
+  exit 1
+}
+
+# Resume-safe: a clean feature HEAD means the commit already succeeded before
+# pipeline state was recorded. Otherwise commit only the reviewed file set.
+if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+  git add <specific reviewed files...>
+  git commit -m "$(cat <<'EOF'
 feat: <short description>
 
 <Brief summary of what was built and why.>
 EOF
 )"
-git push -u origin $BRANCH
+fi
+
+[ -z "$(git status --porcelain --untracked-files=all)" ] || {
+  echo "REFUSED: uncommitted or untracked work remains in $WORKTREE_PATH." >&2
+  exit 1
+}
+COMMIT_SHA=$(git rev-parse HEAD)
+(cd "$MAIN_CHECKOUT" && node "$HOME/.config/agent-config/lib/workspace.mjs" update "$NAME" \
+  "$(jq -n --arg sha "$COMMIT_SHA" '{pipeline:{step:7,commitSha:$sha}}')")
 ```
 
 ---
 
-## Step 8: Deploy decision
+## Step 8: Merge, push, and monitor CI
+
+Finished work ships directly. Resolve the main checkout first:
 
 ```bash
-node $HOME/.claude/lib/workspace.mjs update $NAME '{"pipeline":{"step":8}}'
+MAIN_CHECKOUT=$(git worktree list --porcelain | awk '
+  index($0, "worktree ") == 1 { print substr($0, 10); exit }
+')
 ```
 
-Ask the user via `AskUserQuestion`:
+Run the tested delivery helper from the main checkout. It validates the recorded
+worktree and branch, resolves the remote's actual default branch, fetches it,
+and integrates it without pushing:
 
-> Feature branch `$BRANCH` has been pushed.
->
-> **Deploy model:** $DEPLOY_MODEL
->
-> What would you like to do?
-> 1. **Create a PR** — open a pull request for review
-> 2. **Merge directly** — merge to `$DEFAULT_BRANCH` (triggers deploy)
-> 3. **Skip** — leave the branch alone
-
-**Option 1 (PR):**
 ```bash
-: "${WORKTREE_PATH:?set WORKTREE_PATH first}"
+set -euo pipefail
+INTEGRATION=$(cd "$MAIN_CHECKOUT" && \
+  node "$HOME/.config/agent-config/lib/workspace.mjs" integrate "$NAME")
+WORKTREE_PATH=$(echo "$INTEGRATION" | jq -r .worktreePath)
+DEFAULT_BRANCH=$(echo "$INTEGRATION" | jq -r .defaultBranch)
+INTEGRATED_SHA=$(echo "$INTEGRATION" | jq -r .integratedSha)
+(cd "$MAIN_CHECKOUT" && node "$HOME/.config/agent-config/lib/workspace.mjs" \
+  update "$NAME" '{"pipeline":{"step":8}}')
+```
+
+An integration conflict is a re-plan point: resolve it, rerun automated review
+on the integrated tree, and restart this step. Otherwise, run `$BUILD_CMD` when
+it is non-null and every automated verification command named in the approved
+plan from `$WORKTREE_PATH`. These are hard gates. Then prove the commands left
+the same clean commit and publish it with the helper:
+
+```bash
+set -euo pipefail
 cd "$WORKTREE_PATH"
-gh pr create --title "feat: <short>" --body "$(cat <<'EOF'
-## Summary
-<bullets from plan>
-
-## Review findings addressed
-- <count> MUST FIX resolved
-- <count> SHOULD FIX resolved
-- <count> CONSIDER (addressed/skipped)
-
-## Test plan
-- [ ] <acceptance criteria>
-EOF
-)"
+[ "$BUILD_CMD" = "null" ] || $BUILD_CMD
+# Run each approved-plan verification command here. Stop on the first failure.
+[ -z "$(git status --porcelain --untracked-files=all)" ]
+[ "$(git rev-parse HEAD)" = "$INTEGRATED_SHA" ]
+PUBLISHED=$(cd "$MAIN_CHECKOUT" && \
+  node "$HOME/.config/agent-config/lib/workspace.mjs" publish "$NAME" "$INTEGRATED_SHA")
+DEPLOY_SHA=$(echo "$PUBLISHED" | jq -r .deploySha)
+REPOSITORY_ID=$(echo "$PUBLISHED" | jq -r .repositoryId)
 ```
-Set `$DEPLOY_CHOICE=pr`.
 
-**Option 2 (merge):**
+The helper refuses a stale integration if the default branch advanced before
+the push. Restart Step 8 in that case. It intentionally leaves every local
+default checkout untouched; publication depends only on the reviewed SHA and
+the captured remote default SHA.
+
+Pushing the default branch may trigger CI, deployment, or both. Determine
+`$CI_PROVIDER` (`github-actions`, `documented-command`, or `none`) and
+`$DEPLOY_APPLICABLE` independently from the project instructions and deployment
+reference; do not infer that a green CI run proves deployment. GitHub lookup
+failures are hard only when GitHub Actions is the selected CI provider:
+
 ```bash
-: "${WORKTREE_PATH:?set WORKTREE_PATH first}" "${BRANCH:?BRANCH is empty}" "${DEFAULT_BRANCH:?DEFAULT_BRANCH is empty}"
-cd "$WORKTREE_PATH"
-git checkout $DEFAULT_BRANCH
-git merge $BRANCH --no-ff -m "Merge $BRANCH"
-git push origin $DEFAULT_BRANCH
-```
-Set `$DEPLOY_CHOICE=merged`.
+set -euo pipefail
+case "${CI_PROVIDER:-none}" in
+  github-actions)
+    RUNS_JSON='[]'
+    LAST_RUN_IDS=""
+    STABLE_POLLS=0
+    for _ in $(seq 1 60); do
+      RUNS_JSON=$(gh run list --event push --branch "$DEFAULT_BRANCH" --commit "$DEPLOY_SHA" \
+        --limit 100 --json databaseId,headSha,status,conclusion)
+      RUN_IDS=$(echo "$RUNS_JSON" | jq -r '.[].databaseId' | sort -n | paste -sd, -)
+      if [ -n "$RUN_IDS" ] && [ "$RUN_IDS" = "$LAST_RUN_IDS" ]; then
+        STABLE_POLLS=$((STABLE_POLLS + 1))
+      else
+        STABLE_POLLS=0
+      fi
+      LAST_RUN_IDS="$RUN_IDS"
+      [ "$STABLE_POLLS" -ge 15 ] && break
+      sleep 2
+    done
+    [ "$STABLE_POLLS" -ge 15 ] || {
+      echo "REFUSED: expected GitHub Actions runs were absent or never stabilized." >&2
+      exit 1
+    }
+    while read -r RUN_ID; do
+      gh run watch "$RUN_ID" --exit-status
+    done < <(echo "$RUNS_JSON" | jq -r '.[].databaseId')
+    FINAL_RUNS=$(gh run list --event push --branch "$DEFAULT_BRANCH" --commit "$DEPLOY_SHA" \
+      --limit 100 --json databaseId,headSha,status,conclusion)
+    FINAL_RUN_IDS=$(echo "$FINAL_RUNS" | jq -r '.[].databaseId' | sort -n | paste -sd, -)
+    [ "$FINAL_RUN_IDS" = "$LAST_RUN_IDS" ] || {
+      echo "REFUSED: a new Actions run appeared after monitoring; repeat the CI gate." >&2
+      exit 1
+    }
+    [ "$(echo "$FINAL_RUNS" | jq --arg sha "$DEPLOY_SHA" '[.[] | select(.headSha != $sha or .status != "completed" or (.conclusion | IN("success", "neutral", "skipped") | not))] | length')" -eq 0 ] || exit 1
+    CI_EVIDENCE=$(echo "$FINAL_RUNS" | jq -c \
+      '{status:"passed",provider:"github-actions",runs:[.[]|{id:.databaseId,headSha,status,conclusion}]}')
+    ;;
+  documented-command)
+    : "${CI_VERIFY_CMD:?CI is applicable but no GitHub run or documented verification command was found}"
+    (cd "$MAIN_CHECKOUT" && bash -lc "$CI_VERIFY_CMD")
+    CI_COMMAND_SHA=$(printf '%s' "$CI_VERIFY_CMD" | sha256sum | awk '{print $1}')
+    CI_EVIDENCE=$(jq -cn --arg commandSha "$CI_COMMAND_SHA" \
+      '{status:"passed",provider:"documented-command",command:("sha256:"+$commandSha),exitStatus:0}')
+    ;;
+  none)
+    CI_EVIDENCE='{"status":"not-applicable","reason":"project has no configured post-push CI"}'
+    ;;
+  *) echo "REFUSED: unknown CI provider '$CI_PROVIDER'." >&2; exit 1 ;;
+esac
 
-**Option 3 (skip):** Set `$DEPLOY_CHOICE=skipped`.
+if [ "${DEPLOY_APPLICABLE:-false}" = "true" ]; then
+  : "${DEPLOY_VERIFY_CMD:?Deployment is applicable but no documented verification command was found}"
+  (cd "$MAIN_CHECKOUT" && bash -lc "$DEPLOY_VERIFY_CMD")
+  VERIFY_COMMAND_SHA=$(printf '%s' "$DEPLOY_VERIFY_CMD" | sha256sum | awk '{print $1}')
+  DEPLOY_EVIDENCE=$(jq -cn --arg commandSha "$VERIFY_COMMAND_SHA" \
+    '{status:"passed",command:("sha256:"+$commandSha),exitStatus:0}')
+else
+  DEPLOY_EVIDENCE='{"status":"not-applicable","reason":"project has no deployment for this push"}'
+fi
+
+DELIVERY_EVIDENCE=$(jq -cn --arg repositoryId "$REPOSITORY_ID" \
+  --arg defaultBranch "$DEFAULT_BRANCH" --arg deploySha "$DEPLOY_SHA" \
+  --argjson ci "$CI_EVIDENCE" --argjson deployment "$DEPLOY_EVIDENCE" \
+  '{checkedAt:(now|todateiso8601),repositoryId:$repositoryId,
+    defaultBranch:$defaultBranch,deploySha:$deploySha,ci:$ci,deployment:$deployment}')
+
+cd "$MAIN_CHECKOUT"
+node "$HOME/.config/agent-config/lib/workspace.mjs" verify-delivery \
+  "$NAME" "$DELIVERY_EVIDENCE"
+node "$HOME/.config/agent-config/lib/workspace.mjs" update "$NAME" \
+  '{"pipeline":{"step":9}}'
+```
+
+If CI or deployment fails, diagnose the captured
+default-branch run directly in this worktree. Commit the fix, then restart Step
+8 at fetch/rebase/verification and push explicitly to the default branch again.
+Do not apply the `fix-ci` skill unqualified: it targets the current feature branch and
+its plain push contract is incompatible with this flow. The feature is not done
+until the default branch is healthy.
 
 ---
 
 ## Step 9: Report
 
-Map `$DEPLOY_CHOICE` to a final status:
-- `merged` → call `/workspace done $NAME`, status becomes `done`
-- `pr` → leave workspace `active`, pipeline.step=9, note `pr-open` in description
-- `skipped` → leave workspace `active`, pipeline.step=9
+Apply the `workspace` skill with `done <NAME>`. Its tested helper
+independently verifies ancestry and tears down the database, worktree, and
+landed feature branch in one idempotent operation:
 
-Update:
-
-```bash
-node $HOME/.claude/lib/workspace.mjs update $NAME "$(jq -n --arg c "$DEPLOY_CHOICE" '{pipeline: {step: 9, deployChoice: $c}}')"
+```
+Apply the `workspace` skill with `done <NAME>`.
 ```
 
 Summarize to the user:
@@ -399,10 +515,7 @@ Summarize to the user:
 3. Files changed
 4. Review findings (MUST / SHOULD / CONSIDER counts + resolutions)
 5. Remaining CONSIDER items with reasoning
-6. Deploy status
-7. Next steps:
-   - **merged** → "Done. Worktree cleaned up."
-   - **PR** → "PR is open. Run `/feature complete $NAME` after it merges."
-   - **skipped** → "Branch `$BRANCH` is pushed but not merged. Run `/feature complete $NAME` after merging."
+6. Delivery result, SHA, and CI/deploy status when shipped
+7. "Done. Worktree and landed feature branch cleaned up."
 
 Done.
