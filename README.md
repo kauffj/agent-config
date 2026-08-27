@@ -26,6 +26,7 @@ Windows without work, and the interesting parts assume all three.
 | `skills/` | 14 skills — `workspace`, `feature`, `propose`, `review-pr`, `explore`, `fix-ci`, `humanizer`, and others. |
 | `agents/` | 5 review subagents — security, simplicity, UI, visual, QA. |
 | `hooks/` | 8 hooks — session state, a destructive-command guard, auto-format, lessons injection, transcript fsync, and a pre-commit leak guard. |
+| `codex/` | Codex-native lifecycle wiring for the shared fleet state. |
 | `bin/` | 18 command-line tools behind the above. |
 | `lib/` | Shared libraries behind the skills — among them `doctor.mjs` (config integrity), `workspace.mjs` (worktree state, port allocation) and `project.mjs` (project profile). |
 | `systemd/user/` | 9 units — the timers that make durability and resurrection actually run. |
@@ -43,17 +44,18 @@ red. `Ctrl+Shift+Space` opens a fuzzy picker sorted by urgency;
 `Ctrl+Shift+F` greps live transcripts and jumps to the match.
 
 The visible bar is only a front-end. Underneath, `hooks/session-state.sh` writes
-`state/<session_id>.json` on every session event and `bin/claude-sessions --json`
-joins those into an urgency-sorted registry. Any terminal could render it.
+`state/<session_id>.json` from Claude and Codex lifecycle events, and
+`bin/claude-sessions --json` joins those into an urgency-sorted registry. Any
+terminal could render it.
 
 The registry is not Claude-only. Codex and Grok sessions run in the same tabs and
 compete for the same attention, so each vendor gets a small adapter returning the
 same record shape plus a `vendor` tag — and the picker, the tab bar, the attend
 key, cross-session search, the transcript reader and the post-reboot restore all
 work on them without knowing which vendor they are. Vendors that publish no
-session registry are found by process and matched to their own transcript store;
-they get a status from how long that transcript has been silent, since only
-Claude has hooks to report one.
+session registry are found by process and matched to their own transcript store.
+Codex reports exact status through its native hooks; vendors without hooks fall
+back to an estimate based on transcript activity.
 
 **The durability layer** ([`bin/README.md`](bin/README.md)). Claude appends each
 turn to a transcript, but the kernel can hold those writes in the page cache for
@@ -99,8 +101,8 @@ and `$UI_PRINCIPLES` in `settings.json`), so the standard being applied is
 editable text rather than something buried in a prompt.
 
 **`lib/doctor.mjs`**. Resolves every cross-reference in the config — file paths
-embedded in skills, agents, and hooks, `settings.json` env values, the `~/.claude`
-symlink — against what is actually on disk. It runs at session start and on
+embedded in skills, agents, and hooks, `settings.json` env values, and the
+Claude/Codex symlinks — against what is actually on disk. It runs at session start and on
 pre-commit, turning silent breakage (a renamed agent file, a moved doc) into a
 loud, early failure.
 
@@ -109,7 +111,8 @@ loud, early failure.
 ```bash
 git clone <this repo> ~/projects/claude-config
 ln -s ~/projects/claude-config ~/.claude
-mkdir -p ~/.claude/state ~/.config/wezterm
+mkdir -p ~/.claude/state ~/.codex ~/.config/wezterm
+ln -s ~/.claude/codex/hooks.json ~/.codex/hooks.json
 ln -s ~/.claude/wezterm/wezterm.lua ~/.config/wezterm/wezterm.lua
 
 # timers for durability + resurrection
@@ -135,8 +138,9 @@ wired up by `.gitattributes`) strips it on the way into git, so staging
 the commit as a backstop when the filter isn't configured. Both are needed: the
 filter is per-clone git config, which a fresh clone does not inherit.
 
-`settings.json` already wires the hooks and the status line; it is read from
-`~/.claude/settings.json`, which the symlink provides.
+`settings.json` wires Claude's hooks and status line; `codex/hooks.json` wires
+the corresponding Codex lifecycle events. Codex requires one-time review of a
+new or changed hook definition through `/hooks` before it will run.
 
 **Requirements:** WezTerm, `python3`, `jq`, `node`, systemd-user, and ideally
 `ripgrep` (plain `grep` is the fallback).

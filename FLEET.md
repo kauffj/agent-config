@@ -1,7 +1,7 @@
 # The fleet control plane
 
-Turns a single WezTerm window into a **fleet dashboard**: every tab is one Claude
-Code session, colored by how long it has been waiting on you, labeled by what
+Turns a single WezTerm window into a **fleet dashboard**: every tab is one agent
+session, colored by how long it has been waiting on you, labeled by what
 distinguishes it, and reachable through a fuzzy picker and a content search.
 
 Part of [claude-config](README.md) — see the README for install and for the rest
@@ -13,9 +13,9 @@ The visible tab bar is only a front-end. It renders a small, terminal-agnostic
 **data layer** that any tool could consume.
 
 ```
-Claude Code hooks ──► ~/.claude/state/<session_id>.json   {status, since, agents, wezterm_pane, cwd}
+Claude/Codex hooks ─► ~/.claude/state/<session_id>.json   {status, since, agents, wezterm_pane, cwd}
         │                          ▲
-        │                 bin/claude-snapshot  (60s systemd timer)
+        │                 bin/claude-snapshot  (60s systemd timer + unhooked-vendor fallback)
         │                   • snapshot live sessions for crash recovery
         │                   • REAP state files whose session is dead
         ▼                          │
@@ -28,19 +28,21 @@ Claude Code hooks ──► ~/.claude/state/<session_id>.json   {status, since, 
 
 **Layer 1 — the data layer (works in any terminal).**
 
-- **`hooks/session-state.sh`** is wired into Claude Code's hooks (`SessionStart`,
-  `Stop`, `UserPromptSubmit`, `PreToolUse`, `PermissionRequest`, `Notification`,
-  `SubagentStop`). On each event it writes `~/.claude/state/<session_id>.json`
+- **`hooks/session-state.sh`** is wired into Claude Code through `settings.json`
+  and Codex through `codex/hooks.json`. On each lifecycle event it writes
+  `~/.claude/state/<session_id>.json`
   with the session's `status` (`working` / `waiting` / `delegating`), `since`
   (when that status last *changed* — it only moves on a real transition, so
   "waiting 14m" stays truthful), `agents`, `wezterm_pane`, and `cwd`. It also
-  sets the terminal tab title with a trailing `●` when the session is waiting
-  on you, or `◐` when it is `delegating`.
+  Claude also gets a terminal title with a trailing `●` when the session is
+  waiting on you, or `◐` when it is `delegating`; Codex hook output stays silent
+  because WezTerm consumes the shared state file directly.
 
   `delegating` means the turn ended but background subagents are still running —
   the task notification will wake the session, so it is *not* waiting on you: no
   ding, no `●`, Attend skips it. The `agents` counter drives it (PreToolUse of
-  the Task/Agent tool increments, `SubagentStop` decrements). Because a killed
+  the Task/Agent tool increments for Claude, while Codex's native
+  `SubagentStart` increments directly; `SubagentStop` decrements both). Because a killed
   subagent never fires `SubagentStop`, the counter can only stick *high*, which
   would silence a tab forever — so every renderer (tab bar, statusline, picker)
   degrades a `delegating` whose `updated` has been silent >30m back to
@@ -57,7 +59,9 @@ Claude Code hooks ──► ~/.claude/state/<session_id>.json   {status, since, 
   a file whose session is no longer live is garbage that would otherwise skew the
   tab colors and collide with reused WezTerm pane ids. (Reaping is safe: a live
   session regenerates its file on its next hook, and it never mass-deletes on an
-  empty liveness read.)
+  empty liveness read.) For vendors without lifecycle hooks it retains the old
+  transcript-silence status estimate; a record tagged `status_source: "hook"`
+  is authoritative and is never overwritten by that estimate.
 
 **Layer 2 — the WezTerm front-end (`wezterm/wezterm.lua`).**
 It reads the data layer every ~second and turns it into the tab bar described below.
@@ -142,8 +146,9 @@ chooses the scrollbar.
 ## Install
 
 See the [README](README.md#install). The pieces this subsystem needs are the
-`~/.claude` and `wezterm.lua` symlinks, a `~/.claude/state` directory, the
-`hooks` block already present in `settings.json`, and the
+`~/.claude`, `~/.codex/hooks.json`, and `wezterm.lua` symlinks, a
+`~/.claude/state` directory, the hook configs already present in `settings.json`
+and `codex/hooks.json`, and the
 `claude-snapshot.timer` systemd-user unit (60 s tick — it drives both crash
 recovery and scheduled reopens).
 

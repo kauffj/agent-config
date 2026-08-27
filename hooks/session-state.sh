@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Unified per-session state hook — the single writer of a session's live state.
+# Unified Claude/Codex session-state hook — the single writer of live state.
 #
 # Fired on every lifecycle event, it does four things in order and ALWAYS exits 0,
 # so a bug here can never wedge a session:
@@ -11,8 +11,8 @@
 #      browser of the account this session runs on. Empty = the default account.
 #      `since` only moves on a real status *transition*, so "waiting 14m" stays
 #      truthful across repeated same-status events.
-#   3. Emits the OSC-0 tab title + idle marker via the terminalSequence field
-#      (hooks have no tty; Claude Code writes the escape to the PTY for us).
+#   3. For Claude, emits the OSC-0 tab title + idle marker via terminalSequence
+#      (Codex reads the same state file directly and expects silent hook output).
 #   4. Plays a one-shot sound on the transition *into* waiting (toggleable).
 #
 # Status is derived from the event, not passed as an arg, so every event wires to
@@ -22,10 +22,10 @@
 #
 # `delegating` = the turn ended but background subagents are still running; the
 # task notification will wake the session, so it is NOT waiting on you. Tracked
-# by `agents`: PreToolUse for the Task/Agent tool increments, SubagentStop
-# decrements (clamped at 0 — Workflow-spawned agents stop without a matching
-# launch here). The counter can only stick HIGH (a killed subagent never fires
-# SubagentStop), which would silence a tab forever — so renderers degrade a
+# by `agents`: Claude counts Task/Agent PreToolUse; Codex has SubagentStart;
+# both decrement on SubagentStop (clamped at 0). The counter can only stick HIGH
+# (a killed subagent never fires SubagentStop), which would silence a tab
+# forever — so renderers degrade a
 # `delegating` whose `updated` has gone stale (>30m; every SubagentStop bumps it)
 # back to `waiting`: the worst drift is a late ping, never a missed one.
 # Known gaps that still read as waiting: background Bash and Workflow runs —
@@ -36,6 +36,8 @@
 # literal $HOME/.claude/<file> that's absent on a clean checkout.
 CLAUDE_DIR="$HOME/.claude"
 STATE_DIR="$CLAUDE_DIR/state"
+HARNESS="${1:-claude}"
+[[ "$HARNESS" == "codex" ]] || HARNESS=claude
 INPUT=$(cat)
 
 # One jq pass -> shell-escaped assignments -> eval. @sh quotes each field safely,
@@ -46,6 +48,10 @@ eval "$(jq -r '@sh "event=\(.hook_event_name // "") agent_id=\(.agent_id // "") 
 # Stop hooks can re-fire recursively.
 [[ "$stop_active" == "true" ]] && exit 0
 [[ -z "$session_id" ]] && exit 0
+# Session ids become filenames. Both harnesses currently send compact UUID-like
+# identifiers; keep future malformed payloads from escaping state/ or creating
+# pathological names at this trusted hook boundary.
+[[ ${#session_id} -le 128 && "$session_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || exit 0
 
 state_file="$STATE_DIR/$session_id.json"
 mkdir -p "$STATE_DIR"
@@ -62,13 +68,18 @@ prev_status= prev_since= agents=0
 [[ "$agents" =~ ^[0-9]+$ ]] || agents=0
 now=$(printf '%(%s)T' -1)
 
-# A subagent finishing is pure bookkeeping: drop the in-flight count and bump
-# `updated` (each stop is a proof of life that pushes the renderers' stale
-# window forward). Touch nothing else — the wake-up turn's own Stop decides
-# waiting. No state file means nothing tracked, nothing to do.
-if [[ "$event" == "SubagentStop" ]]; then
+# Subagent lifecycle events are pure bookkeeping: Codex exposes the launch
+# directly, and both harnesses expose completion. Touch no status — the parent
+# remains working until its own Stop parks it. Each event bumps `updated` as
+# proof of life; an orphan event with no tracked parent does nothing.
+if [[ "$event" == "SubagentStop" \
+      || ( "$HARNESS" == "codex" && "$event" == "SubagentStart" ) ]]; then
   [[ -f "$state_file" ]] || exit 0
-  (( agents > 0 )) && agents=$((agents - 1))
+  if [[ "$event" == "SubagentStart" ]]; then
+    agents=$((agents + 1))
+  else
+    (( agents > 0 )) && agents=$((agents - 1))
+  fi
   tmp="$state_file.$$"
   if jq -c --argjson agents "$agents" --argjson updated "$now" \
         '.agents = $agents | .updated = $updated' "$state_file" >"$tmp" 2>/dev/null; then
@@ -114,9 +125,10 @@ else
     UserPromptSubmit) status=working; agents=0 ;;   # user present = safe reconcile point
     PreToolUse)
       status=working
-      # The launch half of the agents counter. "Task" is the tool's hook-facing
-      # name in most builds, "Agent" in newer ones — match both.
-      [[ "$tool_name" =~ ^(Task|Agent)$ ]] && agents=$((agents + 1)) ;;
+      # Claude has no SubagentStart, so its Task/Agent tool call is the launch
+      # signal. Codex does have it; counting both would double every child.
+      [[ "$HARNESS" == "claude" && "$tool_name" =~ ^(Task|Agent)$ ]] \
+        && agents=$((agents + 1)) ;;
     SessionStart)     status=waiting; agents=0 ;;   # fresh/resumed session awaits you
     *) exit 0 ;;
   esac
@@ -137,7 +149,8 @@ fi
 # SessionStart ONLY: a live session's on-disk transcript can lag minutes
 # behind (writes are buffered), so this signal is truthful just at reopen,
 # when the closed session's file is fully flushed.
-if [[ "$event" == "SessionStart" && "$since" == "$now" && -n "$cwd" ]]; then
+if [[ "$HARNESS" == "claude" && "$event" == "SessionStart" \
+      && "$since" == "$now" && -n "$cwd" ]]; then
   tf="$CLAUDE_DIR/projects/${cwd//\//-}/$session_id.jsonl"
   ts=$(tail -n 500 "$tf" 2>/dev/null \
        | jq -r 'select(.timestamp and (.type=="user" or .type=="assistant")) | .timestamp' 2>/dev/null \
@@ -153,9 +166,10 @@ if jq -nc --arg sid "$session_id" --arg st "$status" \
        --argjson since "$since" --argjson updated "$now" \
        --argjson agents "$agents" \
        --arg pane "${WEZTERM_PANE:-}" --arg cwd "$cwd" \
-       --arg profile "${CLAUDE_ACCT_BROWSER_PROFILE:-}" \
+       --arg profile "${CLAUDE_ACCT_BROWSER_PROFILE:-}" --arg harness "$HARNESS" \
      '{session_id:$sid, status:$st, since:$since, updated:$updated, agents:$agents,
        cwd:$cwd, browser_profile:$profile}
+      + (if $harness == "codex" then {vendor:"codex", status_source:"hook"} else {} end)
       + (if $pane != "" then {wezterm_pane:$pane} else {} end)' >"$tmp" 2>/dev/null; then
   mv -f "$tmp" "$state_file" 2>/dev/null
 fi
@@ -170,6 +184,10 @@ if [[ "$status" == "waiting" && "$prev_status" != "waiting" && -n "$snd" ]]; the
     setsid -f canberra-gtk-play -i "$snd" >/dev/null 2>&1 || true
   fi
 fi
+
+# Codex hook stdout is a control channel, not a terminal escape channel. The
+# state file above is authoritative and WezTerm reads it on its next tick.
+[[ "$HARNESS" == "codex" ]] && exit 0
 
 # Tab title + marker (OSC 0 via terminalSequence). Marker is a SUFFIX so it
 # survives title truncation; '●' = waiting on you, '◐' = waiting on subagents.

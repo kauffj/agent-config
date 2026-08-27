@@ -7,11 +7,13 @@ Stdlib only, no fixtures — the interesting cases are about agreeing with how
 Claude actually names transcript directories on this disk, so the end-to-end
 test reads the real ones rather than inventing them.
 """
+import fcntl
 import importlib.util
 import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
@@ -126,6 +128,104 @@ class TestStateReap(unittest.TestCase):
             self.assertFalse(exists(dead + ".json"))
             self.assertTrue(exists("acct-usage.json"))
             self.assertTrue(exists("sessions-snapshot.json"))
+
+
+class TestVendorState(unittest.TestCase):
+    """Lifecycle events outrank transcript mtime for vendors that have hooks."""
+
+    SID = "01a03c16-29cc-7e90-b489-68dbe15bde29"
+
+    def setUp(self):
+        self.snap = _load_snapshot()
+        self.tmp = tempfile.TemporaryDirectory()
+        os.mkdir(os.path.join(self.tmp.name, "state"))
+        self.real_dir = self.snap.CLAUDE_DIR
+        self.real_pane = self.snap.proc_pane_id
+        self.snap.CLAUDE_DIR = self.tmp.name
+        self.snap.proc_pane_id = lambda _pid: "51"
+        self.transcript = os.path.join(self.tmp.name, "rollout.jsonl")
+        with open(self.transcript, "w") as f:
+            f.write("{}\n")
+        os.utime(self.transcript, (100, 100))
+        self.info = {
+            self.SID: {
+                "pid": 123,
+                "cwd": "/work/project",
+                "vendor": "codex",
+                "transcript": self.transcript,
+            }
+        }
+
+    def tearDown(self):
+        self.snap.CLAUDE_DIR = self.real_dir
+        self.snap.proc_pane_id = self.real_pane
+        self.tmp.cleanup()
+
+    @property
+    def state_path(self):
+        return os.path.join(self.tmp.name, "state", self.SID + ".json")
+
+    def hooked_state(self):
+        return {
+            "session_id": self.SID,
+            "status": "working",
+            "since": 900,
+            "updated": 900,
+            "agents": 1,
+            "vendor": "codex",
+            "status_source": "hook",
+            "wezterm_pane": "51",
+        }
+
+    def test_hook_state_survives_a_quiet_rollout(self):
+        hooked = self.hooked_state()
+        with open(self.state_path, "w") as f:
+            json.dump(hooked, f)
+
+        self.snap._publish_vendor_state(self.info, now=1000)
+
+        with open(self.state_path) as f:
+            self.assertEqual(json.load(f), hooked)
+
+    def test_hook_write_wins_a_snapshot_race(self):
+        """The provenance read and fallback write share the hook's lock."""
+        lock_path = os.path.join(self.tmp.name, "state", ".lock")
+        started = threading.Event()
+        errors = []
+
+        def publish():
+            started.set()
+            try:
+                self.snap._publish_vendor_state(self.info, now=1000)
+            except BaseException as exc:  # preserve worker failures for the assertion
+                errors.append(exc)
+
+        with open(lock_path, "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            worker = threading.Thread(target=publish)
+            worker.start()
+            self.assertTrue(started.wait(1))
+            worker.join(0.05)
+            self.assertTrue(worker.is_alive(), "snapshot did not wait for state lock")
+            with open(self.state_path, "w") as f:
+                json.dump(self.hooked_state(), f)
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+        worker.join(1)
+        self.assertFalse(worker.is_alive(), "snapshot stayed blocked after unlock")
+        self.assertEqual(errors, [])
+        with open(self.state_path) as f:
+            self.assertEqual(json.load(f), self.hooked_state())
+
+    def test_unhooked_vendor_keeps_the_silence_fallback(self):
+        self.snap._publish_vendor_state(self.info, now=1000)
+
+        with open(self.state_path) as f:
+            state = json.load(f)
+        self.assertEqual(state["status"], "waiting")
+        self.assertEqual(state["since"], 100)
+        self.assertEqual(state["vendor"], "codex")
+        self.assertNotIn("status_source", state)
 
 
 

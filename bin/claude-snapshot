@@ -8,6 +8,7 @@ to bring back. The snapshot reflects honest current state (it may be empty if no
 is running); restore is on-demand, so a stale set is never re-opened uninvited.
 """
 import glob
+import fcntl
 import json
 import os
 import re
@@ -141,39 +142,52 @@ def _attach_tab_positions(sessions):
             s["tab"] = pos
 
 
-# A Codex session appends to its rollout while it works and goes quiet when it
-# wants you. Nothing writes a state file for it — only Claude has hooks — so the
-# tab bar and the attend key (CTRL+SHIFT+A) had to guess from the pane title and
-# got it wrong. Publish the same {status, since} record the hooks write, derived
-# from how long the transcript has been silent.
+# Vendors without lifecycle hooks get a best-effort state record from transcript
+# activity. Codex now has hooks (codex/hooks.json), whose status is exact; this
+# remains the fallback for an unhooked Codex install and for vendors such as Grok.
 VENDOR_IDLE_AFTER = 15          # seconds of silence that count as "waiting"
 
 
 def _publish_vendor_state(sessions, now):
-    """Give non-Claude sessions the state file every view already reads."""
+    """Give unhooked vendors the state file every view already reads.
+
+    A lifecycle hook writes ``status_source: hook``. Never replace that exact
+    event state with transcript silence: a model can reason for minutes without
+    completing another rollout item, which is the false-waiting bug this guard
+    exists to prevent.
+    """
     for sid, info in sessions.items():
         path = os.path.join(CLAUDE_DIR, "state", "%s.json" % sid)
-        transcript = info.get("transcript")
         try:
-            quiet = now - os.path.getmtime(transcript) if transcript else 0
-        except OSError:
-            quiet = 0
-        waiting = quiet >= VENDOR_IDLE_AFTER
-        status = "waiting" if waiting else "working"
-        # `since` is when this status began, so the fleet's wait gradient ages
-        # a quiet Codex tab exactly like a waiting Claude one.
-        since = int(now - quiet) if waiting else int(now)
-        prev = _read(path) or {}
-        if prev.get("status") == status and prev.get("since"):
-            since = prev["since"]          # don't restart an ongoing wait
-        pane = proc_pane_id(info["pid"]) if info.get("pid") else None
-        rec = {"session_id": sid, "status": status, "since": since,
-               "updated": int(now), "cwd": info.get("cwd") or "",
-               "vendor": info.get("vendor") or "other"}
-        if pane:
-            rec["wezterm_pane"] = pane
-        try:
-            _atomic_write(path, rec)
+            # The lifecycle hook uses this same lock. Keep the provenance read
+            # and fallback write in one critical section so a hook event cannot
+            # land between them and then be overwritten by transcript silence.
+            lock_path = os.path.join(CLAUDE_DIR, "state", ".lock")
+            with open(lock_path, "a") as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                prev = _read(path) or {}
+                if (prev.get("session_id") == sid
+                        and prev.get("status_source") == "hook"):
+                    continue
+                transcript = info.get("transcript")
+                try:
+                    quiet = now - os.path.getmtime(transcript) if transcript else 0
+                except OSError:
+                    quiet = 0
+                waiting = quiet >= VENDOR_IDLE_AFTER
+                status = "waiting" if waiting else "working"
+                # `since` is when this status began, so the fleet's wait
+                # gradient ages a quiet Codex tab like a waiting Claude one.
+                since = int(now - quiet) if waiting else int(now)
+                if prev.get("status") == status and prev.get("since"):
+                    since = prev["since"]  # don't restart an ongoing wait
+                pane = proc_pane_id(info["pid"]) if info.get("pid") else None
+                rec = {"session_id": sid, "status": status, "since": since,
+                       "updated": int(now), "cwd": info.get("cwd") or "",
+                       "vendor": info.get("vendor") or "other"}
+                if pane:
+                    rec["wezterm_pane"] = pane
+                _atomic_write(path, rec)
         except OSError:
             continue
 

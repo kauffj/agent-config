@@ -11,6 +11,7 @@
 # session state is never touched.
 
 HOOK="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/session-state.sh"
+CODEX_HOOKS="$(dirname "$HOOK")/../codex/hooks.json"
 export HOME=$(mktemp -d)
 mkdir -p "$HOME/.claude"
 touch "$HOME/.claude/sound-off"          # never ding from a test run
@@ -25,6 +26,14 @@ fire() { # fire <event> [extra-json-pairs ...] -> hook stdout
   for kv in "$@"; do extra+=",$kv"; done
   printf '{"hook_event_name":"%s","session_id":"%s","cwd":"%s"%s}' \
     "$ev" "$SID" "$CWD" "$extra" | "$HOOK" 2>/dev/null
+}
+
+fire_codex() { # same payload, but exercise Codex's silent-output contract
+  local ev=$1; shift
+  local extra=""
+  for kv in "$@"; do extra+=",$kv"; done
+  printf '{"hook_event_name":"%s","session_id":"%s","cwd":"%s"%s}' \
+    "$ev" "$SID" "$CWD" "$extra" | "$HOOK" codex 2>/dev/null
 }
 
 expect() { # expect <jq-field> <want> <label>
@@ -53,6 +62,22 @@ marker() { # marker <hook-stdout> <glyph|none> <label>
     fails=$((fails + 1))
   fi
 }
+
+echo "Codex config wires every status transition:"
+for ev in SessionStart UserPromptSubmit PreToolUse PermissionRequest SubagentStart SubagentStop Stop; do
+  command=$(jq -r --arg ev "$ev" '.hooks[$ev][0].hooks[0].command // ""' "$CODEX_HOOKS")
+  [ "$command" = '~/.claude/hooks/session-state.sh codex' ] \
+    && printf '  ok    %-28s wired\n' "$ev" \
+    || { printf '  FAIL  %-28s command=%q\n' "$ev" "$command"; fails=$((fails+1)); }
+done
+
+echo "malformed session ids cannot become state paths:"
+SID='../escape'; fire SessionStart >/dev/null
+escape_name='escape.json'
+[ ! -e "$HOME/.claude/$escape_name" ] \
+  && printf '  ok    %-28s rejected\n' "path traversal" \
+  || { printf '  FAIL  %-28s file appeared\n' "path traversal"; fails=$((fails+1)); }
+SID='test-session-1'; SF="$HOME/.claude/state/$SID.json"
 
 echo "lifecycle without subagents stays as before:"
 out=$(fire SessionStart)
@@ -138,6 +163,34 @@ fire SubagentStop >/dev/null
 [ ! -e "$HOME/.claude/state/$SID.json" ] \
   && printf '  ok    %-28s no file created\n' "orphan SubagentStop" \
   || { printf '  FAIL  %-28s state file appeared\n' "orphan SubagentStop"; fails=$((fails+1)); }
+
+echo "Codex lifecycle events are authoritative and silent:"
+SID="test-codex-session"; SF="$HOME/.claude/state/$SID.json"
+export WEZTERM_PANE=91
+out=$(fire_codex SessionStart)
+expect status waiting       "Codex SessionStart"
+expect vendor codex         "Codex vendor"
+expect status_source hook   "Codex status source"
+expect wezterm_pane 91      "Codex pane"
+[ -z "$out" ] \
+  && printf '  ok    %-28s stdout empty\n' "Codex SessionStart" \
+  || { printf '  FAIL  %-28s stdout=%q\n' "Codex SessionStart" "$out"; fails=$((fails+1)); }
+
+fire_codex UserPromptSubmit >/dev/null
+expect status working       "Codex prompt submitted"
+fire_codex PreToolUse '"tool_name":"Agent"' >/dev/null
+expect agents 0             "Codex no PreTool double-count"
+fire_codex SubagentStart '"agent_id":"sub-codex"' >/dev/null
+expect agents 1             "Codex SubagentStart"
+out=$(fire_codex Stop)
+expect status delegating    "Codex Stop with subagent"
+[ -z "$out" ] \
+  && printf '  ok    %-28s stdout empty\n' "Codex Stop" \
+  || { printf '  FAIL  %-28s stdout=%q\n' "Codex Stop" "$out"; fails=$((fails+1)); }
+fire_codex SubagentStop '"agent_id":"sub-codex"' >/dev/null
+expect agents 0             "Codex SubagentStop"
+fire_codex Stop >/dev/null
+expect status waiting       "Codex final Stop"
 
 rm -rf "$HOME"
 if [ "$fails" -eq 0 ]; then echo "ALL PASS"; else echo "$fails FAILURE(S)"; exit 1; fi
