@@ -55,6 +55,16 @@ check BLOCK "git push origin main --force"
 check BLOCK "git push -f origin main"
 check BLOCK "git reset --hard origin/main"
 
+echo "--- worktree branch-sharing overrides: must be BLOCKED ---"
+check BLOCK "git checkout --ignore-other-worktrees main"
+check BLOCK "git switch --ignore-other-worktrees main"
+check BLOCK "git worktree add --force ../wt main"
+check BLOCK "git worktree add ../wt main --force"
+check BLOCK "git worktree add -f ../wt main"
+check ALLOW "git worktree add .workspaces/worktrees/x -b feature/y origin/main"
+check ALLOW "git worktree add .workspaces/worktrees/x feature/existing"
+check ALLOW "git worktree remove .workspaces/worktrees/x --force"
+
 echo "--- protected files (Edit/Write) ---"
 w() { # w <ALLOW|BLOCK> <path>
   local want=$1 path=$2 got

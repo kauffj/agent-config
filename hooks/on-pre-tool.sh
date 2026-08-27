@@ -46,6 +46,18 @@ case "$TOOL" in
             exit 2
         fi
 
+        # 3b. Overriding git's refusal to check one branch out in two worktrees.
+        #     Both folders' HEADs then point at ONE branch ref, so a commit in
+        #     either moves the other's HEAD without touching its files — and git
+        #     reads that gap as staged DELETIONS the next commit carries. This is
+        #     how fsp-app 9544bc21 reverted six commits while pushing as a clean
+        #     fast-forward. The refusal ("'main' is already used by worktree at
+        #     ...") is the protection; these two flags are the only ways past it.
+        if echo "$CMD" | grep -qE '(--ignore-other-worktrees|git[[:space:]]+worktree[[:space:]]+add[^;&|]*[[:space:]](--force|-f)([[:space:]]|$))'; then
+            echo "Blocked: this overrides git's refusal to check one branch out in two worktrees. Two worktrees sharing a branch silently stage each other's files as deletions (fsp-app 9544bc21 lost six commits that way). If you need that branch, work in the worktree that already holds it, or start a new branch here: git worktree add <path> -b <branch> origin/main" >&2
+            exit 2
+        fi
+
         # ── Keep an opted-in repo's MAIN checkout on its protected branch ──
         # Opt a repo in from inside it (no path is hardcoded here):
         #   git config claude.protectMainCheckout true
