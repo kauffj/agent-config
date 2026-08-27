@@ -1,10 +1,9 @@
 ---
 name: review-pr
 description: Run specialized review agents (security, simplicity, UI, optional visual + QA) over a PR, a worktree, or an explicit file set.
-argument-hint: "<PR number/URL> | --worktree <path> | --files <f1,f2,...>  [--server <url>] [--screenshots <dir>]"
 ---
 
-# /review-pr — parallel code review
+# Parallel code review
 
 Runs review agents in parallel over a set of changed files with context. Works against:
 - A GitHub PR (fetched via `gh`)
@@ -13,7 +12,7 @@ Runs review agents in parallel over a set of changed files with context. Works a
 
 When a running dev server and/or screenshot directory are provided, also runs functional-QA and visual-review agents.
 
-**Agents** (in `$HOME/.claude/agents/`):
+**Reviewer role prompts** (in `$HOME/.config/agent-config/agents/`):
 - `security-reviewer.md` — whenever any executable code changed
 - `simplicity-reviewer.md` — whenever any executable code changed
 - `ui-reviewer.md` — if any frontend files changed
@@ -28,22 +27,26 @@ missed vulnerability. Prose-only changes are the one case that needs no judgment
 to rule out.
 
 **Reference files:**
-- `$HICKEY_PRINCIPLES` and `$UI_PRINCIPLES` are set via settings.json env
+- `$HOME/.config/agent-config/hickey-principles.md`
+- `$HOME/.config/agent-config/ui-design-principles.md`
 
 ---
 
-## Parse `$ARGUMENTS`
+## Parse the request
 
 Detect the mode:
 
-- If `$ARGUMENTS` starts with `--worktree` → **Worktree mode**
-- If `$ARGUMENTS` starts with `--files` → **File-list mode**
+- If the invocation text starts with `--worktree` → **Worktree mode**
+- If the invocation text starts with `--files` → **File-list mode**
 - Otherwise → **PR mode** (first token is the PR ref)
 
 Also parse optional flags that apply to all modes:
 - `--server <url>` — dev server URL, enables QA agent
 - `--screenshots <dir>` — screenshot directory, enables visual agent
 - `--acceptance-criteria <text>` — passed to QA agent (optional)
+- `--base <branch>` — worktree-mode base override; otherwise resolve the remote default
+- `--reviewers <comma-list>` — restrict execution to any of `security`,
+  `simplicity`, `ui`, `qa`, or `visual`; otherwise use the classifiers below
 
 ---
 
@@ -64,7 +67,7 @@ Use the file list from `gh pr view ... --json files`. Check out the PR locally i
 
 ```bash
 cd "$WORKTREE_PATH"
-DEFAULT_BRANCH=$(node $HOME/.claude/lib/project.mjs load | jq -r .defaultBranch)
+DEFAULT_BRANCH=${BASE_OVERRIDE:-$(node "$HOME/.config/agent-config/lib/workspace.mjs" default-branch | jq -r .defaultBranch)}
 git fetch origin "$DEFAULT_BRANCH" --quiet
 # Diff the merge-base against the WORKING TREE, not ...HEAD: a recovered or
 # in-progress worktree can hold extensive uncommitted work, and `...HEAD` sees
@@ -105,15 +108,24 @@ finding lives.
 `app/`, or `pages/`, `.css`, `.scss`, `.vue`, `.svelte`. If any changed, the UI
 reviewer runs.
 
+Apply `--reviewers` after these mechanical classifiers: a reviewer runs only if
+it is both applicable and selected. This keeps target resolution and frontend
+classification in one skill while letting the focused review skills request a
+single role.
+
 ---
 
-## Step 3: Launch review agents in parallel
+## Step 3: Delegate reviewer roles in parallel
 
-**Launch all applicable agents in a single message.** Each agent's persona + criteria are in its agent file — read the file and use it as the base prompt, then append the context listed below.
+Read each applicable role prompt and delegate all roles concurrently through
+the current harness. Use the role prompt as the base and append the context
+listed below. If delegation is unavailable, run that review in the current
+context. If a required capability such as interactive browser control is
+unavailable, report that reviewer as unavailable; do not count it as completed.
 
 ### 3a. Security Review (unless prose-only, per Step 2)
 
-Agent: `$HOME/.claude/agents/security-reviewer.md`
+Role prompt: `$HOME/.config/agent-config/agents/security-reviewer.md`
 
 Append:
 - Changed files with full paths: [LIST]
@@ -122,25 +134,25 @@ Append:
 
 ### 3b. Simplicity Review (unless prose-only, per Step 2)
 
-Agent: `$HOME/.claude/agents/simplicity-reviewer.md`
+Role prompt: `$HOME/.config/agent-config/agents/simplicity-reviewer.md`
 
 Append:
 - Changed files with full paths: [LIST]
-- `$HICKEY_PRINCIPLES` is set via settings.json env
+- Simplicity criteria: `$HOME/.config/agent-config/hickey-principles.md`
 
 ### 3c. UI Review (if frontend files changed)
 
-Agent: `$HOME/.claude/agents/ui-reviewer.md`
+Role prompt: `$HOME/.config/agent-config/agents/ui-reviewer.md`
 
 Append:
 - Changed frontend files: [LIST]
-- `$UI_PRINCIPLES` is set via settings.json env
+- UI criteria: `$HOME/.config/agent-config/ui-design-principles.md`
 
 Skip if no frontend files.
 
 ### 3d. QA Review (if `--server <url>` provided)
 
-Agent: `$HOME/.claude/agents/qa-tester.md`
+Role prompt: `$HOME/.config/agent-config/agents/qa-tester.md`
 
 Append:
 - Dev server URL: `$SERVER_URL`
@@ -151,11 +163,11 @@ Skip if no `--server`.
 
 ### 3e. Visual Review (if `--screenshots <dir>` provided)
 
-Agent: `$HOME/.claude/agents/visual-reviewer.md`
+Role prompt: `$HOME/.config/agent-config/agents/visual-reviewer.md`
 
 Append:
 - Screenshot files: [list of paths in `$SCREENSHOTS_DIR`]
-- `$UI_PRINCIPLES` is set via settings.json env
+- UI criteria: `$HOME/.config/agent-config/ui-design-principles.md`
 
 Skip if no `--screenshots`.
 
@@ -164,6 +176,10 @@ Skip if no `--screenshots`.
 ## Step 4: Synthesize
 
 Consolidate all findings into a single review.
+
+List each requested reviewer as `completed`, `skipped` (with the rule that
+caused the skip), or `unavailable` (with the missing capability). Only completed
+reviewers contribute findings or completion counts.
 
 **Review: <title or branch>**
 

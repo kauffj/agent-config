@@ -53,6 +53,7 @@ check BLOCK 'psql "$U" -c "TRUNCATE members;"'
 check BLOCK "git push --force origin main"
 check BLOCK "git push origin main --force"
 check BLOCK "git push -f origin main"
+check BLOCK "git push origin +HEAD:main"
 check BLOCK "git reset --hard origin/main"
 
 echo "--- worktree branch-sharing overrides: must be BLOCKED ---"

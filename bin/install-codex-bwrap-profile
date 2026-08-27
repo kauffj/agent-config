@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_path="$(/usr/bin/realpath -e -- "${BASH_SOURCE[0]}")"
+script_dir="${script_path%/*}"
+repo_dir="$(cd -- "$script_dir/.." && pwd -P)"
+source_profile="$repo_dir/apparmor.d/codex-bwrap"
+target_profile=/etc/apparmor.d/codex-bwrap
+
+if [[ $# -eq 1 && $1 == --check ]]; then
+  codex sandbox -- /bin/true
+  echo "Codex workspace sandbox is available."
+  exit 0
+fi
+
+if [[ $# -ne 0 ]]; then
+  echo "Usage: install-codex-bwrap-profile [--check]" >&2
+  exit 2
+fi
+
+if [[ ! -x /usr/bin/bwrap || ! -x /usr/bin/install || ! -x /usr/bin/sudo
+      || ! -x /usr/sbin/apparmor_parser ]]; then
+  echo "This installer requires bubblewrap and AppArmor on Linux." >&2
+  exit 1
+fi
+
+if [[ ! -f $source_profile || -L $source_profile
+      || $(/usr/bin/realpath -e -- "$source_profile") != "$source_profile" ]]; then
+  echo "$source_profile must be a canonical regular, non-symlink file." >&2
+  exit 1
+fi
+
+if [[ -L $target_profile || ( -e $target_profile && ! -f $target_profile ) ]]; then
+  echo "$target_profile exists but is not a regular file; refusing to replace it." >&2
+  exit 1
+fi
+
+if [[ -f $target_profile ]] && ! /usr/bin/cmp -s "$source_profile" "$target_profile"; then
+  echo "$target_profile already contains different policy; refusing to replace it." >&2
+  exit 1
+fi
+
+# The caller's shell opens the audited source before privilege elevation. Root
+# receives only those already-selected bytes through stdin and never resolves a
+# repository path.
+/usr/bin/sudo /usr/bin/install --owner=root --group=root --mode=0644 /dev/stdin "$target_profile" \
+  < "$source_profile"
+/usr/bin/sudo /usr/sbin/apparmor_parser -r "$target_profile"
+
+codex sandbox -- /bin/true
+echo "Installed $target_profile; Codex workspace sandbox is available."

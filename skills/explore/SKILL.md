@@ -1,16 +1,18 @@
 ---
 name: explore
 description: Deep codebase research in isolated context — investigate a question thoroughly without cluttering the main conversation
-argument-hint: "<question about the codebase>"
-context: fork
-agent: Explore
 ---
 
 # Deep Codebase Exploration
 
-You are investigating a question about this codebase. Be thorough — check multiple files, trace call chains, read tests, and look at git history when relevant.
+Delegate the investigation to an available exploration subagent so its working
+context stays isolated. If this skill is already running in such a subagent,
+continue there. If delegation is unavailable, investigate in the current
+context and report that limitation.
 
-**Question:** $ARGUMENTS
+Be thorough — check multiple files, trace call chains, read tests, and look at git history when relevant.
+
+Treat the text supplied with the invocation as the question.
 
 ## Approach
 

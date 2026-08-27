@@ -14,7 +14,7 @@
 
 ### 3. Self-Improvement Loop
 - After ANY correction from the user: update `tasks/lessons.md` with a rule that would have prevented the mistake
-- Lessons are injected automatically at session start (SessionStart hook in settings.json); if they didn’t arrive, read `tasks/lessons.md` yourself
+- Lessons are injected automatically by the current harness's SessionStart hook; if they didn’t arrive, read `tasks/lessons.md` yourself
 - When a lesson keeps proving itself, graduate it into the current project's `AGENTS.md`; update the global canonical instructions only when the lesson is genuinely global — lessons.md is the inbox, not the archive
 
 ### 4. Verification Before Done
@@ -47,6 +47,7 @@
 - Automate every step the user would otherwise do by hand: write the script instead of listing manual steps, use browser tools to carry them to the exact field that needs their input, pre-fill everything you can.
 - Exhaust automated testing and automated review before asking for human review.
 - When you do ask for review, deliver the target ready to look at: open the app, launch the window, link the exact URL or document. Never "go to X and click Y."
+- Once approved work passes its verification gates, deliver and push it directly to the repository's actual default branch, then monitor CI and deployment to completion. Do not offer a PR or leave finished work on a feature branch.
 
 ### 9. Portable Project Instructions
 - Author shared project guidance in the nearest `AGENTS.md`
@@ -73,7 +74,7 @@ Every production site runs on one shared droplet. **`~/projects/server-config/SE
 
 ### Temporary server lifetime
 
-- Launch every temporary development, preview, test, or static-file server through `~/.claude/bin/agent-session-server -- <command>`. Run the wrapper as a foreground long-running tool command; use the tool's background/session facility when work must continue. Do not use shell `&`, `nohup`, `disown`, or a daemon mode.
+- Launch every temporary development, preview, test, or static-file server through `~/.config/agent-config/bin/agent-session-server -- <command>`. Run the wrapper as a foreground long-running tool command; use the tool's background/session facility when work must continue. Do not use shell `&`, `nohup`, `disown`, or a daemon mode.
 - The wrapper owns the server process group and stops it when the nearest Claude or Codex CLI process exits. Production services that intentionally outlive the agent session are outside this rule.
 - Stop temporary servers explicitly when review ends, then verify that their listening port closed. Session-bound cleanup is the final safety net, not a substitute for ordinary cleanup.
 

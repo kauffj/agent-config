@@ -48,8 +48,14 @@ jobs:
           git ls-files '*.mjs' '*.js' | xargs -r -n1 node --check
           node --check bin/agent-config-install
 
-      - name: Agent discovery installation
-        run: node --test lib/test-agent-config-install.mjs
+      - name: Agent discovery and delivery
+        run: |
+          node --test lib/test-agent-config-install.mjs
+          node --test lib/test-codex-bwrap-installer.mjs
+          node --test lib/test-project.mjs
+          node --test lib/test-workspace-port.mjs
+          node --test lib/test-workspace-delivery.mjs
+          node --test lib/test-portable-skills.mjs
 
       - name: Shell syntax
         run: |
@@ -58,6 +64,9 @@ jobs:
             head -1 "$f" | grep -qE '^#!.*(bash|sh)$' && files+=("$f")
           done < <(git ls-files 'bin/*' 'hooks/*' | grep -v '\.')
           printf '%s\n' "${files[@]}" | sort -u | xargs -r -n1 bash -n
+
+      - name: AppArmor profile syntax
+        run: apparmor_parser --skip-kernel-load --skip-cache apparmor.d/codex-bwrap
 
       - name: ShellCheck
         # Errors only for now: the existing scripts carry style/info findings
@@ -75,7 +84,9 @@ jobs:
         run: bash hooks/test-on-pre-tool.sh
 
       - name: Session-state status machine
-        run: bash hooks/test-session-state.sh
+        run: |
+          bash hooks/test-session-state.sh
+          bash hooks/test-codex-hooks.sh
 
       - name: settings.json clean filter
         run: bash lib/test-strip-automode.sh

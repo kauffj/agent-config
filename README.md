@@ -23,12 +23,12 @@ Windows without work, and the interesting parts assume all three.
 |---|---|
 | **[`FLEET.md`](FLEET.md)** | The fleet control plane — a terminal-agnostic data layer, and a WezTerm tab bar that renders it. Wait-color escalation, fuzzy session picker, transcript search, snooze-and-reopen. |
 | **[`bin/README.md`](bin/README.md)** | Durability and resurrection — fsync'ing transcripts against unclean shutdowns, restoring ones that vanished, and reopening the sessions that were live before a reboot. |
-| `skills/` | 14 skills — `workspace`, `feature`, `propose`, `review-pr`, `explore`, `fix-ci`, `humanizer`, and others. |
+| `skills/` | 13 skills — `workspace`, `feature`, `propose`, `review-pr`, `explore`, `fix-ci`, `humanizer`, and others. |
 | `agents/` | 5 review subagents — security, simplicity, UI, visual, QA. |
-| `hooks/` | 8 hooks — session state, a destructive-command guard, auto-format, lessons injection, transcript fsync, and a pre-commit leak guard. |
-| `codex/` | Codex-native lifecycle wiring for the shared fleet state. |
-| `bin/` | 18 command-line tools behind the above. |
-| `lib/` | Shared libraries behind the skills — among them `doctor.mjs` (config integrity), `workspace.mjs` (worktree state, port allocation) and `project.mjs` (project profile). |
+| `hooks/` | 8 hooks — session state, an accidental-destructive-command backstop, auto-format, lessons injection, transcript fsync, and a pre-commit leak guard. |
+| `codex/` | Codex-native lifecycle, startup, and safety-hook wiring. |
+| `bin/` | 20 command-line tools behind the above. |
+| `lib/` | Shared libraries behind the skills — among them `doctor.mjs` (config integrity), the `workspace*.mjs` state/Git/database/delivery modules and CLI façade, and `project.mjs` (derived project profile plus tracked `.agent/project.json` overrides). |
 | `systemd/user/` | 9 units — the timers that make durability and resurrection actually run. |
 | `instructions/AGENTS.md` | The canonical standing instructions. Workflow orchestration, core principles, and a section on the economics of an agent's time vs. yours. |
 | `CLAUDE.md`, `AGENTS.md` | Thin harness-facing files: the Claude/Grok compatibility import and repository-local Codex guidance. |
@@ -80,11 +80,15 @@ subscriptions, no shared credentials. It reads an undocumented
 `api/oauth/usage` endpoint — the same one `/usage` renders — so treat that part
 as liable to change without notice.
 
-**`/workspace`** (`skills/workspace/SKILL.md`). One primitive for isolated
+**`workspace`** (`skills/workspace/SKILL.md`). One primitive for isolated
 parallel work: a git worktree, a dev-server port, a copied env file, an isolated
 database, and a state record — created, resumed, and torn down as a unit. The
-other skills (`/feature`, `/propose`, `/review-pr`) call it instead of each
-reimplementing worktree setup.
+other skills (`feature`, `propose`, `review-pr`) call it instead of each
+reimplementing worktree setup. `feature` uses that branch for implementation
+and review, then integrates the remote's actual default branch, reruns the
+approved checks, pushes the verified commit directly to default, waits for CI,
+and removes the landed branch and worktree. PRs and parked branches are not
+completion paths in this workflow.
 
 **The review agents** (`agents/`, `skills/review-*`). Five specialist reviewers —
 security, simplicity, UI, visual, QA — that share one contract rather than one
@@ -93,13 +97,12 @@ tester never reads source, the simplicity reviewer never questions requirements
 that were already agreed), carries a single **core question** it asks of every
 file, grades findings **MUST FIX / SHOULD FIX / CONSIDER**, and ends with **"what
 I couldn't evaluate"** — the blind-spot disclosure that makes a clean review
-trustworthy instead of merely quiet. `/review-pr` runs them over a PR, a
+trustworthy instead of merely quiet. `review-pr` runs them over a PR, a
 worktree, or an explicit file list; each also runs standalone.
 
 The simplicity and UI reviewers read their criteria from files in this repo
-(`hickey-principles.md`, `ui-design-principles.md`, pointed at by `$HICKEY_PRINCIPLES`
-and `$UI_PRINCIPLES` in `settings.json`), so the standard being applied is
-editable text rather than something buried in a prompt.
+through the neutral `~/.config/agent-config` source alias, so the standard being
+applied is editable text rather than something buried in a prompt.
 
 **`lib/doctor.mjs`**. Resolves every cross-reference in the config — file paths
 embedded in skills, agents, hooks, and instructions, `settings.json` env values,
@@ -114,8 +117,12 @@ git clone <this repo> ~/projects/claude-config
 ~/projects/claude-config/bin/agent-config-install
 ~/projects/claude-config/bin/agent-config-install --check
 
-mkdir -p ~/.claude/state ~/.codex ~/.config/wezterm
-ln -s ~/.claude/codex/hooks.json ~/.codex/hooks.json
+# Ubuntu 24.04 only: permit Codex's bubblewrap workspace sandbox without
+# disabling AppArmor's global unprivileged-user-namespace restriction
+~/projects/claude-config/bin/install-codex-bwrap-profile
+~/projects/claude-config/bin/install-codex-bwrap-profile --check
+
+mkdir -p ~/.claude/state ~/.config/wezterm
 ln -s ~/.claude/wezterm/wezterm.lua ~/.config/wezterm/wezterm.lua
 
 # timers for durability + resurrection
@@ -125,7 +132,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now claude-snapshot.timer claude-transcript-sync.timer
 
 # integrity check + the pre-commit leak guard
-node ~/.claude/lib/doctor.mjs
+node ~/.config/agent-config/lib/doctor.mjs
 ln -sf ../../hooks/pre-commit ~/.claude/.git/hooks/pre-commit
 
 # keep auto mode's generated infra dossier out of git (see below)
@@ -133,9 +140,9 @@ git -C ~/.claude config filter.strip-automode.clean "node lib/strip-automode.mjs
 ```
 
 The installer derives the repository path from its own location and creates
-exactly five links: the neutral `~/.config/agent-config` source alias,
-`~/.claude`, Codex's `~/.codex/AGENTS.md`, Grok's `~/.grok/AGENTS.md`, and the
-shared `~/.agents/skills`. Codex and Grok both point directly to the canonical
+exactly six links: the neutral `~/.config/agent-config` source alias,
+`~/.claude`, Codex's `~/.codex/AGENTS.md` and `~/.codex/hooks.json`, Grok's
+`~/.grok/AGENTS.md`, and the shared `~/.agents/skills`. Codex and Grok both point directly to the canonical
 policy; Grok discovers Claude instruction files but does not expand Claude's
 `@...` imports. The installer is idempotent and refuses to replace unrecognized
 files, directories, or links. The only automatic migration is the former
@@ -147,6 +154,24 @@ Run it as the target user, never through `sudo`. It is a single-user bootstrap
 tool and assumes another process is not concurrently rewriting the same
 configuration paths; it is not a security boundary against processes already
 running as that user.
+
+On Ubuntu systems that set `kernel.apparmor_restrict_unprivileged_userns=1`,
+Codex's `workspace-write` sandbox needs the included path-specific AppArmor
+profile. The separate installer copies it to `/etc/apparmor.d/codex-bwrap`,
+loads it, and runs a real sandbox probe. It refuses to overwrite different
+existing policy. This keeps the global user-namespace restriction enabled and
+grants the capability only when `/usr/bin/bwrap` runs.
+
+Sandbox and approval policy belong in Codex's user-level `~/.codex/config.toml`,
+not a repository-local `.codex/config.toml`: project config intentionally
+cannot elevate these native security controls. The autonomous default used on
+this workstation is `approval_policy = "never"`, `sandbox_mode =
+"workspace-write"`, and `network_access = true` under
+`[sandbox_workspace_write]`, with `exclude_slash_tmp = true` and
+`exclude_tmpdir_env_var = true`. This confines filesystem writes to the
+checkout while allowing ordinary package, Git, and research traffic. Use a
+command-line override for an exceptional session instead of weakening a
+project file that Codex will ignore.
 
 **That last line matters.** Auto mode writes a summary of this machine's
 infrastructure — production hostnames, where secrets live, how deploys work —
@@ -180,9 +205,11 @@ unprompted. That is a deliberate trade for an autonomous single-operator machine
 not an oversight, and it is the setting to change first if you adopt this. It
 used to sit above forty specific `Bash(...)` entries that it already subsumed;
 those are gone, because a list that grants nothing reads like the real boundary
-and isn't. The actual boundary is `hooks/on-pre-tool.sh` (target-aware refusals,
-tested by `hooks/test-on-pre-tool.sh`) plus `autoMode.soft_deny`. Defense in
-depth, not the primary control — if you want a real one, narrow `Bash(*)`. `wezterm/families.example.json` is an
+and isn't. `hooks/on-pre-tool.sh` (target-aware refusals, tested by
+`hooks/test-on-pre-tool.sh`) and `autoMode.soft_deny` catch common accidents but
+are string-matching heuristics, not security boundaries. Sandbox and permission
+policy are the real controls; narrow `Bash(*)` if you want stronger Claude
+isolation. `wezterm/families.example.json` is an
 example; copy it to `~/.claude/fleet/families.json` and use absolute paths (the
 `cwd` is handed to WezTerm verbatim — no `~` or `$HOME` expansion).
 
@@ -194,13 +221,12 @@ commits are the durable state shared between them; each harness keeps and
 resumes its own sessions. This repository does not translate transcripts or
 try to make one harness resume another's session.
 
-Follow-on work should stay thin and evidence-driven: migrate project guidance
-to canonical `AGENTS.md` files, remove unnecessary Claude-specific paths and
-tool names from otherwise shared skills, and add a vendor adapter only where a
-real incompatibility requires one. Hooks, permissions, session stores, and UI
-preferences remain native to each harness. Existing standards and tools should
-be preferred over a new session daemon, plugin runtime, or terminal/worktree
-manager.
+Shared workflow skills use semantic operations—apply another skill, yield for a
+decision, delegate a role, and run a long-lived tool—plus the neutral source
+alias. Hooks, permissions, session stores, exact reviewer tool grants, and UI
+preferences remain native to each harness. Add a vendor adapter only where a
+demonstrated incompatibility requires one; do not add a workflow runtime,
+duplicate skill bodies, or per-harness worktree manager.
 
 ## Not in this repo
 

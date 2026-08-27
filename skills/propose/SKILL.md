@@ -1,28 +1,27 @@
 ---
 name: propose
 description: Produce an approved implementation proposal — plan, simplicity-review the plan, checkpoint with user. Use before non-trivial implementation work (architectural decisions, multi-file changes, features) when alignment is wanted before writing code. Returns a plan ready to implement.
-argument-hint: "<description of what to build> [--workspace <name>]"
 ---
 
-# /propose — align before you build
+# Align before building
 
 Plan a non-trivial change, get it reviewed against simplicity principles, then confirm with the user. Returns an **approved plan** that a downstream skill (or you) can implement.
 
-Use this when the work is big enough that you want alignment before writing code. `/feature` calls this as Step 1; you can also call it standalone for a refactor, a bug-fix approach, a spike design, etc.
+Use this when the work is big enough that you want alignment before writing code. The `feature` skill applies it as Step 1; it can also be applied standalone for a refactor, a bug-fix approach, or a spike design.
 
 **Reference files:**
-- `$HOME/.claude/hickey-principles.md` — simplicity criteria for the design review
+- `$HOME/.config/agent-config/hickey-principles.md` — simplicity criteria for the design review
 
 ---
 
-## Parse `$ARGUMENTS`
+## Parse the request
 
-Split `$ARGUMENTS` into the description and optional `--workspace <name>`.
+Split the text supplied with the invocation into the description and optional `--workspace <name>`.
 
 If `--workspace <name>` is provided, fetch the workspace record so the plan targets the right worktree:
 
 ```bash
-node $HOME/.claude/lib/workspace.mjs get <NAME>
+node "$HOME/.config/agent-config/lib/workspace.mjs" get <NAME>
 ```
 
 Use its `worktreePath` as the working directory for the Plan agent. If no workspace, use the current working directory.
@@ -30,7 +29,8 @@ Use its `worktreePath` as the working directory for the Plan agent. If no worksp
 Also load the project profile so the plan knows the stack:
 
 ```bash
-node $HOME/.claude/lib/project.mjs load
+node "$HOME/.config/agent-config/lib/workspace.mjs" bootstrap
+node "$HOME/.config/agent-config/lib/project.mjs" load
 ```
 
 Extract `$STACK`, `$DEPLOY_MODEL`, `$BUILD_CMD`. A `null` command means the
@@ -57,7 +57,9 @@ conclusion is visible rather than silent.
 
 ## Step 1: Plan
 
-Launch an Agent (subagent_type: "Plan") with:
+Delegate planning to an available planning or exploration subagent with this
+prompt. If the current harness cannot delegate, perform the same planning in
+the current context and report that limitation:
 
 > You are a senior software architect planning a change.
 >
@@ -89,13 +91,15 @@ Capture the plan as `$PLAN`.
 
 ## Step 2: Simplicity review of the plan
 
-Launch an Agent to review the PLAN (not code) against Hickey's simplicity principles.
+Delegate review of the plan—not the code—to an available review subagent.
+If delegation is unavailable, perform the review in the current context and
+report that limitation.
 
 Prompt:
 
 > You are a design reviewer focused on simplicity and avoiding complection.
 >
-> First, read `$HOME/.claude/hickey-principles.md` to load your review criteria.
+> First, read `$HOME/.config/agent-config/hickey-principles.md` to load your review criteria.
 >
 > Then review this plan:
 >
@@ -125,7 +129,7 @@ Present to the user:
 2. The design-review notes
 3. The working directory (`$CWD`)
 
-Use `AskUserQuestion` to ask: "Does this plan look good? Reply 'yes' to proceed, or provide feedback to adjust."
+Yield to the user through the current harness and ask: "Does this plan look good? Reply 'yes' to proceed, or provide feedback to adjust."
 
 If the user provides feedback, incorporate it and re-run from Step 1 (or just adjust the plan directly if changes are minor).
 
@@ -145,7 +149,7 @@ echo "$PLAN" > .workspaces/plans/<slug>.md
 If `--workspace <name>` was provided, also record the plan path in the workspace record's `pipeline` so downstream skills can find it:
 
 ```bash
-node $HOME/.claude/lib/workspace.mjs update <NAME> "$(jq -n --arg p ".workspaces/plans/<slug>.md" '{pipeline: {planPath: $p}}')"
+node "$HOME/.config/agent-config/lib/workspace.mjs" update <NAME> "$(jq -n --arg p ".workspaces/plans/<slug>.md" '{pipeline: {planPath: $p}}')"
 ```
 
 Print the plan to the user so they see the final version. Callers know where the file is: `.workspaces/plans/<slug>.md` (or, if they have a workspace name, read `pipeline.planPath` from the workspace record).

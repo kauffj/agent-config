@@ -1,8 +1,20 @@
 #!/usr/bin/env bash
-# Hook: PreToolUse — block dangerous commands and protect sensitive files
+# Hook: PreToolUse — catch common accidental destructive commands and writes.
+# This string-matching guard is a usability backstop, not a security boundary;
+# the harness sandbox and permissions remain authoritative.
 
 INPUT=$(cat)
 TOOL=$(echo "$INPUT" | jq -r '.tool_name // empty')
+
+protect_file() {
+    local file=$1
+    case "$file" in
+        *.credentials*|*secrets*|*.env.production|*id_rsa*|*id_ed25519*)
+            echo "Protected file: $file" >&2
+            exit 2
+            ;;
+    esac
+}
 
 case "$TOOL" in
     Bash)
@@ -41,7 +53,7 @@ case "$TOOL" in
 
         # 3. History rewrites and fork bombs. '--force-with-lease' is deliberately
         #    NOT matched — it is the safe form of the same intent.
-        if echo "$CMD" | grep -qE '(git[[:space:]]+push[^;&|]*[[:space:]](--force|-f)([[:space:]]|$)|git[[:space:]]+reset[[:space:]]+--hard|:\(\)[[:space:]]*\{)'; then
+        if echo "$CMD" | grep -qE '(git[[:space:]]+push[^;&|]*([[:space:]](--force|-f)([[:space:]]|$)|[[:space:]]+\+[^[:space:];&|]+)|git[[:space:]]+reset[[:space:]]+--hard|:\(\)[[:space:]]*\{)'; then
             echo "Blocked: force-push, hard reset, or fork bomb" >&2
             exit 2
         fi
@@ -122,14 +134,20 @@ case "$TOOL" in
 
     Edit|Write)
         FILE=$(echo "$INPUT" | jq -r '.tool_input.file_path // empty')
+        protect_file "$FILE"
+        ;;
 
-        # Protect secrets and critical config
-        case "$FILE" in
-            *.credentials*|*secrets*|*.env.production|*id_rsa*|*id_ed25519*)
-                echo "Protected file: $FILE" >&2
-                exit 2
-                ;;
-        esac
+    apply_patch)
+        # Codex matchers expose apply_patch through the Edit/Write aliases, but
+        # its canonical hook input carries the patch in tool_input.command.
+        # Check each patch header so this accidental-write backstop behaves the
+        # same in both harnesses without a second Codex-only implementation.
+        PATCH=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
+        while IFS= read -r FILE; do
+            [ -n "$FILE" ] && protect_file "$FILE"
+        done < <(printf '%s\n' "$PATCH" | sed -nE \
+            -e 's/^\*\*\* (Add|Delete|Update) File: //p' \
+            -e 's/^\*\*\* Move to: //p')
         ;;
 esac
 

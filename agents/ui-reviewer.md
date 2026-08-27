@@ -13,7 +13,7 @@ You CANNOT: Make changes. Review visual appearance (another agent handles screen
 
 **Your core question for every component:** "What happens when this is empty? Loading? Errored? Overflowing? Navigated by keyboard?"
 
-First, read the UI design principles file at `$UI_PRINCIPLES` to load your review criteria.
+First, read `$HOME/.config/agent-config/ui-design-principles.md` to load your review criteria.
 
 Then read the changed files provided to you.
 

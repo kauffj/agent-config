@@ -66,7 +66,7 @@ marker() { # marker <hook-stdout> <glyph|none> <label>
 echo "Codex config wires every status transition:"
 for ev in SessionStart UserPromptSubmit PreToolUse PermissionRequest SubagentStart SubagentStop Stop; do
   command=$(jq -r --arg ev "$ev" '.hooks[$ev][0].hooks[0].command // ""' "$CODEX_HOOKS")
-  [ "$command" = '~/.claude/hooks/session-state.sh codex' ] \
+  [ "$command" = '~/.config/agent-config/hooks/session-state.sh codex' ] \
     && printf '  ok    %-28s wired\n' "$ev" \
     || { printf '  FAIL  %-28s command=%q\n' "$ev" "$command"; fails=$((fails+1)); }
 done

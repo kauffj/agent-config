@@ -1,0 +1,13 @@
+# Ubuntu restricts unprivileged user namespaces unless the executable has an
+# AppArmor profile that explicitly grants them. Codex uses bubblewrap to create
+# its Linux workspace sandbox, so attach this permission to bwrap alone.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile codex-bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+
+  # Site-specific additions and overrides. See local/README for details.
+  include if exists <local/codex-bwrap>
+}

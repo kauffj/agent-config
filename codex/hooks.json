@@ -1,12 +1,28 @@
 {
-  "description": "Publish authoritative Codex lifecycle state to the shared WezTerm fleet dashboard.",
+  "description": "Essential Codex lifecycle, startup, and accidental-safety hooks.",
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/session-state.sh codex"
+            "command": "~/.config/agent-config/hooks/session-state.sh codex"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ~/.config/agent-config/lib/doctor.mjs || true"
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.config/agent-config/hooks/inject-lessons.sh"
           }
         ]
       }
@@ -16,7 +32,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/session-state.sh codex"
+            "command": "~/.config/agent-config/hooks/session-state.sh codex"
           }
         ]
       }
@@ -26,7 +42,16 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/session-state.sh codex"
+            "command": "~/.config/agent-config/hooks/session-state.sh codex"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.config/agent-config/hooks/on-pre-tool.sh"
           }
         ]
       }
@@ -36,7 +61,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/session-state.sh codex"
+            "command": "~/.config/agent-config/hooks/session-state.sh codex"
           }
         ]
       }
@@ -46,7 +71,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/session-state.sh codex"
+            "command": "~/.config/agent-config/hooks/session-state.sh codex"
           }
         ]
       }
@@ -56,7 +81,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/session-state.sh codex"
+            "command": "~/.config/agent-config/hooks/session-state.sh codex"
           }
         ]
       }
@@ -66,7 +91,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "~/.claude/hooks/session-state.sh codex"
+            "command": "~/.config/agent-config/hooks/session-state.sh codex"
           }
         ]
       }
