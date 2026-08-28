@@ -225,11 +225,20 @@ Then wait for it from a separate tool call:
 for i in $(seq 1 30); do curl -s -o /dev/null -w "%{http_code}" http://localhost:$PORT && break || sleep 1; done
 ```
 
-Run the screenshot script with the right auth mode for the affected pages (admin / member / public):
+Group affected pages by the identity required to view them (for example admin,
+member, and public), then run the screenshot script once per identity group.
+Give each group its own output subdirectory so one pass cannot overwrite
+another. Use `--user` for an authenticated identity and `--no-auth` for public
+pages:
 
 ```bash
-npx tsx scripts/screenshot.ts --output-dir $SCREENSHOT_DIR [--user EMAIL | --no-auth] [AFFECTED_URLS]
+npx tsx scripts/screenshot.ts --output-dir "$SCREENSHOT_DIR/admin" --user ADMIN_EMAIL [ADMIN_URLS]
+npx tsx scripts/screenshot.ts --output-dir "$SCREENSHOT_DIR/member" --user MEMBER_EMAIL [MEMBER_URLS]
+npx tsx scripts/screenshot.ts --output-dir "$SCREENSHOT_DIR/public" --no-auth [PUBLIC_URLS]
 ```
+
+Run only the groups the feature affects. When one page behaves differently for
+multiple roles, include it in every applicable group.
 
 If the script fails, diagnose and fix before proceeding.
 
