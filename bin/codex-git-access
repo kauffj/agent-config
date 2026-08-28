@@ -49,6 +49,9 @@ extends = "no-git-offline"
 
 [permissions.git-workspace-offline.filesystem.":workspace_roots"]
 ".git" = "write"
+".git/config" = "read"
+".git/config.worktree" = "read"
+".git/hooks" = "read"
 
 [permissions.git-workspace]
 description = "Workspace editing with Git metadata writable and network enabled."
@@ -60,6 +63,12 @@ enabled = true
 """
 
 MANAGED_PROFILES = tomllib.loads(PROFILE_BLOCK)["permissions"]
+# The first shipped Git-capable profile made all of .git writable. Recognize
+# that exact owned shape so `enable` can narrow existing installs safely.
+LEGACY_MANAGED_PROFILES = copy.deepcopy(MANAGED_PROFILES)
+LEGACY_MANAGED_PROFILES["git-workspace-offline"]["filesystem"] = {
+    ":workspace_roots": {".git": "write"},
+}
 BEGIN_MARKER = "# BEGIN managed by codex-git-access"
 END_MARKER = "# END managed by codex-git-access"
 MANAGED_CHOICES = frozenset(MANAGED_PROFILES)
@@ -331,6 +340,32 @@ def validate_managed_profiles(parsed, path):
     return choice
 
 
+def validate_upgradeable_managed_profiles(parsed, path):
+    """Accept the current owned profiles or the one older owned profile shape."""
+    permissions = parsed.get("permissions")
+    if not isinstance(permissions, dict):
+        raise Refusal(f"{path}: managed permission profiles are missing")
+    actual = {name: permissions.get(name) for name in MANAGED_CHOICES}
+    if actual not in (MANAGED_PROFILES, LEGACY_MANAGED_PROFILES):
+        raise Refusal(f"{path}: managed permission profiles differ from known versions")
+    choice = parsed.get("default_permissions")
+    if choice not in MANAGED_CHOICES:
+        raise Refusal(f"{path}: default_permissions is not a managed profile")
+    if "sandbox_mode" in parsed or "sandbox_workspace_write" in parsed:
+        raise Refusal(f"{path}: legacy and permission-profile settings cannot coexist")
+    return choice
+
+
+def replace_managed_block(text):
+    start = text.index(BEGIN_MARKER)
+    end = text.index(END_MARKER, start) + len(END_MARKER)
+    if text[end:end + 2] == "\r\n":
+        end += 2
+    elif text[end:end + 1] == "\n":
+        end += 1
+    return text[:start] + PROFILE_BLOCK + text[end:]
+
+
 def unrelated_policy_view(parsed):
     """Return the parsed config with only this migration's fields removed."""
     result = copy.deepcopy(parsed)
@@ -360,10 +395,14 @@ def global_transform(source):
     if has_marker:
         if text.count(BEGIN_MARKER) != 1 or text.count(END_MARKER) != 1:
             raise Refusal(f"{path}: managed profile markers are damaged")
-        current = validate_managed_profiles(parsed, path)
+        current = validate_upgradeable_managed_profiles(parsed, path)
         network = current in {"git-workspace", "no-git"}
         choice = expected_profile_choice(network, git=True)
-        return set_assignment(text, "default_permissions", choice), choice
+        output = set_assignment(replace_managed_block(text), "default_permissions", choice)
+        parsed_output = parse_toml(output, path)
+        validate_managed_profiles(parsed_output, path)
+        assert_unrelated_unchanged(parsed, parsed_output, path)
+        return output, choice
     if managed_names:
         raise Refusal(f"{path}: managed profile names already exist without ownership markers")
     if "default_permissions" in parsed:

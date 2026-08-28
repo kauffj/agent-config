@@ -135,7 +135,12 @@ class CodexGitAccessTest(unittest.TestCase):
         self.assertTrue(parsed["permissions"]["no-git"]["network"]["enabled"])
         self.assertEqual(
             parsed["permissions"]["git-workspace-offline"]["filesystem"]
-                  [":workspace_roots"][".git"], "write")
+                  [":workspace_roots"], {
+                      ".git": "write",
+                      ".git/config": "read",
+                      ".git/config.worktree": "read",
+                      ".git/hooks": "read",
+                  })
         self.assertEqual(parsed["permissions"]["git-workspace"]["extends"],
                          "git-workspace-offline")
         self.assertTrue(parsed["permissions"]["git-workspace"]["network"]["enabled"])
@@ -163,6 +168,35 @@ class CodexGitAccessTest(unittest.TestCase):
         self.run_cli("enable", check=True)
         parsed = tomllib.loads(self.config.read_text())
         self.assertEqual(parsed["default_permissions"], "git-workspace-offline")
+
+    def test_enable_upgrades_the_original_owned_profile_shape(self):
+        module = load_script()
+        old_block = module.PROFILE_BLOCK.replace(
+            '".git/config" = "read"\n'
+            '".git/config.worktree" = "read"\n'
+            '".git/hooks" = "read"\n', '')
+        text = textwrap.dedent('''\
+            approval_policy = "never"
+            default_permissions = "git-workspace"
+
+            [hooks.state]
+            [hooks.state."fixture"]
+            trusted_hash = "sha256:kept"
+
+            ''') + old_block
+        self.write_global(text)
+
+        result = self.run_cli("enable", check=True)
+
+        parsed = tomllib.loads(self.config.read_text())
+        self.assertEqual(parsed["default_permissions"], "git-workspace")
+        self.assertEqual(
+            parsed["permissions"]["git-workspace-offline"]["filesystem"]
+                  [":workspace_roots"][".git/hooks"], "read")
+        self.assertEqual(parsed["hooks"]["state"]["fixture"]["trusted_hash"],
+                         "sha256:kept")
+        self.assertEqual(len(self.backup_bundles()), 1)
+        self.assertIn("updated user config", result.stdout)
 
     def test_migration_preserves_an_array_of_tables_after_the_legacy_table(self):
         text = global_config().replace(

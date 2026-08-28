@@ -173,8 +173,10 @@ Codex's legacy `workspace-write` sandbox deliberately protects `.git` as
 read-only, so it can edit source but cannot commit. `codex-git-access enable`
 replaces that legacy policy with four permission profiles: Git/no-Git crossed
 with network on/off. The user default becomes Git-enabled without granting
-write access outside the workspace; both temporary-directory exclusions and
-`approval_policy = "never"` remain unchanged. The command recognizes only the
+write access outside the workspace. Hidden persistence surfaces remain
+protected: `.git/config`, `.git/config.worktree`, and `.git/hooks/` stay
+read-only while ordinary Git metadata is writable. Both temporary-directory
+exclusions and `approval_policy = "never"` remain unchanged. The command recognizes only the
 legacy shape used here, preserves unrelated TOML text, validates the result,
 creates a private backup under `~/.local/state/agent-config/backups/`, and is
 idempotent. It refuses ambiguous or conflicting policy instead of guessing.
