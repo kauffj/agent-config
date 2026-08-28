@@ -47,22 +47,8 @@ def installed_codex():
     return None
 
 
-def installed_node():
-    for directory in os.environ.get("PATH", "").split(os.pathsep):
-        candidate = Path(directory) / "node"
-        try:
-            resolved = candidate.resolve(strict=True)
-        except OSError:
-            continue
-        if os.access(resolved, os.X_OK):
-            return resolved
-    return None
-
-
 class CodexWorktreeTest(unittest.TestCase):
     def setUp(self):
-        if installed_node() is None:
-            self.skipTest("Node is not installed")
         TEST_TMP.mkdir(parents=True, exist_ok=True, mode=0o700)
         TEST_TMP.chmod(0o700)
         self.temp = tempfile.TemporaryDirectory(dir=TEST_TMP)
@@ -81,12 +67,11 @@ class CodexWorktreeTest(unittest.TestCase):
         fake = package / "codex.js"
         fake.write_text(textwrap.dedent('''\
             #!/usr/bin/env node
-            process.stdout.write(JSON.stringify({"argv": process.argv.slice(2), "cwd": process.cwd()}) + "\\n");
-            process.exit(Number(process.env.FAKE_CODEX_EXIT || "0"));
+            exec /usr/bin/python3 -E -c 'import json, os, sys; print(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd()})); raise SystemExit(int(os.environ.get("FAKE_CODEX_EXIT", "0")))' "$@"
             '''))
         fake.chmod(0o755)
         (self.real_bin / "codex").symlink_to(fake)
-        (self.real_bin / "node").symlink_to(installed_node())
+        (self.real_bin / "node").symlink_to("/bin/sh")
         access = load_access()
         config = 'default_permissions = "git-workspace"\n\n' + access.PROFILE_BLOCK
         (self.codex_home / "config.toml").write_text(config)
