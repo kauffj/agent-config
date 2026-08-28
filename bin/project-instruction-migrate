@@ -1,0 +1,774 @@
+#!/usr/bin/python3 -E
+"""Apply guarded AGENTS.md/CLAUDE.md migrations across local projects.
+
+The live fleet manifest is deliberately runtime state, not repository policy.
+This tool supplies the reusable transaction: report exact state, apply only
+when every listed input still matches, and restore from a durable private
+backup without overwriting later edits.
+"""
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+from pathlib import Path
+import secrets
+import stat
+import subprocess
+import sys
+
+import _secure_fs as secure_io
+
+
+SCHEMA_VERSION = 1
+GIT_BIN = "/usr/bin/git"
+SYSTEM_UID = Path("/").stat().st_uid
+TARGET_KEYS = {
+    "id", "root", "kind", "claudeBefore", "agentsBefore",
+    "claudeAfter", "agentsAfter", "deletions",
+}
+STATE_KEYS = {"kind", "sha256", "rawTarget"}
+PAYLOAD_KEYS = {"payload", "sha256"}
+DELETION_KEYS = {"path", "before"}
+
+
+class Refusal(Exception):
+    pass
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def reject_unknown(value, allowed, where):
+    extra = set(value) - allowed
+    if extra:
+        raise Refusal(f"{where}: unknown keys: {', '.join(sorted(extra))}")
+
+
+def read_json(path, label):
+    try:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise Refusal(f"{path}: {label} must be a regular file")
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Refusal:
+        raise
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise Refusal(f"{path}: cannot read {label}: {exc}") from exc
+
+
+def relative_path(value, where):
+    if not isinstance(value, str) or not value or "\0" in value:
+        raise Refusal(f"{where}: expected a non-empty relative path")
+    path = Path(value)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise Refusal(f"{where}: path must stay below its declared root")
+    return path
+
+
+def inspect_parent_chain(root, rel, *, final_parent=True):
+    current = root
+    parts = rel.parts[:-1] if final_parent else rel.parts
+    for part in parts:
+        current = current / part
+        try:
+            fd, _info = secure_io.open_owned_directory(current)
+        except secure_io.Refusal as exc:
+            raise Refusal(f"{current}: parent path is unsafe: {exc}") from exc
+        os.close(fd)
+    return root / rel
+
+
+def inspect_absolute_parent_chain(path):
+    current = Path(path.anchor)
+    for part in path.parts[1:-1]:
+        current = current / part
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(current, flags)
+        except OSError as exc:
+            raise Refusal(f"{current}: absolute parent path is unsafe: {exc}") from exc
+        try:
+            info = os.fstat(fd)
+            if (info.st_uid not in {SYSTEM_UID, os.getuid()}
+                    or secure_io.writable_by_peer(info, fd, current)):
+                raise Refusal(f"{current}: absolute parent path is writable by another user")
+        finally:
+            os.close(fd)
+
+
+def owned_root(path, where):
+    try:
+        fd, _info = secure_io.open_owned_directory(path)
+    except secure_io.Refusal as exc:
+        raise Refusal(f"{path}: cannot inspect {where}: {exc}") from exc
+    os.close(fd)
+    return path.resolve()
+
+
+def file_state_at(parent_fd, parent_info, name, path):
+    try:
+        info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return {
+            "kind": "absent",
+            "parentIdentity": (parent_info.st_dev, parent_info.st_ino),
+        }
+    except OSError as exc:
+        raise Refusal(f"{path}: cannot inspect path: {exc}") from exc
+    if info.st_uid != os.getuid():
+        raise Refusal(f"{path}: path is not owned by the current user")
+    if stat.S_ISLNK(info.st_mode):
+        try:
+            target = os.readlink(name, dir_fd=parent_fd)
+        except OSError as exc:
+            raise Refusal(f"{path}: cannot read symlink: {exc}") from exc
+        return {
+            "kind": "symlink", "rawTarget": target,
+            "identity": (info.st_dev, info.st_ino),
+            "parentIdentity": (parent_info.st_dev, parent_info.st_ino),
+        }
+    if not stat.S_ISREG(info.st_mode):
+        raise Refusal(f"{path}: only regular files and symlinks are supported")
+    if info.st_nlink != 1:
+        raise Refusal(f"{path}: hard-linked files are not supported")
+    flags = os.O_RDONLY | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(name, flags, dir_fd=parent_fd)
+    except OSError as exc:
+        raise Refusal(f"{path}: cannot open file safely: {exc}") from exc
+    try:
+        opened = os.fstat(fd)
+        if ((opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino)
+                or secure_io.writable_by_peer(opened, fd, path)):
+            raise Refusal(f"{path}: file changed or is writable by another user")
+        data = secure_io.read_all(fd)
+    finally:
+        os.close(fd)
+    return {
+        "kind": "file", "sha256": digest(data), "data": data,
+        "mode": stat.S_IMODE(opened.st_mode),
+        "identity": (opened.st_dev, opened.st_ino),
+        "parentIdentity": (parent_info.st_dev, parent_info.st_ino),
+    }
+
+
+def file_state(path):
+    try:
+        parent_fd, parent_info = secure_io.open_owned_directory(path.parent)
+    except secure_io.Refusal as exc:
+        raise Refusal(f"{path.parent}: unsafe parent directory: {exc}") from exc
+    try:
+        return file_state_at(parent_fd, parent_info, path.name, path)
+    finally:
+        os.close(parent_fd)
+
+
+def expected_state(value, where, *, allow_absent=True, allow_symlink=False):
+    if not isinstance(value, dict):
+        raise Refusal(f"{where}: expected a state object")
+    reject_unknown(value, STATE_KEYS, where)
+    kind = value.get("kind")
+    allowed = {"file"}
+    if allow_absent:
+        allowed.add("absent")
+    if allow_symlink:
+        allowed.add("symlink")
+    if kind not in allowed:
+        raise Refusal(f"{where}: unsupported kind {kind!r}")
+    if kind == "file":
+        if set(value) != {"kind", "sha256"} or not valid_sha(value.get("sha256")):
+            raise Refusal(f"{where}: file state requires one SHA-256")
+    elif kind == "symlink":
+        if set(value) != {"kind", "rawTarget"} or not isinstance(value.get("rawTarget"), str):
+            raise Refusal(f"{where}: symlink state requires one rawTarget")
+    elif set(value) != {"kind"}:
+        raise Refusal(f"{where}: absent state has no other fields")
+    return dict(value)
+
+
+def valid_sha(value):
+    return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+
+def state_matches(actual, expected):
+    if actual["kind"] != expected["kind"]:
+        return False
+    if expected["kind"] == "file" and actual["sha256"] != expected["sha256"]:
+        return False
+    if expected["kind"] == "symlink" and actual["rawTarget"] != expected["rawTarget"]:
+        return False
+    return all(actual.get(key) == expected[key]
+               for key in ("mode", "identity", "parentIdentity") if key in expected)
+
+
+def payload_state(manifest_dir, value, where):
+    if not isinstance(value, dict):
+        raise Refusal(f"{where}: expected a payload object")
+    reject_unknown(value, PAYLOAD_KEYS, where)
+    if set(value) != PAYLOAD_KEYS or not valid_sha(value.get("sha256")):
+        raise Refusal(f"{where}: payload and SHA-256 are required")
+    rel = relative_path(value["payload"], f"{where}.payload")
+    path = inspect_parent_chain(manifest_dir, rel)
+    actual = file_state(path)
+    expected = {"kind": "file", "sha256": value["sha256"]}
+    if not state_matches(actual, expected):
+        raise Refusal(f"{path}: payload hash or type changed")
+    try:
+        actual["data"].decode("utf-8")
+    except UnicodeError as exc:
+        raise Refusal(f"{path}: instruction payload is not UTF-8") from exc
+    return {"kind": "file", "sha256": actual["sha256"], "data": actual["data"]}
+
+
+def git_root(path):
+    result = subprocess.run(
+        [GIT_BIN, "-c", "core.fsmonitor=false", "-C", str(path),
+         "rev-parse", "--show-toplevel"],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=git_environment())
+    if result.returncode:
+        return None
+    return Path(result.stdout.strip()).resolve()
+
+
+def planned_git_paths_clean(root, rels):
+    result = subprocess.run(
+        [GIT_BIN, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+         "-C", str(root), "status", "--porcelain=v1", "--", *map(str, rels)],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=git_environment())
+    if result.returncode:
+        raise Refusal(f"{root}: cannot inspect planned Git paths: {result.stderr.strip()}")
+    return not result.stdout.strip()
+
+
+def git_environment():
+    env = os.environ.copy()
+    for key in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+                "GIT_COMMON_DIR"):
+        env.pop(key, None)
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    return env
+
+
+def parse_target(raw, manifest_dir, projects_root, seen_ids, seen_roots):
+    if not isinstance(raw, dict):
+        raise Refusal("manifest target must be an object")
+    reject_unknown(raw, TARGET_KEYS, f"target {raw.get('id', '?')}")
+    required = TARGET_KEYS - {"deletions"}
+    missing = required - set(raw)
+    if missing:
+        raise Refusal(f"target {raw.get('id', '?')}: missing keys: {', '.join(sorted(missing))}")
+    target_id = raw.get("id")
+    if not isinstance(target_id, str) or not target_id or target_id in seen_ids:
+        raise Refusal(f"target id is empty or duplicated: {target_id!r}")
+    seen_ids.add(target_id)
+    root_rel = relative_path(raw.get("root"), f"target {target_id}.root")
+    root = inspect_parent_chain(projects_root, root_rel, final_parent=False)
+    root = owned_root(root, f"target {target_id} root")
+    if root in seen_roots:
+        raise Refusal(f"target {target_id}: duplicate root {root}")
+    seen_roots.add(root)
+    kind = raw.get("kind")
+    actual_git_root = git_root(root)
+    if kind == "git":
+        if actual_git_root != root:
+            raise Refusal(f"{root}: Git target is not the checkout root")
+    elif kind == "directory":
+        if actual_git_root is not None:
+            raise Refusal(f"{root}: directory target is inside a Git checkout")
+    else:
+        raise Refusal(f"target {target_id}: kind must be 'git' or 'directory'")
+
+    operations = []
+    for name, before_key, after_key in (
+        ("CLAUDE.md", "claudeBefore", "claudeAfter"),
+        ("AGENTS.md", "agentsBefore", "agentsAfter"),
+    ):
+        rel = Path(name)
+        path = inspect_parent_chain(root, rel)
+        before = expected_state(raw[before_key], f"target {target_id}.{before_key}")
+        after = payload_state(manifest_dir, raw[after_key], f"target {target_id}.{after_key}")
+        operations.append({"path": path, "rel": rel, "before": before, "after": after})
+
+    deletions = raw.get("deletions", [])
+    if not isinstance(deletions, list):
+        raise Refusal(f"target {target_id}.deletions must be an array")
+    planned = {Path("CLAUDE.md"), Path("AGENTS.md")}
+    for index, deletion in enumerate(deletions):
+        where = f"target {target_id}.deletions[{index}]"
+        if not isinstance(deletion, dict):
+            raise Refusal(f"{where}: expected an object")
+        reject_unknown(deletion, DELETION_KEYS, where)
+        if set(deletion) != DELETION_KEYS:
+            raise Refusal(f"{where}: path and before are required")
+        rel = relative_path(deletion["path"], f"{where}.path")
+        if rel in planned:
+            raise Refusal(f"{where}: duplicate planned path {rel}")
+        planned.add(rel)
+        path = inspect_parent_chain(root, rel)
+        before = expected_state(
+            deletion["before"], f"{where}.before", allow_absent=False, allow_symlink=True)
+        operations.append({
+            "path": path, "rel": rel, "before": before, "after": {"kind": "absent"},
+        })
+
+    return {
+        "id": target_id, "root": root, "kind": kind,
+        "operations": operations, "planned": sorted(planned, key=str),
+    }
+
+
+def load_manifest(path, projects_root):
+    path = path.expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    raw = read_json(path, "migration manifest")
+    if not isinstance(raw, dict):
+        raise Refusal(f"{path}: manifest must be an object")
+    reject_unknown(raw, {"schemaVersion", "id", "targets"}, "manifest")
+    if raw.get("schemaVersion") != SCHEMA_VERSION:
+        raise Refusal(f"{path}: unsupported schemaVersion")
+    migration_id = raw.get("id")
+    if not isinstance(migration_id, str) or not migration_id:
+        raise Refusal(f"{path}: migration id is required")
+    if not isinstance(raw.get("targets"), list) or not raw["targets"]:
+        raise Refusal(f"{path}: targets must be a non-empty array")
+    projects_root = owned_root(projects_root, "projects root")
+    seen_ids, seen_roots = set(), set()
+    targets = [
+        parse_target(item, path.parent, projects_root, seen_ids, seen_roots)
+        for item in raw["targets"]
+    ]
+    return {"id": migration_id, "targets": targets, "path": path}
+
+
+def classify_target(target):
+    before, after, either = [], [], []
+    for operation in target["operations"]:
+        actual = file_state(operation["path"])
+        is_before = state_matches(actual, operation["before"])
+        is_after = state_matches(actual, operation["after"])
+        before.append(is_before)
+        after.append(is_after)
+        either.append(is_before or is_after)
+    if all(after):
+        status = "applied"
+    elif all(before):
+        status = "ready"
+    elif all(either):
+        status = "partial"
+    else:
+        status = "drift"
+    planned_clean = True
+    if target["kind"] == "git":
+        planned_clean = planned_git_paths_clean(target["root"], target["planned"])
+    return {"status": status, "plannedPathsClean": planned_clean}
+
+
+def state_root():
+    base = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state")).expanduser()
+    if not base.is_absolute():
+        raise Refusal("XDG_STATE_HOME must be an absolute path")
+    return base / "agent-config" / "project-migrations"
+
+
+def ensure_private_directory(path):
+    """Create a private directory through held, validated parent descriptors."""
+    missing = []
+    cursor = path
+    while True:
+        try:
+            cursor.lstat()
+            break
+        except FileNotFoundError:
+            missing.append(cursor.name)
+            parent = cursor.parent
+            if parent == cursor:
+                raise Refusal(f"{path}: no safe existing parent for backup directory")
+            cursor = parent
+    try:
+        secure_io.validate_trusted_path(cursor)
+        fd, _info = secure_io.open_owned_directory(cursor)
+    except secure_io.Refusal as exc:
+        raise Refusal(f"{cursor}: unsafe backup-state parent: {exc}") from exc
+    try:
+        current = cursor
+        for name in reversed(missing):
+            try:
+                os.mkdir(name, 0o700, dir_fd=fd)
+            except FileExistsError:
+                pass
+            next_fd = os.open(name, secure_io.directory_open_flags(), dir_fd=fd)
+            info = os.fstat(next_fd)
+            current = current / name
+            if (info.st_uid != os.getuid()
+                    or secure_io.writable_by_peer(info, next_fd, current)):
+                os.close(next_fd)
+                raise Refusal(f"{current}: backup directory is unsafe")
+            os.close(fd)
+            fd = next_fd
+        os.fchmod(fd, 0o700)
+        os.fsync(fd)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def backup_bundle(migration_id, operations):
+    root = state_root()
+    root_fd = ensure_private_directory(root)
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    bundle_name = f"{stamp}-{os.getpid()}-{secrets.token_hex(4)}"
+    bundle = root / bundle_name
+    try:
+        os.mkdir(bundle_name, 0o700, dir_fd=root_fd)
+        bundle_fd = os.open(bundle_name, secure_io.directory_open_flags(), dir_fd=root_fd)
+        try:
+            records = []
+            for index, operation in enumerate(operations):
+                before = operation["expected"]
+                backup = None
+                if before["kind"] == "file":
+                    backup = f"{index:03d}-before"
+                    write_new_at(bundle_fd, backup, before["data"], 0o600)
+                records.append({
+                    "path": str(operation["path"]),
+                    "before": serial_state(before),
+                    "beforeBackup": backup,
+                    "after": serial_state(operation["desired"]),
+                })
+            manifest = {
+                "schemaVersion": SCHEMA_VERSION, "migrationId": migration_id,
+                "entries": records,
+            }
+            write_new_at(
+                bundle_fd, "manifest.json",
+                (json.dumps(manifest, indent=2) + "\n").encode(), 0o600)
+            os.fsync(bundle_fd)
+            os.fsync(root_fd)
+        finally:
+            os.close(bundle_fd)
+    finally:
+        os.close(root_fd)
+    return bundle
+
+
+def serial_state(value):
+    out = {"kind": value["kind"]}
+    if value["kind"] == "file":
+        out.update({"sha256": value["sha256"], "mode": value.get("mode", 0o644)})
+    elif value["kind"] == "symlink":
+        out["rawTarget"] = value["rawTarget"]
+    return out
+
+
+def write_new_at(parent_fd, name, data, mode):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(name, flags, mode, dir_fd=parent_fd)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+        os.fchmod(fd, mode)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def prepare_file_at(parent_fd, path, data, mode):
+    name = f".{path.name}.project-instruction-migrate-{os.getpid()}-{secrets.token_hex(5)}"
+    write_new_at(parent_fd, name, data, mode)
+    return name
+
+
+def prepare_symlink_at(parent_fd, path, raw_target):
+    name = f".{path.name}.project-instruction-migrate-{os.getpid()}-{secrets.token_hex(5)}"
+    os.symlink(raw_target, name, dir_fd=parent_fd)
+    return name
+
+
+def install_state(path, desired, *, expected=None, mode=0o644):
+    try:
+        parent_fd, parent_info = secure_io.open_owned_directory(path.parent)
+    except secure_io.Refusal as exc:
+        raise Refusal(f"{path.parent}: unsafe parent directory: {exc}") from exc
+    prepared = None
+    try:
+        # Prepare payload I/O before the last identity check. Python does not
+        # expose a conditional rename, so another same-user writer can still
+        # race the final check and replace; peer users and parent swaps are
+        # excluded by the held directory descriptor and ownership checks.
+        if desired["kind"] == "file":
+            prepared = prepare_file_at(
+                parent_fd, path, desired["data"], desired.get("mode", mode))
+        elif desired["kind"] == "symlink":
+            prepared = prepare_symlink_at(parent_fd, path, desired["rawTarget"])
+        current = file_state_at(parent_fd, parent_info, path.name, path)
+        if expected is not None and not state_matches(current, expected):
+            raise Refusal(f"{path}: changed at mutation boundary")
+        if desired["kind"] == "absent":
+            if current["kind"] != "absent":
+                os.unlink(path.name, dir_fd=parent_fd)
+                os.fsync(parent_fd)
+        elif desired["kind"] == "file":
+            os.replace(prepared, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            prepared = None
+            os.fsync(parent_fd)
+        elif desired["kind"] == "symlink":
+            os.replace(prepared, path.name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            prepared = None
+            os.fsync(parent_fd)
+        else:
+            raise Refusal(f"{path}: unsupported desired state")
+    finally:
+        if prepared is not None:
+            try:
+                os.unlink(prepared, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+        os.close(parent_fd)
+
+
+def execute_replacements(operations, failure_label):
+    completed = []
+    try:
+        for operation in operations:
+            completed.append(operation)
+            install_state(
+                operation["path"], operation["desired"], expected=operation["expected"])
+    except BaseException as exc:
+        rollback_errors = []
+        for operation in reversed(completed):
+            try:
+                current = file_state(operation["path"])
+                if state_matches(current, operation["expected"]):
+                    continue
+                if not state_matches(current, operation["desired"]):
+                    raise Refusal(f"{operation['path']}: changed before rollback")
+                install_state(
+                    operation["path"], operation["expected"], expected=current)
+            except BaseException as rollback_exc:
+                rollback_errors.append(str(rollback_exc))
+        detail = f"; rollback errors: {rollback_errors}" if rollback_errors else ""
+        raise Refusal(f"{failure_label} failed: {exc}{detail}") from exc
+
+
+def require_ready_targets(targets):
+    for target in targets:
+        state = classify_target(target)
+        if state["status"] != "ready":
+            raise Refusal(f"target {target['id']}: state is {state['status']}")
+        if not state["plannedPathsClean"]:
+            raise Refusal(f"target {target['id']}: a planned Git path is dirty or staged")
+
+
+def apply_transaction(migration_id, targets):
+    if not targets:
+        return None
+    require_ready_targets(targets)
+    operations = []
+    for target in targets:
+        for operation in target["operations"]:
+            actual = file_state(operation["path"])
+            if not state_matches(actual, operation["before"]):
+                raise Refusal(f"{operation['path']}: changed after preflight")
+            desired = dict(operation["after"])
+            if desired["kind"] == "file":
+                desired["mode"] = actual.get("mode", 0o644)
+            operations.append({
+                "path": operation["path"], "expected": actual, "desired": desired,
+            })
+    bundle = backup_bundle(migration_id, operations)
+    try:
+        # Backup I/O may take time across a fleet. Recheck target-level Git/index
+        # preconditions immediately before the first mutation.
+        require_ready_targets(targets)
+        execute_replacements(operations, "migration")
+    except Refusal as exc:
+        raise Refusal(f"write failed; originals are at {bundle}: {exc}") from exc
+    return bundle
+
+
+def select_targets(manifest, wanted):
+    if not wanted:
+        return manifest["targets"]
+    by_id = {target["id"]: target for target in manifest["targets"]}
+    missing = [value for value in wanted if value not in by_id]
+    if missing:
+        raise Refusal(f"unknown target ids: {', '.join(missing)}")
+    return [by_id[value] for value in wanted]
+
+
+def report(manifest, wanted, as_json):
+    rows = []
+    failed = False
+    for target in select_targets(manifest, wanted):
+        state = classify_target(target)
+        row = {"id": target["id"], "root": str(target["root"]), **state}
+        rows.append(row)
+        if (state["status"] in {"partial", "drift"}
+                or (state["status"] == "ready" and not state["plannedPathsClean"])):
+            failed = True
+    if as_json:
+        print(json.dumps({"migrationId": manifest["id"], "targets": rows}, indent=2))
+    else:
+        for row in rows:
+            clean = "clean" if row["plannedPathsClean"] else "planned paths dirty"
+            print(f"{row['status']:<8} {row['id']:<24} {clean}  {row['root']}")
+    if failed:
+        raise SystemExit(1)
+
+
+def apply(manifest, wanted):
+    targets = select_targets(manifest, wanted)
+    pending_targets = []
+    for target in targets:
+        state = classify_target(target)
+        if state["status"] == "applied":
+            continue
+        if state["status"] != "ready":
+            raise Refusal(f"target {target['id']}: state is {state['status']}")
+        if not state["plannedPathsClean"]:
+            raise Refusal(f"target {target['id']}: a planned Git path is dirty or staged")
+        pending_targets.append(target)
+    bundle = apply_transaction(manifest["id"], pending_targets)
+    if bundle is None:
+        print("project-instruction-migrate: already applied; no changes")
+    else:
+        print(f"project-instruction-migrate: backup: {bundle}")
+        for target in pending_targets:
+            print(f"project-instruction-migrate: applied: {target['id']}")
+
+
+def bundle_state(value, backup, bundle, where):
+    if not isinstance(value, dict):
+        raise Refusal(f"{where}: state must be an object")
+    allowed = STATE_KEYS | {"mode"}
+    reject_unknown(value, allowed, where)
+    kind = value.get("kind")
+    if kind == "absent":
+        if set(value) != {"kind"} or backup is not None:
+            raise Refusal(f"{where}: invalid absent state")
+        return {"kind": "absent"}
+    if kind == "symlink":
+        if set(value) != {"kind", "rawTarget"} or backup is not None:
+            raise Refusal(f"{where}: invalid symlink state")
+        return {"kind": "symlink", "rawTarget": value["rawTarget"]}
+    if kind != "file" or set(value) != {"kind", "sha256", "mode"}:
+        raise Refusal(f"{where}: invalid file state")
+    if not valid_sha(value.get("sha256")) or not isinstance(value.get("mode"), int):
+        raise Refusal(f"{where}: invalid file hash or mode")
+    if not isinstance(backup, str):
+        raise Refusal(f"{where}: file backup is missing")
+    rel = relative_path(backup, f"{where}.backup")
+    path = inspect_parent_chain(bundle, rel)
+    actual = file_state(path)
+    if not state_matches(actual, {"kind": "file", "sha256": value["sha256"]}):
+        raise Refusal(f"{path}: backup content changed")
+    return {**value, "data": actual["data"]}
+
+
+def recorded_post_state(value, where):
+    if not isinstance(value, dict):
+        raise Refusal(f"{where}: state must be an object")
+    reject_unknown(value, STATE_KEYS | {"mode"}, where)
+    kind = value.get("kind")
+    if kind == "absent" and set(value) == {"kind"}:
+        return {"kind": "absent"}
+    if kind == "symlink" and set(value) == {"kind", "rawTarget"} \
+            and isinstance(value.get("rawTarget"), str):
+        return {"kind": "symlink", "rawTarget": value["rawTarget"]}
+    if kind == "file" and set(value) == {"kind", "sha256", "mode"} \
+            and valid_sha(value.get("sha256")) and isinstance(value.get("mode"), int):
+        return {"kind": "file", "sha256": value["sha256"], "mode": value["mode"]}
+    raise Refusal(f"{where}: invalid recorded post-state")
+
+
+def restore(bundle):
+    try:
+        secure_io.validate_trusted_path(state_root())
+    except secure_io.Refusal as exc:
+        raise Refusal(f"{state_root()}: unsafe managed migration state path: {exc}") from exc
+    managed_root = owned_root(state_root(), "managed migration state directory")
+    if stat.S_IMODE(managed_root.lstat().st_mode) & 0o077:
+        raise Refusal(f"{managed_root}: managed migration state directory must be private")
+    bundle = owned_root(bundle, "backup bundle")
+    if bundle.parent != managed_root:
+        raise Refusal(f"{bundle}: backup bundle is outside the managed migration state directory")
+    if stat.S_IMODE(bundle.lstat().st_mode) & 0o077:
+        raise Refusal(f"{bundle}: backup bundle must be private (mode 0700)")
+    raw = read_json(bundle / "manifest.json", "backup manifest")
+    if not isinstance(raw, dict):
+        raise Refusal(f"{bundle}: backup manifest must be an object")
+    reject_unknown(raw, {"schemaVersion", "migrationId", "entries"}, "backup manifest")
+    if raw.get("schemaVersion") != SCHEMA_VERSION or not isinstance(raw.get("entries"), list):
+        raise Refusal(f"{bundle}: unsupported backup manifest")
+    operations = []
+    for index, entry in enumerate(raw["entries"]):
+        where = f"backup entry {index}"
+        if not isinstance(entry, dict):
+            raise Refusal(f"{where}: expected an object")
+        reject_unknown(entry, {"path", "before", "beforeBackup", "after"}, where)
+        if not isinstance(entry.get("path"), str) or not Path(entry["path"]).is_absolute():
+            raise Refusal(f"{where}: path must be absolute")
+        path = Path(entry["path"])
+        inspect_absolute_parent_chain(path)
+        before = bundle_state(entry.get("before"), entry.get("beforeBackup"), bundle, f"{where}.before")
+        after = recorded_post_state(entry.get("after"), f"{where}.after")
+        actual = file_state(path)
+        if state_matches(actual, before):
+            continue
+        if not state_matches(actual, after):
+            raise Refusal(f"{path}: changed since migration; refusing restore")
+        operations.append({"path": path, "expected": actual, "desired": before})
+    if not operations:
+        print("project-instruction-migrate: already restored; no changes")
+        return
+    execute_replacements(operations, "restore")
+    print(f"project-instruction-migrate: restored: {bundle}")
+
+
+def default_projects_root():
+    return Path.home() / "projects"
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="project-instruction-migrate",
+        description="Report, apply, or restore guarded project instruction migrations.")
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name in ("report", "apply"):
+        child = sub.add_parser(name)
+        child.add_argument("manifest", type=Path)
+        child.add_argument("--projects-root", type=Path, default=default_projects_root())
+        child.add_argument("--target", action="append", default=[])
+        if name == "report":
+            child.add_argument("--json", action="store_true")
+    restore_parser = sub.add_parser("restore")
+    restore_parser.add_argument("bundle", type=Path)
+    args = parser.parse_args()
+    try:
+        if args.command == "restore":
+            restore(args.bundle)
+        else:
+            manifest = load_manifest(args.manifest, args.projects_root)
+            if args.command == "report":
+                report(manifest, args.target, args.json)
+            else:
+                apply(manifest, args.target)
+    except Refusal as exc:
+        print(f"project-instruction-migrate: REFUSED: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    main()

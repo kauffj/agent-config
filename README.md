@@ -2,8 +2,9 @@
 
 An opinionated agent configuration with shared instructions and skills for
 Claude Code, Codex, and Grok. Claude still consumes the whole repository as its
-`~/.claude` directory; thin discovery links let the other harnesses read the
-same policy and skill sources without duplicating them.
+`~/.claude` directory; thin support links let the other harnesses read the
+same policy and skill sources, and let Codex add validated linked-worktree Git
+access, without duplicating configuration.
 
 Two ideas run through all of it:
 
@@ -27,7 +28,7 @@ Windows without work, and the interesting parts assume all three.
 | `agents/` | 5 review subagents — security, simplicity, UI, visual, QA. |
 | `hooks/` | 8 hooks — session state, an accidental-destructive-command backstop, auto-format, lessons injection, transcript fsync, and a pre-commit leak guard. |
 | `codex/` | Codex-native lifecycle, startup, and safety-hook wiring. |
-| `bin/` | 23 command-line tools and focused harness scripts behind the above. |
+| `bin/` | 25 command-line tools and focused harness scripts behind the above. |
 | `lib/` | Shared libraries behind the skills — among them `doctor.mjs` (config integrity), the `workspace*.mjs` state/Git/database/delivery modules and CLI façade, and `project.mjs` (derived project profile plus tracked `.agent/project.json` overrides). |
 | `systemd/user/` | 9 units — the timers that make durability and resurrection actually run. |
 | `instructions/AGENTS.md` | The canonical standing instructions. Workflow orchestration, core principles, and a section on the economics of an agent's time vs. yours. |
@@ -106,7 +107,7 @@ applied is editable text rather than something buried in a prompt.
 
 **`lib/doctor.mjs`**. Resolves every cross-reference in the config — file paths
 embedded in skills, agents, hooks, and instructions, `settings.json` env values,
-and all harness discovery links — against what is actually on disk. It runs at
+and all harness support links — against what is actually on disk. It runs at
 session start and on pre-commit, turning silent breakage (a renamed agent file,
 a moved doc, a missing Codex link) into a loud, early failure.
 
@@ -147,9 +148,10 @@ git -C ~/.claude config filter.strip-automode.clean "node lib/strip-automode.mjs
 ```
 
 The installer derives the repository path from its own location and creates
-exactly six links: the neutral `~/.config/agent-config` source alias,
-`~/.claude`, Codex's `~/.codex/AGENTS.md` and `~/.codex/hooks.json`, Grok's
-`~/.grok/AGENTS.md`, and the shared `~/.agents/skills`. Codex and Grok both point directly to the canonical
+exactly seven links: the neutral `~/.config/agent-config` source alias,
+`~/.claude`, the managed `~/.local/bin/codex` launcher, Codex's
+`~/.codex/AGENTS.md` and `~/.codex/hooks.json`, Grok's `~/.grok/AGENTS.md`, and
+the shared `~/.agents/skills`. Codex and Grok both point directly to the canonical
 policy; Grok discovers Claude instruction files but does not expand Claude's
 `@...` imports. The installer is idempotent and refuses to replace unrecognized
 files, directories, or links. The only automatic migration is the former
@@ -192,16 +194,37 @@ If a project already has a legacy local `workspace-write` policy, name it on
 the `enable` command to migrate that local policy while preserving its explicit
 network setting. Projects without local policy simply inherit the user default.
 
-Run `codex-git-access check [PROJECT...]` to validate the installed profiles.
-For each normal checkout it creates and removes one uniquely named inert file
-inside the resolved Git directory, proving the active sandbox can write Git
-metadata without changing the index or refs. A linked worktree stores its real
-Git directory outside the worktree; the command reports that limitation rather
-than silently granting another checkout write access. Permission changes are
-loaded only by new Codex sessions. See OpenAI's current
+Run `codex-git-access check [PROJECT...]` from a newly started Codex session to
+validate the installed profiles. For each checkout it creates and removes one
+uniquely named inert file inside the resolved Git directory, proving the active
+sandbox can write Git metadata without changing the index or refs. For a
+linked worktree, the installed launcher first validates Git's `.git`,
+`commondir`, `gitdir`, and worktree-list pointers. It then starts Codex with an
+ephemeral profile that keeps the external common Git directory read-only and
+opens only shared objects/refs/logs plus that worktree's own admin directory.
+The source checkout's index, HEAD, config, hooks, and sibling worktree admin
+directories remain read-only. Shared objects and refs are necessarily shared
+between linked worktrees; use separate clones when those must be isolated too.
+Explicit Codex sandbox, profile, or permission overrides bypass this automatic
+augmentation. Permission changes and launcher installs affect only new Codex
+sessions. See OpenAI's current
 [permission-profile](https://developers.openai.com/codex/permissions/) and
 [configuration-precedence](https://developers.openai.com/codex/config-basic/#configuration-precedence)
 documentation for the underlying model.
+
+## Project instruction migrations
+
+`bin/project-instruction-migrate` is the transaction used for standards-first
+project rollouts. A runtime JSON manifest names exact project roots, expected
+hashes for the existing `CLAUDE.md` and `AGENTS.md`, hash-checked replacement
+payloads, and any exact obsolete-file deletions. `report` is read-only;
+`apply` refuses drift or dirty planned Git paths, permits unrelated dirty work,
+writes every selected project as one rollback-capable transaction, and stores
+a private backup under `~/.local/state/agent-config/project-migrations/`;
+`restore` refuses to overwrite edits made after the migration. Non-Git umbrella
+directories are supported without treating their nested repositories as the
+umbrella root. Live fleet manifests are ignored runtime state, not durable
+repository policy.
 
 **That last line matters.** Auto mode writes a summary of this machine's
 infrastructure — production hostnames, where secrets live, how deploys work —

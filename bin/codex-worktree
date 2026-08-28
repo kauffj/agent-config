@@ -1,0 +1,395 @@
+#!/usr/bin/python3 -E
+"""Launch Codex with narrow Git access for a validated linked worktree."""
+
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+
+import _codex_git_access as git_access
+
+
+RUNTIME_PROFILE = "codex-git-linked-runtime"
+POLICY_OVERRIDES = ("default_permissions", "permissions.", "sandbox_mode", "sandbox_workspace_write")
+GIT_BIN = Path("/usr/bin/git")
+SYSTEM_UID = Path("/").stat().st_uid
+
+
+def trusted_executable(path):
+    """Accept an executable only below non-peer-writable root/user directories."""
+    for index, item in enumerate((path, *path.parents)):
+        flags = os.O_RDONLY | os.O_CLOEXEC
+        if index > 0:
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(item, flags)
+        except OSError:
+            return False
+        try:
+            info = os.fstat(fd)
+            expected_type = stat.S_ISREG(info.st_mode) if index == 0 else stat.S_ISDIR(info.st_mode)
+            if (not expected_type or info.st_uid not in {SYSTEM_UID, os.getuid()}
+                    or git_access.writable_by_peer(info, fd, item)):
+                return False
+            if index == 0 and not info.st_mode & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH):
+                return False
+        finally:
+            os.close(fd)
+    return True
+
+
+def trusted_candidate(raw, boundary):
+    if not raw.is_absolute() or (boundary is not None and inside(raw, boundary)):
+        return None
+    try:
+        resolved = raw.resolve(strict=True)
+    except OSError:
+        return None
+    if ((boundary is not None and inside(resolved, boundary))
+            or not trusted_executable(resolved)):
+        return None
+    return resolved
+
+
+def find_node(codex_directory, boundary):
+    directories = [codex_directory]
+    directories.extend(
+        Path(raw).expanduser() for raw in os.environ.get("PATH", "").split(os.pathsep)
+        if raw and Path(raw).expanduser().is_absolute()
+    )
+    seen = set()
+    for directory in directories:
+        candidate = directory / "node"
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        resolved = trusted_candidate(candidate, boundary)
+        if resolved is not None:
+            return resolved
+    raise RuntimeError("real Codex uses Node, but no trusted Node executable was found")
+
+
+def codex_command(candidate, resolved, boundary):
+    try:
+        with resolved.open("rb") as source:
+            prefix = source.read(128)
+    except OSError as exc:
+        raise RuntimeError(f"could not inspect the real Codex executable: {exc}") from exc
+    if prefix.startswith(b"\x7fELF"):
+        return {"program": resolved, "argv": [str(resolved)]}
+    first_line = prefix.splitlines()[0] if prefix else b""
+    if first_line == b"#!/usr/bin/env node":
+        node = find_node(candidate.parent, boundary)
+        return {"program": node, "argv": [str(node), str(resolved)]}
+    raise RuntimeError(f"unsupported real Codex entry point: {first_line!r}")
+
+
+def find_real_codex(cwd):
+    own = Path(__file__).resolve()
+    boundary = project_boundary(cwd)
+    for raw_dir in os.environ.get("PATH", "").split(os.pathsep):
+        directory = Path(raw_dir).expanduser()
+        if not raw_dir or not directory.is_absolute():
+            continue
+        candidate = directory / "codex"
+        resolved = trusted_candidate(candidate, boundary)
+        if resolved is None:
+            continue
+        if resolved == own:
+            continue
+        return codex_command(candidate, resolved, boundary)
+    raise RuntimeError("could not find the real Codex executable after the managed launcher")
+
+
+def invocation_options(args):
+    value = None
+    policy_override = False
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            break
+        if arg in {"-C", "--cd"}:
+            if index + 1 >= len(args):
+                break
+            value = args[index + 1]
+            index += 2
+            continue
+        if arg.startswith("-C") and len(arg) > 2:
+            value = arg[2:]
+        if arg.startswith("--cd="):
+            value = arg.split("=", 1)[1]
+        if arg in {
+            "-s", "--sandbox", "-p", "--profile",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--ignore-user-config",
+        }:
+            policy_override = True
+        if (arg.startswith("--sandbox=") or arg.startswith("--profile=")
+                or (arg.startswith("-s") and len(arg) > 2)
+                or (arg.startswith("-p") and len(arg) > 2)):
+            policy_override = True
+        config_value = None
+        if arg in {"-c", "--config"} and index + 1 < len(args):
+            config_value = args[index + 1]
+            index += 1
+        elif arg.startswith("--config="):
+            config_value = arg.split("=", 1)[1]
+        elif arg.startswith("-c") and len(arg) > 2:
+            config_value = arg[2:]
+        if config_value is not None:
+            key = config_value.split("=", 1)[0].strip()
+            if key.startswith(POLICY_OVERRIDES):
+                policy_override = True
+        index += 1
+    path = Path(value).expanduser() if value is not None else Path.cwd()
+    try:
+        cwd = path.resolve(strict=True)
+    except OSError:
+        cwd = Path.cwd().resolve()
+    return {"cwd": cwd, "policyOverride": policy_override}
+
+
+def git_output(cwd, *args):
+    env = os.environ.copy()
+    routed = {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CEILING_DIRECTORIES", "GIT_COMMON_DIR",
+        "GIT_CONFIG", "GIT_CONFIG_COUNT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM",
+        "GIT_CONFIG_SYSTEM", "GIT_DIR", "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+        "GIT_EXEC_PATH", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_WORK_TREE",
+    }
+    for key in list(env):
+        if key in routed or key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")):
+            env.pop(key, None)
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    result = subprocess.run(
+        [str(GIT_BIN), "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+         "-C", str(cwd), *args], text=True, env=env,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "Git repository lookup failed")
+    return result.stdout.strip()
+
+
+def open_safe_directory(access, path):
+    fd, _info = access.open_owned_directory(path)
+    os.close(fd)
+
+
+def resolve_pointer(base, raw):
+    value = Path(raw)
+    candidate = value if value.is_absolute() else base / value
+    return candidate.resolve(strict=True)
+
+
+def inside(path, root):
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def has_git_marker(cwd):
+    current = cwd
+    while True:
+        try:
+            (current / ".git").lstat()
+            return True
+        except FileNotFoundError:
+            pass
+        parent = current.parent
+        if parent == current:
+            return False
+        current = parent
+
+
+def project_boundary(cwd):
+    current = cwd
+    while True:
+        try:
+            (current / ".git").lstat()
+            return current
+        except FileNotFoundError:
+            pass
+        parent = current.parent
+        if parent == current:
+            return None
+        current = parent
+
+
+def linked_worktree(cwd, access):
+    try:
+        root = Path(git_output(cwd, "rev-parse", "--show-toplevel")).resolve(strict=True)
+    except RuntimeError:
+        if has_git_marker(cwd):
+            raise
+        return None
+    if not inside(cwd, root):
+        raise RuntimeError("Git reported a checkout that does not contain the invocation directory")
+    git_dir = Path(git_output(cwd, "rev-parse", "--absolute-git-dir")).resolve(strict=True)
+    common = Path(git_output(
+        cwd, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve(strict=True)
+    if inside(git_dir, root):
+        return None
+
+    open_safe_directory(access, root)
+    open_safe_directory(access, git_dir)
+    open_safe_directory(access, common)
+    worktrees = common / "worktrees"
+    open_safe_directory(access, worktrees)
+    if git_dir.parent != worktrees:
+        raise RuntimeError("external Git directory is not a linked-worktree admin directory")
+
+    pointer_path = root / ".git"
+    pointer = access.secure_read(pointer_path)
+    match = re.fullmatch(r"gitdir: ([^\r\n]+)\r?\n?", pointer["text"])
+    if not match or resolve_pointer(root, match.group(1)) != git_dir:
+        raise RuntimeError("worktree .git pointer does not match Git's resolved directory")
+
+    commondir = access.secure_read(git_dir / "commondir")["text"].strip()
+    if not commondir or resolve_pointer(git_dir, commondir) != common:
+        raise RuntimeError("worktree commondir pointer does not match Git's common directory")
+    gitdir_pointer = access.secure_read(git_dir / "gitdir")["text"].strip()
+    if not gitdir_pointer or resolve_pointer(git_dir, gitdir_pointer) != pointer_path:
+        raise RuntimeError("worktree gitdir back-pointer does not match the checkout")
+
+    listed = []
+    for line in git_output(cwd, "worktree", "list", "--porcelain").splitlines():
+        if line.startswith("worktree "):
+            try:
+                listed.append(Path(line[9:]).resolve(strict=True))
+            except OSError:
+                continue
+    if root not in listed:
+        raise RuntimeError("linked checkout is absent from git worktree list")
+    return {"root": root, "gitDir": git_dir, "common": common, "name": git_dir.name}
+
+
+def config_layers(root, cwd):
+    yield root / ".codex" / "config.toml"
+    try:
+        relative = cwd.relative_to(root)
+    except ValueError:
+        return
+    cursor = root
+    for part in relative.parts:
+        cursor = cursor / part
+        yield cursor / ".codex" / "config.toml"
+
+
+def active_permission(context, cwd, access):
+    source = access.secure_read(access.codex_home() / "config.toml")
+    parsed = access.parse_toml(source["text"], source["path"])
+    active = access.validate_managed_profiles(parsed, source["path"])
+    if RUNTIME_PROFILE in parsed.get("permissions", {}):
+        raise RuntimeError(f"{source['path']}: reserved runtime profile name is already defined")
+    for path in config_layers(context["root"], cwd):
+        local_source = access.secure_read(path, missing_ok=True)
+        if not local_source["exists"]:
+            continue
+        local = access.parse_toml(local_source["text"], path)
+        access.reject_project_managed_profiles(local, path)
+        if RUNTIME_PROFILE in local.get("permissions", {}):
+            raise RuntimeError(f"{path}: reserved runtime profile name is already defined")
+        if "sandbox_mode" in local or "sandbox_workspace_write" in local:
+            raise RuntimeError(f"{path}: legacy sandbox policy prevents linked Git augmentation")
+        choice = local.get("default_permissions")
+        if choice is not None:
+            if choice not in access.MANAGED_CHOICES:
+                raise RuntimeError(f"{path}: unrelated permission profile {choice!r}")
+            active_git = active in {"git-workspace", "git-workspace-offline"}
+            active_network = active in {"git-workspace", "no-git"}
+            chosen_git = choice in {"git-workspace", "git-workspace-offline"}
+            chosen_network = choice in {"git-workspace", "no-git"}
+            if chosen_git and not active_git:
+                raise RuntimeError(f"{path}: local policy cannot re-enable Git access")
+            if chosen_network and not active_network:
+                raise RuntimeError(f"{path}: local policy cannot re-enable network access")
+            active = choice
+    return active
+
+
+def toml_string(value):
+    return json.dumps(str(value), ensure_ascii=False)
+
+
+def runtime_profile(context, active):
+    if active == "git-workspace":
+        parent = "no-git"
+    elif active == "git-workspace-offline":
+        parent = "no-git-offline"
+    else:
+        return None
+    common = str(context["common"])
+    admin = f"worktrees/{context['name']}"
+    rules = [
+        (".", "read"),
+        ("objects", "write"),
+        ("objects/info/alternates", "read"),
+        ("objects/info/http-alternates", "read"),
+        ("refs", "write"),
+        ("logs/refs", "write"),
+        ("FETCH_HEAD", "write"),
+        ("FETCH_HEAD.lock", "write"),
+        ("packed-refs", "write"),
+        ("packed-refs.lock", "write"),
+        ("packed-refs.new", "write"),
+        (admin, "write"),
+        (f"{admin}/commondir", "read"),
+        (f"{admin}/gitdir", "read"),
+        (f"{admin}/config.worktree", "read"),
+        ("config", "read"),
+        ("config.worktree", "read"),
+        ("hooks", "read"),
+        ("info", "read"),
+        ("HEAD", "read"),
+        ("index", "read"),
+        ("logs/HEAD", "read"),
+        ("worktrees", "read"),
+    ]
+    rule_text = ",".join(f"{toml_string(path)}={toml_string(mode)}" for path, mode in rules)
+    profile = (
+        "{description=\"Validated linked-worktree Git metadata access.\","
+        f"extends={toml_string(parent)},"
+        f"filesystem={{{toml_string(common)}={{{rule_text}}}}}}}"
+    )
+    return [
+        "--add-dir", common,
+        "-c", f"permissions.{RUNTIME_PROFILE}={profile}",
+        "-c", f"default_permissions={toml_string(RUNTIME_PROFILE)}",
+    ]
+
+
+def main():
+    args = sys.argv[1:]
+    invocation = invocation_options(args)
+    try:
+        real = find_real_codex(invocation["cwd"])
+    except RuntimeError as exc:
+        print(f"codex-worktree: {exc}", file=sys.stderr)
+        raise SystemExit(127)
+    extra = []
+    if not invocation["policyOverride"]:
+        access = git_access
+        try:
+            cwd = invocation["cwd"]
+            context = linked_worktree(cwd, access)
+            if context is not None:
+                extra = runtime_profile(context, active_permission(context, cwd, access)) or []
+        except (RuntimeError, access.Refusal, OSError) as exc:
+            print(f"codex-worktree: linked Git augmentation skipped: {exc}", file=sys.stderr)
+    environment = os.environ.copy()
+    for key in ("NODE_OPTIONS", "NODE_PATH"):
+        environment.pop(key, None)
+    os.execve(
+        real["program"], [*real["argv"], *extra, *args], environment)
+
+
+if __name__ == "__main__":
+    main()

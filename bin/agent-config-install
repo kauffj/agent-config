@@ -14,6 +14,7 @@ const {
   symlinkSync,
 } = require('node:fs');
 const { randomUUID } = require('node:crypto');
+const { spawnSync } = require('node:child_process');
 const { dirname, isAbsolute, join, relative, resolve } = require('node:path');
 const { pathToFileURL } = require('node:url');
 
@@ -52,7 +53,26 @@ function validateHome(rawHome) {
 
   const stat = statSync(home);
   if (!stat.isDirectory()) throw new Error('HOME must be a directory');
+  if (stat.uid !== process.getuid()) throw new Error('HOME must be owned by the current user');
   return home;
+}
+
+function trustedPathProblems(repo, paths) {
+  const helper = join(repo, 'bin', '_secure_fs.py');
+  const result = spawnSync('/usr/bin/python3', ['-E', helper, ...new Set(paths)], {
+    encoding: 'utf8',
+  });
+  if (result.error) throw result.error;
+  let problems;
+  try {
+    problems = JSON.parse(result.stdout);
+  } catch {
+    throw new Error(`filesystem trust helper failed: ${result.stderr.trim() || result.stdout.trim()}`);
+  }
+  if (![0, 1].includes(result.status)) {
+    throw new Error(`filesystem trust helper failed: ${result.stderr.trim() || `exit ${result.status}`}`);
+  }
+  return new Map(Object.entries(problems));
 }
 
 function inspectLink(spec, classifyTarget) {
@@ -83,7 +103,7 @@ function inspectLink(spec, classifyTarget) {
   };
 }
 
-function inspectParent(home, linkPath) {
+function inspectParent(home, linkPath, trustProblems) {
   const parent = dirname(linkPath);
   const rel = relative(home, parent);
   if (rel === '') return null;
@@ -97,11 +117,17 @@ function inspectParent(home, linkPath) {
       return `${displayPath(home, cursor)} must not be a symbolic link`;
     }
     if (!entry.isDirectory()) return `${displayPath(home, cursor)} is not a directory`;
+    if (entry.uid !== process.getuid() || trustProblems.has(cursor)) {
+      return `${displayPath(home, cursor)} must be user-owned and not peer-writable`;
+    }
   }
   return null;
 }
 
-function inspectSource(spec) {
+function inspectSource(spec, repo, trustProblems) {
+  if (relative(repo, spec.targetPath).startsWith('..')) {
+    return 'source path escapes the canonical repository';
+  }
   let resolvedTarget;
   let stat;
   try {
@@ -116,7 +142,29 @@ function inspectSource(spec) {
     return `resolves to ${quoted(resolvedTarget)}, not its canonical source path`;
   }
   const correctType = spec.targetType === 'directory' ? stat.isDirectory() : stat.isFile();
-  return correctType ? null : `is not a ${spec.targetType}`;
+  if (!correctType) return `is not a ${spec.targetType}`;
+  if (stat.uid !== process.getuid() || trustProblems.has(spec.targetPath)) {
+    return 'must be user-owned and not peer-writable';
+  }
+  if (spec.id === 'codex-launcher' && (stat.mode & 0o111) === 0) {
+    return 'must be executable';
+  }
+  return null;
+}
+
+function existingParentPaths(home, linkPath) {
+  const paths = [];
+  const rel = relative(home, dirname(linkPath));
+  if (rel === '') return paths;
+  let cursor = home;
+  for (const part of rel.split('/')) {
+    cursor = join(cursor, part);
+    const entry = lstatOrNull(cursor);
+    if (entry === null) break;
+    paths.push(cursor);
+    if (!entry.isDirectory() || entry.isSymbolicLink()) break;
+  }
+  return paths;
 }
 
 function putLink(spec, replace, classifyTarget) {
@@ -165,14 +213,23 @@ async function main() {
   const layoutUrl = pathToFileURL(join(repo, 'lib/harness-layout.mjs')).href;
   const { classifyHarnessLinkTarget, resolveHarnessLinks } = await import(layoutUrl);
   const links = resolveHarnessLinks(repo, home);
+  const trustPaths = [home, ...links.map(({ targetPath }) => targetPath)];
+  for (const spec of links) trustPaths.push(...existingParentPaths(home, spec.linkPath));
+  const trustProblems = trustedPathProblems(repo, trustPaths);
   const sourceProblems = links
-    .map((spec) => ({ spec, problem: inspectSource(spec) }))
+    .map((spec) => ({ spec, problem: inspectSource(spec, repo, trustProblems) }))
     .filter(({ problem }) => problem !== null);
   const parentChecks = links.map((spec) => ({
     spec,
-    problem: inspectParent(home, spec.linkPath),
+    problem: inspectParent(home, spec.linkPath, trustProblems),
   }));
-  const parentProblems = [...new Set(parentChecks.map(({ problem }) => problem).filter(Boolean))];
+  const homeProblem = trustProblems.has(home)
+    ? 'HOME must be user-owned and not peer-writable through its full path'
+    : null;
+  const parentProblems = [...new Set([
+    homeProblem,
+    ...parentChecks.map(({ problem }) => problem),
+  ].filter(Boolean))];
   const findings = parentChecks
     .filter(({ problem }) => problem === null)
     .map(({ spec }) => ({ spec, status: inspectLink(spec, classifyHarnessLinkTarget) }));
@@ -180,7 +237,7 @@ async function main() {
   if (args[0] === '--check') {
     const problems = findings.filter(({ status }) => status.kind !== 'correct');
     if (problems.length === 0 && parentProblems.length === 0 && sourceProblems.length === 0) {
-      process.stdout.write('agent-config: all discovery links are configured\n');
+      process.stdout.write('agent-config: all support links are configured\n');
       return;
     }
     process.stdout.write('agent-config check:\n');
@@ -231,7 +288,7 @@ async function main() {
   }
 
   if (created === 0 && migrated === 0) {
-    process.stdout.write('agent-config: discovery links already configured\n');
+    process.stdout.write('agent-config: support links already configured\n');
   } else {
     process.stdout.write(`agent-config: created ${created} link(s), migrated ${migrated} legacy link(s)\n`);
   }

@@ -20,6 +20,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "bin" / "codex-git-access"
+MODULE = ROOT / "bin" / "_codex_git_access.py"
 
 
 def global_config(*, network=True, slash_tmp=True, env_tmp=True):
@@ -59,7 +60,7 @@ def project_config(*, network=False):
 
 
 def load_script():
-    loader = importlib.machinery.SourceFileLoader("codex_git_access_test", str(SCRIPT))
+    loader = importlib.machinery.SourceFileLoader("codex_git_access_test", str(MODULE))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
@@ -367,7 +368,7 @@ class CodexGitAccessTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("managed profiles belong only in the user config", result.stdout)
 
-    def test_check_accepts_normal_checkout_and_flags_linked_worktree(self):
+    def test_check_accepts_normal_checkout_and_requires_linked_launcher(self):
         self.write_global()
         root = self.git_repo("main")
         tracked = root / "tracked"
@@ -387,7 +388,14 @@ class CodexGitAccessTest(unittest.TestCase):
                         "linked-test", str(linked)], check=True, env=self.env())
         result = self.run_cli("check", linked)
         self.assertEqual(result.returncode, 1)
-        self.assertIn("outside the workspace", result.stdout)
+        self.assertIn("managed ~/.local/bin/codex launcher is missing", result.stdout)
+
+        launcher = self.home / ".local" / "bin" / "codex"
+        launcher.parent.mkdir(parents=True)
+        launcher.symlink_to(ROOT / "bin" / "codex-worktree")
+        configured = self.run_cli("check", linked)
+        self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+        self.assertIn("linked-worktree Git metadata write probe passed", configured.stdout)
 
     def test_check_fails_when_git_metadata_is_not_writable(self):
         self.write_global()
