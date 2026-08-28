@@ -17,21 +17,136 @@ for each. Run from inside WezTerm (it uses `wezterm cli spawn`).
                                       from transcript files — the fallback for
                                       when no snapshot survived the reboot
 """
+import glob
+import json
 import os
 import shutil
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from _claude_sessions_lib import (  # noqa: E402
-    clear_recovery, live_sessions, recent_transcript_sessions, resume_command,
-    resume_set,
+    CLAUDE_DIR, SESSION_ID_RE, caller_session_ids, clear_recovery,
+    leased_session_ids, process_live_session_ids, recent_transcript_sessions,
+    resume_command, resume_set,
 )
+
+LIVE_SESSION_CACHE = os.path.expanduser(
+    "~/.cache/wezterm-fleet-live-sessions.json")
+
+
+def _mux_live_session_ids():
+    """Join WezTerm's live panes to lifecycle-hook session state.
+
+    `wezterm cli list` is an RPC to the mux and therefore sees the real pane set
+    even when this process has a restricted /proc. The hooks already publish the
+    exact session↔pane join used by the tab UI. This path is read-only from the
+    caller's sandbox: no mutable helper is executed outside it and no shared
+    rendezvous file is required.
+    """
+    pane = os.environ.get("WEZTERM_PANE")
+    if not pane or not shutil.which("wezterm"):
+        return None
+    try:
+        listed = subprocess.run(
+            ["wezterm", "cli", "list", "--format", "json"],
+            capture_output=True, text=True, timeout=3)
+        if listed.returncode != 0:
+            return None
+        rows = json.loads(listed.stdout)
+        if not isinstance(rows, list):
+            return None
+        live_panes = set()
+        for row in rows:
+            if not isinstance(row, dict) or not isinstance(
+                    row.get("pane_id"), (int, str)):
+                continue
+            pane_id = str(row["pane_id"])
+            live_panes.add(pane_id)
+        if str(pane) not in live_panes:
+            return None
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError):
+        return None
+
+    try:
+        with open(LIVE_SESSION_CACHE) as stream:
+            cache = json.load(stream)
+        if not isinstance(cache, dict):
+            return None
+        age = time.time() - cache.get("updated", 0)
+        exact = cache.get("sessions")
+        if (cache.get("schema") != 1 or not isinstance(exact, dict)
+                or age < -5 or age > 5):
+            return None
+    except (OSError, TypeError, ValueError):
+        return None
+
+    live = set()
+    for sid, state_pane in exact.items():
+        state_pane = str(state_pane)
+        if (isinstance(sid, str) and SESSION_ID_RE.fullmatch(sid)
+                and state_pane in live_panes):
+            live.add(sid)
+
+    # Independently retain the newest lifecycle record for every live pane.
+    # Pane variables can be stale or overwritten by terminal output; on any
+    # disagreement the union deliberately errs false-live (skip a restore)
+    # rather than letting one identity hide another active writer.
+    fallback = {}
+    for path in glob.glob(os.path.join(CLAUDE_DIR, "state", "*.json")):
+        try:
+            with open(path) as stream:
+                record = json.load(stream)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        sid = record.get("session_id")
+        state_pane = record.get("wezterm_pane")
+        if (isinstance(sid, str) and SESSION_ID_RE.fullmatch(sid)
+                and state_pane is not None
+                and str(state_pane) in live_panes):
+            state_pane = str(state_pane)
+            updated = record.get("updated")
+            updated = updated if isinstance(updated, (int, float)) else 0
+            if state_pane not in fallback or updated >= fallback[state_pane][0]:
+                fallback[state_pane] = (updated, sid)
+    live.update(sid for _updated, sid in fallback.values())
+    return live
+
+
+def _effective_live_session_ids():
+    """Use mux/hook liveness whenever this command runs inside WezTerm."""
+    process_ids = process_live_session_ids()
+    callers = caller_session_ids()
+    live = process_ids | leased_session_ids() | callers
+    if os.environ.get("WEZTERM_PANE"):
+        mux_ids = _mux_live_session_ids()
+        if mux_ids is None or (callers and not callers.issubset(mux_ids)):
+            sys.exit("claude-resume: cannot safely inspect host sessions from "
+                     "this pane; wait for its lifecycle state and try again")
+        live |= mux_ids
+    return live
+
+
+def _wait_until_mux_live(session_ids, timeout=5):
+    """Confirm spawned agents, rather than treating pane allocation as startup."""
+    wanted = set(session_ids)
+    deadline = time.monotonic() + timeout
+    observed = set()
+    while wanted and time.monotonic() < deadline:
+        observed = _mux_live_session_ids() or set()
+        if wanted.issubset(observed):
+            return True
+        time.sleep(0.5)
+    return not wanted or wanted.issubset(observed)
 
 
 def main():
     argv = sys.argv[1:]
     dry = "--dry-run" in argv
+    live = _effective_live_session_ids()
 
     # The default source is the post-crash restore the recovery file is for, so
     # only it consumes the recovery point. Explicit --snapshot/--from-transcripts
@@ -43,7 +158,6 @@ def main():
         limit = 12
         if i + 1 < len(argv) and argv[i + 1].isdigit():
             limit = int(argv[i + 1])
-        live = set(live_sessions())
         # Pull extra, then exclude live ones, so a live session doesn't crowd
         # genuine candidates out of the N most-recent slots.
         todo = [{"sessionId": s["sessionId"], "cwd": s["cwd"]}
@@ -55,9 +169,9 @@ def main():
         i = argv.index("--snapshot")
         if i + 1 >= len(argv):
             sys.exit("--snapshot requires a path")
-        todo = resume_set(snap_path=argv[i + 1])
+        todo = resume_set(snap_path=argv[i + 1], live_ids=live)
     else:
-        todo = resume_set()
+        todo = resume_set(live_ids=live)
 
     if not todo:
         print("nothing to resume (resume-set sessions already live, or none on disk)")
@@ -66,7 +180,7 @@ def main():
         print("wezterm not on PATH — run this from inside WezTerm")
         sys.exit(1)
 
-    spawned = 0
+    spawned_ids = set()
     tab_shell = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                              "agent-tab-shell")
     for s in todo:
@@ -86,18 +200,24 @@ def main():
             continue
         r = subprocess.run(
             ["wezterm", "cli", "spawn", "--cwd", cwd, "--",
-             tab_shell, cmd],
+             tab_shell, "--session", sid, cmd],
             capture_output=True, text=True)
         ok = r.returncode == 0
-        spawned += ok
+        if ok:
+            spawned_ids.add(sid)
         print("%s %s  %s%s%s" % ("spawned" if ok else "FAILED ", sid[:8], cwd,
                                  tag,
                                  "" if ok else "  :: " + r.stderr.strip()))
 
-    # Consume the recovery point once we've actually brought everything back, so
-    # the next run doesn't re-suggest the same set. Keep it if any spawn failed.
-    if clear_after and not dry and spawned == len(todo):
-        clear_recovery()
+    # Pane allocation is not agent startup: the wrapper can still reject a
+    # duplicate or fail before exec. Consume the recovery point only after every
+    # requested session has appeared in lifecycle state on a live mux pane.
+    if clear_after and not dry and len(spawned_ids) == len(todo):
+        if _wait_until_mux_live(spawned_ids):
+            clear_recovery()
+        else:
+            print("recovery point preserved: not every spawned pane became live",
+                  file=sys.stderr)
 
 
 if __name__ == "__main__":

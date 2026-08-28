@@ -327,10 +327,11 @@ def records():
             "glyph": None,   # filled below, once the relative ceiling is known
             "group": meta.get("group"),
             "priority": priority,
-            # no hook to record the pane, so read it off the live process
-            "wezterm_pane": (st.get("wezterm_pane")
-                             or (proc_pane_id(info["pid"]) if info.get("pid")
-                                 and vendor != "claude" else None)),
+            # The process environment is exact. Hook state is only a fallback:
+            # pane ids are recycled, and a restored record can retain its old id.
+            "wezterm_pane": ((proc_pane_id(info["pid"])
+                              if info.get("pid") else None)
+                             or st.get("wezterm_pane")),
             "urgency": _urgency(status, age, priority),
         })
     ceiling = max(7200, maxwait)   # 2h floor, else the longest current wait

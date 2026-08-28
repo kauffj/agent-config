@@ -53,6 +53,17 @@ eval "$(jq -r '@sh "event=\(.hook_event_name // "") agent_id=\(.agent_id // "") 
 # pathological names at this trusted hook boundary.
 [[ ${#session_id} -le 128 && "$session_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || exit 0
 
+# Bind the full native session id to the pane itself. Unlike pane numbers, this
+# user variable dies with the pane and survives mux clients reconnecting; WezTerm
+# publishes the current set for sandboxed recovery commands that cannot see host
+# /proc. Write directly to the controlling terminal because Codex hook stdout is
+# a JSON control channel.
+if [[ -n "${WEZTERM_PANE:-}" && -w /dev/tty ]] && command -v base64 >/dev/null; then
+  encoded_sid=$(printf %s "$session_id" | base64 -w 0)
+  printf '\033]1337;SetUserVar=agent_session=%s\007' "$encoded_sid" \
+    >/dev/tty 2>/dev/null || true
+fi
+
 state_file="$STATE_DIR/$session_id.json"
 mkdir -p "$STATE_DIR"
 

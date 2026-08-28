@@ -21,19 +21,25 @@ Anything else falls back to a headless `claude -p` call (validated, future-
 only), so free-form phrasing still works when the grammar misses.
 """
 import argparse
+from contextlib import contextmanager
 import datetime as dt
+import fcntl
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
-from _claude_sessions_lib import (CLAUDE_DIR, live_sessions,  # noqa: E402
-                                  other_vendor_sessions, resume_command)
+from _claude_sessions_lib import (  # noqa: E402
+    AGENT_STATE_DIR, CLAUDE_DIR, process_live_session_ids, resume_command,
+)
 
 SCHEDULED = os.path.join(CLAUDE_DIR, "scheduled.json")
+SCHEDULE_LOCK = os.path.join(AGENT_STATE_DIR, "scheduled.lock")
 
 _UNITS = {
     "s": 1, "sec": 1, "secs": 1, "second": 1, "seconds": 1,
@@ -158,12 +164,35 @@ def _read():
 
 
 def _write(entries):
-    tmp = SCHEDULED + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(entries, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, SCHEDULED)
+    os.makedirs(CLAUDE_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".scheduled-", dir=CLAUDE_DIR)
+    try:
+        with os.fdopen(fd, "w") as stream:
+            json.dump(entries, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, SCHEDULED)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+
+
+@contextmanager
+def _schedule_lock():
+    """Serialize every scheduled.json read/modify/write transition."""
+    os.makedirs(os.path.dirname(SCHEDULE_LOCK), mode=0o700, exist_ok=True)
+    fd = os.open(SCHEDULE_LOCK,
+                 os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW,
+                 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def _wakes_in(reopen_at, now):
@@ -219,23 +248,25 @@ def cmd_add(a):
         if when is None:
             sys.exit("error: %s — try '2h', 'tomorrow 9am', 'monday morning', "
                      "'2026-07-14 09:00'" % e)
-    entries = [e for e in _read() if e.get("session_id") != a.sid]
-    entries.append({
-        "session_id": a.sid,
-        "vendor": a.vendor,
-        "cwd": a.cwd,
-        "reopen_at": when,
-        "label": a.label or a.sid[:8],
-        "created_at": int(dt.datetime.now().timestamp()),
-    })
-    _write(entries)
+    with _schedule_lock():
+        entries = [e for e in _read() if e.get("session_id") != a.sid]
+        entries.append({
+            "session_id": a.sid,
+            "vendor": a.vendor,
+            "cwd": a.cwd,
+            "reopen_at": when,
+            "label": a.label or a.sid[:8],
+            "created_at": int(dt.datetime.now().timestamp()),
+        })
+        _write(entries)
     print("scheduled %s -> %s" % (a.sid[:8], dt.datetime.fromtimestamp(when).strftime("%Y-%m-%d %H:%M")))
 
 
 def cmd_cancel(a):
-    entries = _read()
-    kept = [e for e in entries if e.get("session_id") != a.sid]
-    _write(kept)
+    with _schedule_lock():
+        entries = _read()
+        kept = [e for e in entries if e.get("session_id") != a.sid]
+        _write(kept)
     print("cancelled %s" % a.sid[:8] if len(kept) != len(entries) else "no schedule for %s" % a.sid[:8])
 
 
@@ -265,7 +296,7 @@ def _target_window():
     the fleet window. None if WezTerm isn't reachable."""
     try:
         out = subprocess.run(["wezterm", "cli", "list", "--format", "json"],
-                             capture_output=True, text=True)
+                             capture_output=True, text=True, timeout=3)
         if out.returncode != 0:
             return None
         counts = {}
@@ -286,21 +317,29 @@ def _log(msg):
         pass
 
 
-def cmd_reopen_due(a):
+def _reopen(a, force_sid=None):
     now = dt.datetime.now().timestamp()
     entries = _read()
     if not entries:
-        return
+        return False
     have_wezterm = shutil.which("wezterm") is not None
-    win = _target_window() if have_wezterm else None
-    live = set(live_sessions()) | set(other_vendor_sessions())
-    kept, reopened, dropped, failed = [], [], 0, 0
+    requested_window = getattr(a, "window_id", None)
+    win = requested_window if have_wezterm and requested_window is not None \
+        else (_target_window() if have_wezterm else None)
+    # A lease proves only that a launch is in flight. Drop durable snooze state
+    # only for a native process that is observably running on the host.
+    live = process_live_session_ids()
+    kept, requested, reopened, settled, dropped, failed = [], [], [], set(), 0, 0
     tab_shell = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                              "agent-tab-shell")
     for e in entries:
         sid, cwd = e.get("session_id"), e.get("cwd") or ""
         command = resume_command(sid, e.get("vendor") or "claude") if sid else None
-        if not sid or e.get("reopen_at", 0) > now:
+        selected = force_sid is not None and sid == force_sid
+        if not sid or (not selected and e.get("reopen_at", 0) > now):
+            kept.append(e)
+            continue
+        if force_sid is not None and not selected:
             kept.append(e)
             continue
         if command is None:
@@ -310,6 +349,7 @@ def cmd_reopen_due(a):
                  % (sid[:8], e.get("vendor")))
             continue
         if sid in live:                      # already back (manual reopen) — drop it
+            settled.add(sid)
             dropped += 1
             continue
         if a.dry_run:
@@ -319,17 +359,47 @@ def cmd_reopen_due(a):
         if not have_wezterm or win is None:  # WezTerm down / unreachable — retry next tick
             kept.append(e)
             continue
-        r = subprocess.run(
-            ["wezterm", "cli", "spawn", "--window-id", str(win), "--cwd", cwd, "--",
-             tab_shell, command],
-            capture_output=True, text=True)
+        try:
+            r = subprocess.run(
+                ["wezterm", "cli", "spawn", "--window-id", str(win),
+                 "--cwd", cwd, "--", tab_shell, "--session", sid, command],
+                capture_output=True, text=True, timeout=3)
+        except (OSError, subprocess.SubprocessError) as exc:
+            kept.append(e)
+            failed += 1
+            _log("SPAWN FAILED %s win=%s err=%s"
+                 % (sid[:8], win, str(exc)[:200]))
+            continue
         if r.returncode == 0:
-            reopened.append(e)
-            _log("reopened %s (%s) win=%s" % (sid[:8], e.get("label", ""), win))
+            requested.append(e)
         else:
             kept.append(e)                   # keep on failure (mirror claude-resume)
             failed += 1
             _log("SPAWN FAILED %s rc=%s win=%s err=%s" % (sid[:8], r.returncode, win, r.stderr.strip()[:200]))
+    # A successful mux RPC proves only that a pane was allocated. Wait briefly
+    # for the native agent process before removing durable snooze state;
+    # an unconfirmed request stays queued and safely retries on a later tick.
+    if requested:
+        deadline = time.monotonic() + 5
+        started = set()
+        wanted = {e["session_id"] for e in requested}
+        while time.monotonic() < deadline:
+            started = process_live_session_ids()
+            if wanted.issubset(started):
+                break
+            time.sleep(0.5)
+        for e in requested:
+            sid = e["session_id"]
+            if sid in started:
+                reopened.append(e)
+                settled.add(sid)
+                _log("reopened %s (%s) win=%s"
+                     % (sid[:8], e.get("label", ""), win))
+            else:
+                kept.append(e)
+                failed += 1
+                _log("STARTUP UNCONFIRMED %s win=%s; keeping scheduled entry"
+                     % (sid[:8], win))
     if not a.dry_run and (reopened or dropped or failed):
         _log("run: entries=%d due-reopened=%d dropped-live=%d failed=%d wezterm=%s win=%s"
              % (len(entries), len(reopened), dropped, failed, have_wezterm, win))
@@ -337,13 +407,30 @@ def cmd_reopen_due(a):
         _write(kept)
     for e in reopened:
         _notify(e.get("label", "a session"))
+    return force_sid in settled if force_sid is not None else bool(reopened)
+
+
+def cmd_reopen_due(a):
+    # Holding this lock across the bounded startup confirmation prevents an add
+    # or cancel from being overwritten by the older snapshot of scheduled.json.
+    with _schedule_lock():
+        _reopen(a)
+
+
+def cmd_reopen(a):
+    with _schedule_lock():
+        found = any(e.get("session_id") == a.sid for e in _read())
+        if not found:
+            sys.exit("no schedule for %s" % a.sid[:8])
+        if not _reopen(a, force_sid=a.sid):
+            sys.exit("session %s did not start; schedule preserved" % a.sid[:8])
 
 
 def _notify(label):
     if shutil.which("notify-send"):
         try:
             subprocess.run(["notify-send", "Agent tab reopened", "%s is back" % label],
-                           check=False)
+                           check=False, timeout=3)
         except Exception:
             pass
 
@@ -367,6 +454,10 @@ def main():
 
     pr = sub.add_parser("reopen-due"); pr.set_defaults(fn=cmd_reopen_due)
     pr.add_argument("--dry-run", action="store_true")
+
+    po = sub.add_parser("reopen"); po.set_defaults(fn=cmd_reopen, dry_run=False)
+    po.add_argument("--sid", required=True)
+    po.add_argument("--window-id")
 
     args = p.parse_args()
     args.fn(args)

@@ -7,8 +7,10 @@ Source of truth is Claude's own runtime registry at ~/.claude/sessions/<pid>.jso
 session id from the process argv (--resume / --session-id / -r).
 """
 import glob
+import fcntl
 import json
 import os
+import stat
 from urllib.parse import quote
 import re
 import time
@@ -23,15 +25,12 @@ SNAPSHOT = os.path.join(CLAUDE_DIR, "sessions-snapshot.json")
 # death) and never clobbered by the timer's honest-state writes. The durable record
 # a freeze can't erase before you restore. See claude-snapshot and resume_set().
 RECOVERY_SNAP = os.path.join(CLAUDE_DIR, "sessions-recovery.json")
+AGENT_STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state"),
+    "agent-fleet")
+LIVE_LEASE_DIR = os.path.join(AGENT_STATE_DIR, "live")
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-
-
-def pid_alive(pid):
-    try:
-        os.kill(int(pid), 0)
-    except (OSError, ValueError, TypeError):
-        return False
-    return True
+_CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 
 
 def _proc_argv(pid):
@@ -40,6 +39,17 @@ def _proc_argv(pid):
             return [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
     except OSError:
         return []
+
+
+def _proc_start_ticks(pid):
+    """Kernel process start generation (field 22), immune to PID reuse."""
+    try:
+        with open(f"/proc/{pid}/stat") as stream:
+            data = stream.read()
+        fields = data[data.rfind(")") + 2:].split()
+        return int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def _proc_cwd(pid):
@@ -81,7 +91,7 @@ def _from_registry():
         except (OSError, ValueError):
             continue
         sid, pid = d.get("sessionId"), d.get("pid")
-        if not sid or not pid_alive(pid):
+        if not _looks_like_session_id(sid) or not _registry_process_matches(d):
             continue
         if d.get("kind") and d.get("kind") != "interactive":
             continue
@@ -93,6 +103,29 @@ def _from_registry():
             "source": "registry",
         }
     return sessions
+
+
+def _registry_process_matches(record):
+    """Prove a registry PID is the same Claude process generation it named."""
+    pid = record.get("pid")
+    argv = _proc_argv(pid)
+    if not argv or os.path.basename(argv[0]) != "claude":
+        return False
+    expected_ticks = record.get("procStart")
+    actual_ticks = _proc_start_ticks(pid)
+    if expected_ticks is not None:
+        try:
+            return actual_ticks == int(expected_ticks)
+        except (TypeError, ValueError):
+            return False
+    # Compatibility with early registry versions that recorded only wall time.
+    started_ms = record.get("startedAt")
+    actual_epoch = _proc_start_epoch(pid)
+    try:
+        return actual_epoch is not None and abs(
+            actual_epoch - float(started_ms) / 1000) <= START_MARGIN
+    except (TypeError, ValueError):
+        return False
 
 
 def _argv_session_id(argv):
@@ -136,7 +169,6 @@ def _project_dir(cwd):
     return os.path.join(PROJECTS_DIR, re.sub(r"[^a-zA-Z0-9]", "-", cwd))
 
 
-_CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 START_MARGIN = 5.0  # seconds of clock-skew slack when matching start times
 
 
@@ -157,12 +189,8 @@ def _proc_start_epoch(pid):
     if btime is None:
         return None
     try:
-        with open(f"/proc/{pid}/stat") as f:
-            data = f.read()
-        # field 22 (starttime) in clock ticks since boot; fields after comm,
-        # which is parenthesized and may contain spaces -> split on last ')'.
-        fields = data[data.rfind(")") + 2:].split()
-        return btime + int(fields[19]) / _CLK_TCK
+        ticks = _proc_start_ticks(pid)
+        return btime + ticks / _CLK_TCK if ticks is not None else None
     except (OSError, ValueError, IndexError):
         return None
 
@@ -332,7 +360,134 @@ def _snap_meta(path):
         return {}
 
 
-def resume_set(snap_path=SNAPSHOT, recovery_max_age_h=12):
+def leased_session_ids(directory=None):
+    """Session ids whose launch wrappers currently hold a live lease.
+
+    The empty lock files are deliberately not state: only a conflicting kernel
+    lock proves liveness, so a crash can leave files behind without suppressing
+    a future restore. Shared probes do not conflict with one another; they only
+    conflict with the launcher's exclusive lease.
+    """
+    out = set()
+    directory = LIVE_LEASE_DIR if directory is None else directory
+    try:
+        directory_fd = open_live_lease_dir(directory)
+    except (OSError, TypeError):
+        return out
+    try:
+        for name in os.listdir(directory_fd):
+            if not name.endswith(".lock"):
+                continue
+            sid = name[:-5]
+            if not SESSION_ID_RE.fullmatch(sid):
+                continue
+            try:
+                fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK
+                             | os.O_NOFOLLOW | os.O_CLOEXEC,
+                             dir_fd=directory_fd)
+            except OSError:
+                continue
+            try:
+                info = os.fstat(fd)
+                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                        or info.st_nlink != 1):
+                    continue
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    out.add(sid)
+                else:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            finally:
+                os.close(fd)
+    finally:
+        os.close(directory_fd)
+    return out
+
+
+def open_live_lease_dir(directory=None, create=False):
+    """Open the private live-lease directory without following its final path.
+
+    The directory fd pins every later lock-file operation to the directory we
+    validated, so a symlink or rename cannot redirect later file operations.
+    The runtime lives in persistent user state outside the configuration
+    checkout so ordinary project sandboxes and cache cleaners cannot replace a
+    held lease's directory entry.
+    Only the runtime directory itself must be a real, owner-private directory.
+    """
+    directory = LIVE_LEASE_DIR if directory is None else os.path.abspath(directory)
+    parent, name = os.path.split(directory.rstrip(os.sep))
+    if not parent or not name:
+        raise OSError("unsafe live-lease directory")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+    if create:
+        os.makedirs(parent, mode=0o700, exist_ok=True)
+    parent_fd = os.open(parent, flags)
+    try:
+        if create:
+            try:
+                os.mkdir(name, 0o700, dir_fd=parent_fd)
+            except FileExistsError:
+                pass
+        directory_fd = os.open(name, flags | os.O_NOFOLLOW, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
+    try:
+        info = os.fstat(directory_fd)
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_mode & 0o077):
+            raise OSError("live-lease directory is not owner-private")
+        return directory_fd
+    except Exception:
+        os.close(directory_fd)
+        raise
+
+
+def caller_session_ids(environ=None):
+    """Validated identity of the agent invoking this command, if any.
+
+    Tool subprocesses inherit their native session id even when their sandbox
+    hides the host process tree. Spawned tabs clear these variables before the
+    resumed command starts, so they cannot inherit the caller's identity.
+    """
+    env = os.environ if environ is None else environ
+    out = set()
+    for name in ("CLAUDE_CODE_SESSION_ID", "CODEX_SESSION_ID"):
+        sid = env.get(name)
+        if isinstance(sid, str) and SESSION_ID_RE.fullmatch(sid):
+            out.add(sid)
+    return out
+
+
+def process_live_session_ids():
+    """Live ids proved by processes visible in this PID namespace."""
+    return set(live_sessions()) | set(other_vendor_sessions())
+
+
+def session_process_identity(session_id):
+    """One live writer's stable (pid, start-generation), if discoverable."""
+    info = live_sessions().get(session_id)
+    if info is None:
+        info = other_vendor_sessions().get(session_id)
+    pid = info.get("pid") if info else None
+    ticks = _proc_start_ticks(pid) if pid is not None else None
+    return (int(pid), ticks) if pid is not None and ticks is not None else None
+
+
+def process_identity_alive(identity):
+    """Whether a previously resolved process generation still exists."""
+    pid, ticks = identity
+    return _proc_start_ticks(pid) == ticks
+
+
+def known_live_session_ids():
+    """Live ids visible through processes, launcher leases, or this caller."""
+    return process_live_session_ids() | leased_session_ids() | caller_session_ids()
+
+
+def resume_set(snap_path=SNAPSHOT, recovery_max_age_h=12, live_ids=None):
     """Sessions to reopen after a restart, ready for `claude --resume`.
 
     Unions the live snapshot with any pre-crash set preserved in the recovery
@@ -351,7 +506,7 @@ def resume_set(snap_path=SNAPSHOT, recovery_max_age_h=12):
     spawn tabs left to right. Anything without one — no pid when the snapshot was
     taken, a session outside WezTerm, a pre-feature recovery file — sorts by cwd
     after them. Returns [{sessionId, cwd, tab?}]."""
-    live = set(live_sessions()) | set(other_vendor_sessions())
+    live = (known_live_session_ids() if live_ids is None else set(live_ids))
     sources = [_snap_meta(snap_path).get("sessions", [])]
     rec = _snap_meta(RECOVERY_SNAP)
     preserved = rec.get("preservedAt", 0)

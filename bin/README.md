@@ -72,7 +72,23 @@ harnesses' session identity before the native resume command runs, then does the
 same before leaving an interactive shell behind. Without that boundary, a Codex
 tab opened from an alternate-account Claude session inherits
 `CLAUDE_CONFIG_DIR`; the next `claude` in that shell bypasses account selection
-and keeps spending the same account.
+and keeps spending the same account. For a resumed session the wrapper also
+holds an exclusive kernel lease under `~/.local/state/agent-fleet/live/` while
+the agent runs.
+`claude-resume` reads those locks as one PID-namespace-independent liveness
+source and joins WezTerm's live pane list to the lifecycle state the hooks
+already publish. That join is read-only from a managed Codex sandbox, so it
+works from any project without executing a mutable helper on the host.
+
+The lease atomically excludes duplicate launches that cross this shared wrapper;
+the pane/hook join also detects directly started Claude and Codex sessions;
+wrapper-launched vendors publish the same pane identity. A direct native resume
+that races the wrapper cannot participate in its lock, so that detection is
+intentionally best-effort rather than an impossible cross-process guarantee.
+The lease follows the foreground agent process tree across supervisor failure,
+and an unlocked leftover file is not live. This is cooperative duplicate-writer
+coordination among trusted launch paths, not isolation from malicious same-UID
+processes (which can invoke the WezTerm mux directly).
 
 ## Reading (the scrollback-mangle escape hatch)
 

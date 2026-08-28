@@ -85,6 +85,7 @@ local WAIT_FLOOR_S  = 7200           -- 2h floor for the gradient ceiling
 local AWAKE_GAP_CAP = 120            -- inter-tick gap over this = suspend; not counted
 local WAIT_CACHE    = HOME .. '/.cache/wezterm-fleet-wait.json'
 local TAB_ORDER_CACHE = HOME .. '/.cache/wezterm-fleet-tab-order.json'
+local LIVE_SESSION_CACHE = HOME .. '/.cache/wezterm-fleet-live-sessions.json'
 local SAVE_EVERY    = 15             -- persist the awake clock at most this often (s)
 
 -- A `delegating` status (turn parked on background subagents — see
@@ -275,6 +276,22 @@ local function save_tab_order(order)
   if f then f:write(body); f:close(); last_tab_order = body end
 end
 
+-- Publish exact pane-scoped session ids for recovery commands running with a
+-- restricted /proc. Agents set `agent_session` through OSC 1337; user vars are
+-- owned by the pane lifetime, so a recycled numeric pane id cannot inherit one.
+local function save_live_sessions(sessions, now)
+  local ok, body = pcall(wezterm.json_encode,
+                         { schema = 1, updated = now, sessions = sessions })
+  if not ok then return end
+  local tmp = LIVE_SESSION_CACHE .. '.tmp.' .. tostring(now) .. '.'
+              .. tostring(math.random(0, 2147483647))
+  local f = io.open(tmp, 'w')
+  if not f then return end
+  f:write(body)
+  f:close()
+  if not os.rename(tmp, LIVE_SESSION_CACHE) then os.remove(tmp) end
+end
+
 -- update-status is also scheduled by pane-title changes, not just its ~1/sec timer.
 -- A title animation can therefore invoke it many times per second and across every
 -- GUI window. Keep the cheap window-width observation responsive, but run the
@@ -308,8 +325,8 @@ wezterm.on('update-status', function(window, pane)
   -- The same walk records each pane's VISUAL position: ipairs order over w:tabs()
   -- is the on-screen order (it's what a drag-reorder changes), and it's only
   -- observable here — `wezterm cli list` returns panes unordered.
-  local live, order = {}, {}
-  pcall(function()
+  local live, order, live_sessions = {}, {}, {}
+  local mux_ok = pcall(function()
     for _, w in ipairs(wezterm.mux.all_windows()) do
       local wid = w:window_id()
       for i, t in ipairs(w:tabs()) do
@@ -319,11 +336,26 @@ wezterm.on('update-status', function(window, pane)
           live[pid] = true
           order[pid] = { wid, i - 1 }
         end
+        for _, p in ipairs(t:panes()) do
+          local vars = p:get_user_vars()
+          local sid = vars and vars.agent_session or nil
+          if type(sid) == 'string' and #sid <= 128
+             and sid:match('^[%w][%w._%-]*$') then
+            live_sessions[sid] = tostring(p:pane_id())
+          end
+        end
       end
     end
   end)
+  if mux_ok then
+    save_tab_order(order)
+    save_live_sessions(live_sessions, now)
+  else
+    -- A partial pane walk is unsafe as a liveness oracle. Keep the previous
+    -- cache until it ages out so sandboxed recovery fails closed.
+    live, order, live_sessions = {}, {}, {}
+  end
   local restrict = next(live) ~= nil
-  save_tab_order(order)
 
   -- Rebuild pane_state (keyed by pane id, for render lookup), computing each
   -- waiting session's downtime-free age and the longest OPEN wait (the ceiling).
@@ -871,17 +903,24 @@ local function activate_or_resume(win, pane, rec)
     end
     return true
   end
-  -- Live in the registry but no WezTerm pane (closed, or running elsewhere): resume.
+  -- Registry rows are already live by construction. No pane means the session
+  -- runs outside this WezTerm mux; resuming it would create a second writer.
+  -- Snoozed rows are the only closed-session records this function receives.
+  if not rec.scheduled then
+    win:toast_notification('fleet', 'session is active outside this WezTerm window', nil, 4000)
+    return false
+  end
   if not rec.resume_command or rec.resume_command == '' then
     win:toast_notification('fleet', 'cannot safely resume this session', nil, 4000)
     return false
   end
-  win:perform_action(
-    act.SpawnCommandInNewTab {
-      cwd = rec.cwd,
-      args = { AGENT_TAB_SHELL, rec.resume_command },
-    },
-    pane)
+  -- The schedule owner performs spawn -> native-process confirmation ->
+  -- conditional removal. Fire it asynchronously so the GUI is never blocked
+  -- during its bounded startup check.
+  wezterm.background_child_process({
+    HOME .. '/.claude/bin/claude-schedule', 'reopen',
+    '--sid', rec.session_id, '--window-id', tostring(win:window_id()),
+  })
   return true
 end
 
@@ -1040,7 +1079,7 @@ local function session_picker(window, pane)
 
   -- Union in SNOOZED (closed, scheduled-to-reopen) sessions so you can reopen one
   -- early. They have no live pane, so activate_or_resume resumes them; selecting
-  -- one also cancels its schedule. See bin/claude-schedule.
+  -- one asks the schedule owner to spawn, confirm startup, then remove it.
   local sok, sched = wezterm.run_child_process({ HOME .. '/.claude/bin/claude-schedule', 'list', '--json' })
   if sok and sched and sched ~= '' then
     local okj, list = pcall(wezterm.json_parse, sched)
@@ -1080,9 +1119,6 @@ local function session_picker(window, pane)
         activated = resurface_hidden(win, p, rec)
       else
         activated = activate_or_resume(win, p, rec)
-      end
-      if activated and rec.scheduled then
-        wezterm.run_child_process({ HOME .. '/.claude/bin/claude-schedule', 'cancel', '--sid', id })
       end
     end),
   }, pane)

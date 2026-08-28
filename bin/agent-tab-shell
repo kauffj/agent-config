@@ -10,8 +10,33 @@
 
 set -u
 
+session_id=
+wait_session=false
+while [[ $# -gt 1 ]]; do
+    case "$1" in
+        --session)
+            [[ $# -ge 3 ]] || break
+            session_id=$2
+            shift 2
+            ;;
+        --wait-session)
+            wait_session=true
+            shift
+            ;;
+        *) break ;;
+    esac
+done
+
 if [[ $# -ne 1 || -z "$1" ]]; then
-    echo "usage: agent-tab-shell '<agent command>'" >&2
+    echo "usage: agent-tab-shell [--session SID] [--wait-session] '<agent command>'" >&2
+    exit 2
+fi
+if [[ -n "$session_id" && ! "$session_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]; then
+    echo "agent-tab-shell: unsafe session id" >&2
+    exit 2
+fi
+if [[ "$wait_session" == true && -z "$session_id" ]]; then
+    echo "agent-tab-shell: --wait-session requires --session" >&2
     exit 2
 fi
 
@@ -38,11 +63,36 @@ clean_agent_identity() {
 command=$1
 clean_agent_identity
 
-# A login + interactive shell reconstructs PATH and shell functions exactly as
-# a terminal launch does (`claude` is the account-routing shell function).
-bash -lic "$command"
-status=$?
+if [[ -n "$session_id" ]]; then
+    helper="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_agent_session_lease.py"
+    helper_args=()
+    if [[ "$wait_session" == true ]]; then
+        echo "agent-tab-shell: waiting for session $session_id to exit"
+        helper_args+=(--wait)
+    fi
+    "$helper" "${helper_args[@]}" "$session_id" "$command"
+    status=$?
+    # Acquisition collisions are helper control flow, not completed agent
+    # sessions. Do not turn a rejected duplicate into a stray interactive tab.
+    if [[ $status -eq 75 && -t 0 && -t 1 ]]; then
+        exit 75
+    fi
+    if [[ $status -ne 0 && -t 0 && -t 1 ]]; then
+        # An uncatchable supervisor death can leave the agent group in the
+        # foreground. Its inherited lease tells recovery exactly when that tree
+        # is gone; only then reclaim the TTY for the post-agent shell.
+        "$helper" --recover-terminal "$session_id" || true
+    fi
+else
+    # A login + interactive shell reconstructs PATH and shell functions exactly
+    # as a terminal launch does (`claude` is the account-routing shell function).
+    bash -lic "$command"
+    status=$?
+fi
 
+# The returned shell is intentionally not an agent. The helper owns and releases
+# the lease before control returns here. The agent process tree inherits the
+# lease only so an unexpected supervisor death cannot leave a writer unlocked.
 clean_agent_identity
 if [[ -t 0 && -t 1 ]]; then
     exec bash -l

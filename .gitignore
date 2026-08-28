@@ -59,6 +59,7 @@ sound-off-*
 spawned-windows.log
 scheduled.json
 scheduled.log
+scheduled.lock
 
 # ── Runtime state that must never reach a public repo ──────────────────
 # Claude Code's own config: oauthAccount (email, uuid, org, billing tier),
@@ -92,6 +93,7 @@ projects-backup/
 
 # Rescue exports (conversation content) + rescue runtime state — never source
 rescue/
+feedback/
 transcript-check.notified.json
 *-remote-session-terminals.txt
 

@@ -23,6 +23,7 @@ launch_model() scope the caps, and the picker routes on its own.
 """
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -56,26 +57,6 @@ def session_from_pane():
         if best is None or (rec.get("updated") or 0) > (best.get("updated") or 0):
             best = rec
     return best
-
-
-def claude_ancestor():
-    """The pid of the claude process this script is running under. Walked from
-    /proc rather than read from $CLAUDE_PID so a nested shell can't lie."""
-    pid = os.getpid()
-    for _ in range(12):
-        try:
-            with open("/proc/%d/stat" % pid) as f:
-                fields = f.read().rsplit(") ", 1)
-            comm = fields[0].split("(", 1)[1]
-            ppid = int(fields[1].split()[1])
-        except (OSError, IndexError, ValueError):
-            return None
-        if comm == "claude":
-            return pid
-        if ppid <= 1:
-            return None
-        pid = ppid
-    return None
 
 
 def current_account(accounts):
@@ -143,10 +124,6 @@ def main():
     if not sid:
         sys.exit("claude-model: no session here — run it inside a Claude session.")
     cwd = session.get("cwd") or os.getcwd()
-    pid = claude_ancestor() or int(os.environ.get("CLAUDE_PID") or 0)
-    if not pid:
-        sys.exit("claude-model: can't find this session's claude process.")
-
     statuses = L.probe_all(accounts, model, now)
     usable = [s for s in statuses
               if s["state"] in L.HEALTHY and s["assessment"]
@@ -186,15 +163,14 @@ def main():
     # was already running. And no --acct either — the picker routes at exit
     # time, which can be hours later, by which point the account that ran out
     # may be the one with the most headroom again.
-    resume = ("claude --resume %s" % sid if cont
-              else "claude --model %s --resume %s" % (model, sid))
-    inner = ("echo 'claude-model: waiting for the current session (pid %d) to exit "
-             "— run /exit in its tab'; "
-             "while kill -0 %d 2>/dev/null; do sleep 0.5; done; "
-             "%s" % (pid, pid, resume))
+    quoted_sid = shlex.quote(sid)
+    resume = ("claude --resume %s" % quoted_sid if cont
+              else "claude --model %s --resume %s"
+              % (shlex.quote(model), quoted_sid))
     tab_shell = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                              "agent-tab-shell")
-    cmd = ["wezterm", "cli", "spawn", "--cwd", cwd, "--", tab_shell, inner]
+    cmd = ["wezterm", "cli", "spawn", "--cwd", cwd, "--", tab_shell,
+           "--session", sid, "--wait-session", resume]
 
     if cont:
         print("session %s  →  %s (capped here, room there)"
