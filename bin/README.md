@@ -280,9 +280,11 @@ default names are `Browser N`. With the pinned browser momentarily disconnected
 and exactly one such stranger visible, a session auto-selects the stranger
 silently; with two or more it asks, and nothing in the list tells them apart
 (2026-08-28: a third extension signed into `main` on another machine did both).
-The hook therefore tells every session that a deviceId other than its own is
-another machine — to be described as such, never driven without asking. The
-cure lives on the other machine: sign the extension out there.
+The hook therefore tells every session to `select_browser` its own deviceId
+before the first browser action instead of trusting the auto-pick, and that a
+deviceId other than its own is another machine — to be described as such,
+never driven. The cure for the stranger itself lives on the other machine:
+sign the extension out there.
 
 Installing the extension is **not** enough. It registers with no account until a
 human opens it in that browser and signs in — the diagnostic is its storage

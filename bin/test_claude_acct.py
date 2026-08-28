@@ -965,7 +965,9 @@ class TestExtensionIdentity(unittest.TestCase):
                          ("dev-1", "alt@example.com", True, "ok"))
         advice = L.browser_identity_advice(self.acct, accounts)
         for needle in (str(L.BROWSER_ROOT / "alt"), "alt@example.com", "dev-1",
-                       "auto-selects", "different machine", "never drive"):
+                       "auto-selects", "different machine", "never drive",
+                       "call select_browser with this deviceId directly",
+                       "claude --acct-browser alt"):
             self.assertIn(needle, advice)
         self.assertNotIn("Browser 1", advice.split("not \"Browser N\"")[0])
         self.assertIn("pin ok", L.browser_identity_summary(self.acct, accounts))

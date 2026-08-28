@@ -1374,7 +1374,14 @@ def browser_identity_advice(acct, accounts):
             "machine signed into the same account (claude's \"on this computer\" "
             "only means \"also Linux\"): never drive it without asking, and "
             "describe it as \"unknown Linux browser, connected <time>\", not "
-            "\"Browser N\"." % (b["where"], b["signedIn"], b["deviceId"], pin))
+            "\"Browser N\". Standing instruction from the user: at the start of "
+            "any browser work call select_browser with this deviceId directly — "
+            "do not ask which browser to use, it is this account's own and the "
+            "only one that may be driven. If select_browser says it is not "
+            "connected, stop and ask the user to open it ('claude --acct-browser "
+            "%s') rather than falling back to any other device."
+            % (b["where"], b["signedIn"], b["deviceId"], pin,
+               display_name(acct, accounts)))
 
 
 BROWSER_STATE_TEXT = {
