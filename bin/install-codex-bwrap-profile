@@ -18,12 +18,6 @@ if [[ $# -ne 0 ]]; then
   exit 2
 fi
 
-if [[ ! -x /usr/bin/bwrap || ! -x /usr/bin/install || ! -x /usr/bin/sudo
-      || ! -x /usr/sbin/apparmor_parser ]]; then
-  echo "This installer requires bubblewrap and AppArmor on Linux." >&2
-  exit 1
-fi
-
 if [[ ! -f $source_profile || -L $source_profile
       || $(/usr/bin/realpath -e -- "$source_profile") != "$source_profile" ]]; then
   echo "$source_profile must be a canonical regular, non-symlink file." >&2
@@ -37,6 +31,12 @@ fi
 
 if [[ -f $target_profile ]] && ! /usr/bin/cmp -s "$source_profile" "$target_profile"; then
   echo "$target_profile already contains different policy; refusing to replace it." >&2
+  exit 1
+fi
+
+if [[ ! -x /usr/bin/bwrap || ! -x /usr/bin/install || ! -x /usr/bin/sudo
+      || ! -x /usr/sbin/apparmor_parser ]]; then
+  echo "This installer requires bubblewrap and AppArmor on Linux." >&2
   exit 1
 fi
 
