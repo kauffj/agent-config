@@ -27,7 +27,7 @@ Windows without work, and the interesting parts assume all three.
 | `agents/` | 5 review subagents — security, simplicity, UI, visual, QA. |
 | `hooks/` | 8 hooks — session state, an accidental-destructive-command backstop, auto-format, lessons injection, transcript fsync, and a pre-commit leak guard. |
 | `codex/` | Codex-native lifecycle, startup, and safety-hook wiring. |
-| `bin/` | 22 command-line tools and focused harness scripts behind the above. |
+| `bin/` | 23 command-line tools and focused harness scripts behind the above. |
 | `lib/` | Shared libraries behind the skills — among them `doctor.mjs` (config integrity), the `workspace*.mjs` state/Git/database/delivery modules and CLI façade, and `project.mjs` (derived project profile plus tracked `.agent/project.json` overrides). |
 | `systemd/user/` | 9 units — the timers that make durability and resurrection actually run. |
 | `instructions/AGENTS.md` | The canonical standing instructions. Workflow orchestration, core principles, and a section on the economics of an agent's time vs. yours. |
@@ -117,6 +117,13 @@ git clone <this repo> ~/projects/claude-config
 ~/projects/claude-config/bin/agent-config-install
 ~/projects/claude-config/bin/agent-config-install --check
 
+# One-time Codex permission migration: Git works by default.
+~/projects/claude-config/bin/codex-git-access enable
+
+# After restarting Codex, run this inside the new session to prove its active
+# sandbox can write Git metadata.
+~/projects/claude-config/bin/codex-git-access check ~/projects/claude-config
+
 # Ubuntu 24.04 only: permit Codex's bubblewrap workspace sandbox without
 # disabling AppArmor's global unprivileged-user-namespace restriction
 ~/projects/claude-config/bin/install-codex-bwrap-profile
@@ -162,16 +169,37 @@ loads it, and runs a real sandbox probe. It refuses to overwrite different
 existing policy. This keeps the global user-namespace restriction enabled and
 grants the capability only when `/usr/bin/bwrap` runs.
 
-Sandbox and approval policy belong in Codex's user-level `~/.codex/config.toml`,
-not a repository-local `.codex/config.toml`: project config intentionally
-cannot elevate these native security controls. The autonomous default used on
-this workstation is `approval_policy = "never"`, `sandbox_mode =
-"workspace-write"`, and `network_access = true` under
-`[sandbox_workspace_write]`, with `exclude_slash_tmp = true` and
-`exclude_tmpdir_env_var = true`. This confines filesystem writes to the
-checkout while allowing ordinary package, Git, and research traffic. Use a
-command-line override for an exceptional session instead of weakening a
-project file that Codex will ignore.
+Codex's legacy `workspace-write` sandbox deliberately protects `.git` as
+read-only, so it can edit source but cannot commit. `codex-git-access enable`
+replaces that legacy policy with four permission profiles: Git/no-Git crossed
+with network on/off. The user default becomes Git-enabled without granting
+write access outside the workspace; both temporary-directory exclusions and
+`approval_policy = "never"` remain unchanged. The command recognizes only the
+legacy shape used here, preserves unrelated TOML text, validates the result,
+creates a private backup under `~/.local/state/agent-config/backups/`, and is
+idempotent. It refuses ambiguous or conflicting policy instead of guessing.
+
+Trusted project config has higher precedence than the user default. To keep one
+checkout's Git metadata read-only without changing its network posture, run:
+
+```bash
+~/.config/agent-config/bin/codex-git-access opt-out /path/to/project
+```
+
+If a project already has a legacy local `workspace-write` policy, name it on
+the `enable` command to migrate that local policy while preserving its explicit
+network setting. Projects without local policy simply inherit the user default.
+
+Run `codex-git-access check [PROJECT...]` to validate the installed profiles.
+For each normal checkout it creates and removes one uniquely named inert file
+inside the resolved Git directory, proving the active sandbox can write Git
+metadata without changing the index or refs. A linked worktree stores its real
+Git directory outside the worktree; the command reports that limitation rather
+than silently granting another checkout write access. Permission changes are
+loaded only by new Codex sessions. See OpenAI's current
+[permission-profile](https://developers.openai.com/codex/permissions/) and
+[configuration-precedence](https://developers.openai.com/codex/config-basic/#configuration-precedence)
+documentation for the underlying model.
 
 **That last line matters.** Auto mode writes a summary of this machine's
 infrastructure — production hostnames, where secrets live, how deploys work —

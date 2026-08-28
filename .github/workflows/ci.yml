@@ -31,6 +31,7 @@ jobs:
       - name: Python test suites
         run: |
           python3 bin/test_agent_session_server.py -v
+          python3 bin/test_codex_git_access.py -v
           python3 bin/test_claude_sessions_lib.py -v
           python3 bin/test_claude_acct.py
 
