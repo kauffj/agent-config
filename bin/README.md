@@ -236,13 +236,18 @@ Capability is **detected from disk** — the extension present under
 `"browser": true` in `accounts.json` as a manual override. No bookkeeping: the
 moment you install the extension in an account's profile, it joins the pool.
 
-The account binding is **the browser's environment**, not the manifest. A
-native-messaging host inherits the environment of the browser that spawned it
-(verified 2026-08-19: a live host carried `CLAUDE_ACCT_BROWSER_PROFILE` and
-`BROWSER` straight from its browser), so `claude-acct-browser` exports that
-profile's `CLAUDE_CONFIG_DIR` — recorded in `<user-data-dir>/claude-config-dir`
-— before exec'ing the browser, and every host it spawns lands on the right
-account. The shim also scrubs the `CLAUDE_CODE_*` variables of whatever session
+**Which account lists a browser is the extension's own sign-in.** The extension
+registers itself with the bridge (`bridge.claudeusercontent.com`) under the
+claude.ai account it is signed into, and a session lists exactly the extensions
+registered under its account. So each profile's extension has to be signed in
+as the account that owns the profile — `--acct-status` says whether it is
+(`signed in as …`, or `WRONG ACCOUNT` with the fix). The `CLAUDE_CONFIG_DIR`
+the shim exports binds the *native-messaging host* that browser spawns: a host
+inherits the environment of the browser that spawned it (verified 2026-08-19:
+a live host carried `CLAUDE_ACCT_BROWSER_PROFILE` and `BROWSER` straight from
+its browser), so `claude-acct-browser` exports the profile's `CLAUDE_CONFIG_DIR`
+— recorded in `<user-data-dir>/claude-config-dir` — before exec'ing the
+browser. The shim also scrubs the `CLAUDE_CODE_*` variables of whatever session
 opened the browser, so a host never inherits a session identity that isn't its.
 
 Binding through the manifest instead does **not** survive, which is why it
@@ -252,6 +257,32 @@ rewrites that product-wide manifest to its own shim on every `--chrome` session
 start (verified by reproduction) — so any manifest the wrapper asserts is undone
 by the next session that starts. `chrome/` is therefore not in the shared
 symlink set.
+
+**Which browser a session drives is pinned, and every deviceId resolves from
+disk.** Claude Code auto-selects `chromeExtension.pairedDeviceId` from the
+account's global config (`~/.claude.json` for the default account,
+`<dir>/.claude.json` otherwise) whenever that device is connected, and writes
+the pin itself the first time a session picks a browser (`select_browser`, or
+the extension's Connect prompt). The wrapper never writes it — every running
+session rewrites that file, and a wrapper write would race them. The extension
+keeps its `bridgeDeviceId` (the deviceId the bridge lists) and `accountUuid` in
+`chrome.storage.local`, a leveldb under the profile that `_claude_acct_lib.py`
+reads with a small table reader (Snappy blocks looked up through the index,
+plus the write-ahead log). That is what turns the picker's `Browser 1
+(21bd9734-…) — Linux, on this computer` into *the system Brave, signed in as
+claudepersonal@*: the SessionStart hook prints that mapping for the session's
+own browser, and `--acct-status` prints it per account with the pin state
+(`pin ok`, `PIN DRIFT` after an extension reinstall, `not pinned`).
+
+**Any browser signed into your account anywhere on Linux shows as "on this
+computer".** Claude Code's locality check is `osPlatform` equality and its
+default names are `Browser N`. With the pinned browser momentarily disconnected
+and exactly one such stranger visible, a session auto-selects the stranger
+silently; with two or more it asks, and nothing in the list tells them apart
+(2026-08-28: a third extension signed into `main` on another machine did both).
+The hook therefore tells every session that a deviceId other than its own is
+another machine — to be described as such, never driven without asking. The
+cure lives on the other machine: sign the extension out there.
 
 Installing the extension is **not** enough. It registers with no account until a
 human opens it in that browser and signs in — the diagnostic is its storage

@@ -218,12 +218,28 @@ def ensure_roster(accounts, minimum=MIN_ACCOUNTS):
     return accounts
 
 
-def account_email(acct):
+def claude_json_path(acct):
+    """The global config claude reads for this account. With CLAUDE_CONFIG_DIR
+    set it is <dir>/.claude.json; without it — the default account — it is
+    ~/.claude.json, NOT ~/.claude/.claude.json (claude never writes that one,
+    so anything read from it is a stale copy)."""
+    return (acct["dir"] / ".claude.json") if acct["dir"] else \
+        Path.home() / ".claude.json"
+
+
+def read_claude_json(acct):
     try:
-        return json.loads((config_dir(acct) / ".claude.json").read_text()) \
-            .get("oauthAccount", {}).get("emailAddress")
-    except Exception:
-        return None
+        return json.loads(claude_json_path(acct).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def account_email(acct):
+    return read_claude_json(acct).get("oauthAccount", {}).get("emailAddress")
+
+
+def account_uuid(acct):
+    return read_claude_json(acct).get("oauthAccount", {}).get("accountUuid")
 
 
 # ------------------------------------------------------------- credentials
@@ -974,6 +990,8 @@ def cmd_status():
         print(("  %-26s %-28s %s"
                % (who, BROWSER_STATE_TEXT[state],
                   (fix % display_name(acct, accounts)) if fix else "")).rstrip())
+        if state != "absent":
+            print("  %-26s %s" % ("", browser_identity_summary(acct, accounts)))
 
     if model:
         print("\n(the weekly column counts %s-scoped caps; model from "
@@ -1052,6 +1070,313 @@ def extension_activated(acct):
     return False
 
 
+# ----------------------------------------------- what the extension knows
+
+# The extension keeps its identity in chrome.storage.local, a leveldb under
+# the profile: bridgeDeviceId (the id it registers with the bridge — the
+# deviceId sessions see in list_connected_browsers) and accountUuid (the
+# claude.ai account it is signed into, which is the account whose sessions
+# will list it). Both are opaque to a session, so a picker that shows two
+# "Browser N ... Linux, on this computer" rows can't be resolved from inside
+# claude at all; read from disk they resolve to "your Brave, signed in as X".
+#
+# Reading leveldb takes a small table reader: Chromium compresses table blocks
+# with Snappy, and recent writes sit uncompressed in the write-ahead log.
+# Blocks are looked up through the table index and only the ones that can hold
+# a wanted key are decompressed — the store fills with thousands of
+# mcpConnected flips, and this runs on every session start.
+
+LDB_MAGIC = bytes.fromhex("57fb808b247547db")
+LDB_LOG_BLOCK = 32768
+EXTENSION_KEYS = {b"bridgeDeviceId": "deviceId", b"accountUuid": "accountUuid"}
+
+
+def _varint(b, i):
+    r = shift = 0
+    while True:
+        c = b[i]
+        i += 1
+        r |= (c & 0x7f) << shift
+        shift += 7
+        if not c & 0x80:
+            return r, i
+
+
+def snappy_decompress(d):
+    """Raw Snappy block (no framing): a length preamble, then literals and
+    back-references. Copies may overlap their own output, hence byte-wise."""
+    _, i = _varint(d, 0)
+    out = bytearray()
+    while i < len(d):
+        tag = d[i]
+        i += 1
+        kind = tag & 3
+        if kind == 0:
+            n = tag >> 2
+            if n >= 60:
+                width = n - 59
+                n = int.from_bytes(d[i:i + width], "little")
+                i += width
+            n += 1
+            out += d[i:i + n]
+            i += n
+            continue
+        if kind == 1:
+            n = ((tag >> 2) & 7) + 4
+            off = ((tag >> 5) << 8) | d[i]
+            i += 1
+        elif kind == 2:
+            n = (tag >> 2) + 1
+            off = int.from_bytes(d[i:i + 2], "little")
+            i += 2
+        else:
+            n = (tag >> 2) + 1
+            off = int.from_bytes(d[i:i + 4], "little")
+            i += 4
+        if not 0 < off <= len(out):
+            raise ValueError("snappy: copy before start of output")
+        for _ in range(n):
+            out.append(out[-off])
+    return bytes(out)
+
+
+def _ldb_block(f, off, size):
+    f.seek(off)
+    raw = f.read(size + 1)          # block, then its compression byte
+    data, kind = raw[:size], raw[size]
+    if kind == 0:
+        return data
+    if kind == 1:
+        return snappy_decompress(data)
+    raise ValueError("leveldb: block compression %d" % kind)
+
+
+def _ldb_entries(block):
+    """(key, value) pairs of one block; keys are prefix-compressed."""
+    restarts = int.from_bytes(block[-4:], "little")
+    end = len(block) - 4 - 4 * restarts
+    i, key = 0, b""
+    while i < end:
+        shared, i = _varint(block, i)
+        unshared, i = _varint(block, i)
+        vlen, i = _varint(block, i)
+        key = key[:shared] + block[i:i + unshared]
+        i += unshared
+        yield key, block[i:i + vlen]
+        i += vlen
+
+
+def _ldb_lookup(path, wanted):
+    """(user key, sequence, value) for live entries of the wanted user keys
+    in one .ldb table. The index names, per block, a separator at or above
+    its last key, so the first index entry whose user part is >= a wanted
+    key is the block that can hold it (plus the next, when the separator IS
+    that key: the run may continue)."""
+    with open(path, "rb") as f:
+        f.seek(-48, 2)
+        footer = f.read(48)
+        if footer[-8:] != LDB_MAGIC:
+            raise ValueError("leveldb: not a table file")
+        _, i = _varint(footer, 0)
+        _, i = _varint(footer, i)                     # metaindex: unused
+        off, i = _varint(footer, i)
+        size, _ = _varint(footer, i)
+        index = list(_ldb_entries(_ldb_block(f, off, size)))
+        chosen = set()
+        for want in wanted:
+            for n, (sep, _) in enumerate(index):
+                if sep[:-8] >= want:
+                    chosen.add(n)
+                    if sep[:-8] == want and n + 1 < len(index):
+                        chosen.add(n + 1)
+                    break
+        for n in sorted(chosen):
+            boff, j = _varint(index[n][1], 0)
+            bsize, _ = _varint(index[n][1], j)
+            for ikey, value in _ldb_entries(_ldb_block(f, boff, bsize)):
+                tag = int.from_bytes(ikey[-8:], "little")
+                if ikey[:-8] in wanted and tag & 0xff == 1:   # 1 = value
+                    yield ikey[:-8], tag >> 8, value
+
+
+def _ldb_log(path, wanted):
+    """(user key, sequence, value) for puts of the wanted keys in the
+    write-ahead log: 32K blocks of (crc, len, kind) records, each a batch."""
+    data = Path(path).read_bytes()
+    records, pending = [], b""
+    for start in range(0, len(data), LDB_LOG_BLOCK):
+        i, stop = start, min(start + LDB_LOG_BLOCK, len(data))
+        while i + 7 <= stop:
+            length = int.from_bytes(data[i + 4:i + 6], "little")
+            kind = data[i + 6]
+            if kind == 0 and length == 0:     # zero padding ends the block
+                break
+            frag = data[i + 7:i + 7 + length]
+            i += 7 + length
+            pending = frag if kind in (1, 2) else pending + frag   # full/first
+            if kind in (1, 4):                                     # full/last
+                records.append(pending)
+                pending = b""
+    for rec in records:
+        seq = int.from_bytes(rec[:8], "little")
+        count = int.from_bytes(rec[8:12], "little")
+        i = 12
+        for n in range(count):
+            kind = rec[i]
+            i += 1
+            klen, i = _varint(rec, i)
+            key = rec[i:i + klen]
+            i += klen
+            if kind != 1:                     # deletion: no value follows
+                continue
+            vlen, i = _varint(rec, i)
+            if key in wanted:
+                yield key, seq + n, rec[i:i + vlen]
+            i += vlen
+
+
+def extension_store(acct):
+    root = profile_root(acct["name"], [acct])
+    for profile in ("Default", "."):
+        store = root / profile / "Local Extension Settings" / EXTENSION_ID
+        if store.is_dir():
+            return store
+    return None
+
+
+def extension_identity(acct):
+    """{"deviceId": ..., "accountUuid": ...} as the extension in this
+    account's browser stores them — latest write wins. {} when there is no
+    store or any part of it can't be read: an old value from a half-read
+    store would name the wrong browser, and "unknown" is the honest answer."""
+    store = extension_store(acct)
+    if store is None:
+        return {}
+    latest = {}
+    try:
+        for f in sorted(store.iterdir()):
+            if f.suffix == ".ldb":
+                rows = _ldb_lookup(f, EXTENSION_KEYS)
+            elif f.suffix == ".log":
+                rows = _ldb_log(f, EXTENSION_KEYS)
+            else:
+                continue
+            for key, seq, value in rows:
+                if seq >= latest.get(key, (-1, b""))[0]:
+                    latest[key] = (seq, value)
+    except (OSError, ValueError, IndexError):
+        return {}
+    out = {}
+    for key, (_, value) in latest.items():
+        try:
+            v = json.loads(value.decode("utf-8"))
+        except ValueError:
+            continue
+        if isinstance(v, str) and v:
+            out[EXTENSION_KEYS[key]] = v
+    return out
+
+
+def pinned_device(acct):
+    """The browser claude auto-selects for this account without asking:
+    chromeExtension.pairedDeviceId in its global config, which claude itself
+    writes the first time a session picks a browser (select_browser, or the
+    Connect prompt). Read-only here on purpose — every running session
+    rewrites that file, and a wrapper write would race them."""
+    pin = read_claude_json(acct).get("chromeExtension") or {}
+    if not pin.get("pairedDeviceId"):
+        return {}
+    return {"deviceId": pin["pairedDeviceId"],
+            "name": pin.get("pairedDeviceName")}
+
+
+def account_for_uuid(uuid, accounts):
+    if not uuid:
+        return None
+    for a in accounts:
+        if account_uuid(a) == uuid:
+            return a
+    return None
+
+
+def browser_identity(acct, accounts):
+    """Everything a session needs to recognise this account's browser among
+    the deviceIds the bridge lists, as plain data:
+      deviceId   the extension's bridgeDeviceId (None: store unreadable)
+      where      which profile that is
+      signedIn   email of the account the extension is signed into, or None
+      ownerOk    signed into THIS account (any other account never lists it)
+      pin        ok | drift | none — claude's pairedDeviceId vs. the real id
+      pinned     the pin as stored, for the drift message"""
+    ident = extension_identity(acct)
+    profile = browser_profile(acct["name"], accounts)
+    owner = account_for_uuid(ident.get("accountUuid"), accounts)
+    pin = pinned_device(acct)
+    dev = ident.get("deviceId")
+    return {
+        "deviceId": dev,
+        "where": "the system Brave profile" if profile is None
+                 else "Brave profile %s" % profile,
+        "signedIn": email_of(owner) if owner else None,
+        "signedInUuid": ident.get("accountUuid"),
+        "ownerOk": owner is not None and owner["name"] == acct["name"],
+        "pin": "none" if not pin else "ok" if pin["deviceId"] == dev else "drift",
+        "pinned": pin,
+    }
+
+
+def browser_identity_summary(acct, accounts):
+    """One status line: deviceId · signed-in account · pin state."""
+    b = browser_identity(acct, accounts)
+    if not b["deviceId"]:
+        return "extension storage unreadable — deviceId unknown"
+    signed = ("signed in as %s" % b["signedIn"] if b["signedIn"]
+              else "signed into an account not on the roster"
+              if b["signedInUuid"] else "extension not signed in")
+    if not b["ownerOk"] and b["signedIn"]:
+        signed += " (WRONG ACCOUNT)"
+    pin = {"ok": "pin ok", "none": "not pinned",
+           "drift": "PIN DRIFT: config pins %s" % b["pinned"].get("deviceId")}
+    return "deviceId %s · %s · %s" % (b["deviceId"][:8], signed, pin[b["pin"]])
+
+
+def browser_identity_advice(acct, accounts):
+    """What the SessionStart hook tells a session, so a picker can say "your
+    Brave, signed in as X" and never "Browser 1", and so an unknown deviceId
+    is treated as another machine rather than driven on faith."""
+    b = browser_identity(acct, accounts)
+    if not b["deviceId"]:
+        return ""
+    me = email_of(acct) or acct["name"]
+    if not b["ownerOk"]:
+        who = ("signed in as %s" % b["signedIn"] if b["signedIn"] else
+               "signed into an account not on the roster" if b["signedInUuid"]
+               else "not signed into any account")
+        return ("WRONG ACCOUNT: the Claude extension in %s (deviceId %s) is %s, "
+                "not %s, so it registers under that account and sessions on %s "
+                "will never list it. Fix: open it with 'claude --acct-browser %s', "
+                "sign the extension out and back in as %s."
+                % (b["where"], b["deviceId"], who, me, me,
+                   display_name(acct, accounts), me))
+    pin = {
+        "ok": "pinned in its config, so claude auto-selects it whenever it is "
+              "connected",
+        "none": "not pinned yet — pick it once with select_browser and claude "
+                "remembers it",
+        "drift": "PIN DRIFT: its config pins %s (%s) instead, so claude will "
+                 "not auto-select it — the extension was reinstalled; pick "
+                 "this deviceId once with select_browser and claude re-pins it"
+                 % (b["pinned"].get("deviceId"),
+                    b["pinned"].get("name") or "unnamed"),
+    }[b["pin"]]
+    return ("This account's browser is %s, signed in as %s, deviceId %s — %s. "
+            "Any other deviceId from list_connected_browsers is a different "
+            "machine signed into the same account (claude's \"on this computer\" "
+            "only means \"also Linux\"): never drive it without asking, and "
+            "describe it as \"unknown Linux browser, connected <time>\", not "
+            "\"Browser N\"." % (b["where"], b["signedIn"], b["deviceId"], pin))
+
+
 BROWSER_STATE_TEXT = {
     "ready": "ready",
     "closed": "browser not running",
@@ -1108,12 +1433,14 @@ def ensure_browser_profile(name, acct_dir):
     its login can't be hijacked by whoever is signed into the default profile)
     and a one-line record of which account owns it.
 
-    That record is the account binding. A native-messaging host inherits the
+    That record binds the native-messaging host. A host inherits the
     environment of the browser that spawned it — verified 2026-08-19: a running
     host carried CLAUDE_ACCT_BROWSER_PROFILE and BROWSER straight from its
     browser — so the shim exports this profile's CLAUDE_CONFIG_DIR before
     exec'ing the browser, and every host that browser spawns lands on the right
     account. The env travels with the process; nothing has to win a race.
+    (Which account *lists* the browser is the extension's own claude.ai
+    sign-in, read back by extension_identity.)
 
     Binding through the native-messaging manifest instead does NOT survive, and
     that is why this file exists: Brave reads manifests only from its product

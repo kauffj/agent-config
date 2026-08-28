@@ -16,10 +16,11 @@ set -e
 profile="${CLAUDE_ACCT_BROWSER_PROFILE:?claude-acct-browser: CLAUDE_ACCT_BROWSER_PROFILE not set}"
 mkdir -p "$profile"
 
-# Bind this browser to the account that owns the profile. A native-messaging
-# host inherits the environment of the browser that spawned it, so exporting
-# CLAUDE_CONFIG_DIR here is the entire binding: Claude in Chrome then talks to
-# the same account the browser is signed in as. The manifest cannot do this —
+# Bind the native-messaging hosts this browser spawns to the account that owns
+# the profile. A host inherits the environment of the browser that spawned it,
+# so exporting CLAUDE_CONFIG_DIR here is that whole binding. (Which account's
+# sessions *list* this browser is the extension's own claude.ai sign-in — keep
+# it signed in as the profile's account.) The manifest cannot do this —
 # Brave reads only its product-wide one and Claude Code rewrites that on every
 # --chrome session start, so a manifest binding is undone by the next session.
 # Drop the session variables of whatever Claude session opened us. The browser

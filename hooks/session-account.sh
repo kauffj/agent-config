@@ -29,6 +29,15 @@ others = [L.display_name(a, accounts) for a in accounts
           if a["name"] != mine["name"] and L.browser_ready(a)]
 print(L.display_name(mine, accounts), capable, ",".join(others) or "-")
 
+# Which of the bridge's deviceIds is THIS account's browser, read from the
+# extension's own storage: the picker otherwise shows "Browser 1 / Browser 2",
+# both "Linux, on this computer", and nothing inside claude can tell them
+# apart. Printed whenever the browser exists (running or not).
+if capable in ("ready", "closed"):
+    advice = L.browser_identity_advice(mine, accounts)
+    if advice:
+        print(advice)
+
 # A model-scoped weekly cap the picker routed around is invisible from inside
 # the session: this account was chosen for the launch model, so switching with
 # /model can hit a wall the session has no way to see coming. Cached snapshot

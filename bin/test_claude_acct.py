@@ -820,5 +820,197 @@ class TestSeed(unittest.TestCase):
         self.assertNotIn("/tmp/empty", out["projects"])
 
 
+
+
+# --------------------------------------------- extension identity from disk
+
+def _vi(n):
+    out = bytearray()
+    while True:
+        b, n = n & 0x7f, n >> 7
+        out.append(b | 0x80 if n else b)
+        if not n:
+            return bytes(out)
+
+
+def ikey(user, seq, kind=1):
+    return user + ((seq << 8) | kind).to_bytes(8, "little")
+
+
+def ldb_block(entries):
+    body = b"".join(_vi(0) + _vi(len(k)) + _vi(len(v)) + k + v
+                    for k, v in entries)
+    return body + (0).to_bytes(4, "little") + (1).to_bytes(4, "little")
+
+
+def snappy_literals(data):
+    """A valid Snappy stream that only uses literal runs."""
+    out = bytearray(_vi(len(data)))
+    for i in range(0, len(data), 60):
+        chunk = data[i:i + 60]
+        out += bytes([(len(chunk) - 1) << 2]) + chunk
+    return bytes(out)
+
+
+def write_ldb(path, blocks):
+    """A leveldb table: blocks = [(entries, raw)] in key order; raw is the
+    stored bytes (None = store uncompressed) so a block can be deliberately
+    unreadable — the reader must never open a block it doesn't need."""
+    f, index = bytearray(), []
+    for entries, raw in blocks:
+        blob = ldb_block(entries) if raw is None else raw
+        index.append((entries[-1][0], _vi(len(f)) + _vi(len(blob))))
+        f += blob + bytes([0 if raw is None else 1]) + b"\0\0\0\0"
+    idx_off, idx = len(f), ldb_block(index)
+    f += idx + b"\0\0\0\0\0"
+    meta_off, meta = len(f), ldb_block([])
+    f += meta + b"\0\0\0\0\0"
+    footer = _vi(meta_off) + _vi(len(meta)) + _vi(idx_off) + _vi(len(idx))
+    f += footer + b"\0" * (40 - len(footer)) + L.LDB_MAGIC
+    path.write_bytes(bytes(f))
+
+
+def write_log(path, seq, puts, split=False):
+    body = seq.to_bytes(8, "little") + len(puts).to_bytes(4, "little")
+    for k, v in puts:
+        body += (b"\0" + _vi(len(k)) + k if v is None
+                 else b"\1" + _vi(len(k)) + k + _vi(len(v)) + v)
+
+    def rec(kind, frag):
+        return b"\0\0\0\0" + len(frag).to_bytes(2, "little") + bytes([kind]) + frag
+    if split:                     # FIRST + LAST fragments of one record
+        half = len(body) // 2
+        path.write_bytes(rec(2, body[:half]) + rec(4, body[half:]))
+    else:
+        path.write_bytes(rec(1, body))
+
+
+class TestExtensionIdentity(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.real_root, L.BROWSER_ROOT = L.BROWSER_ROOT, root / "browsers"
+        self.cfg = root / "cfg-alt"
+        self.cfg.mkdir()
+        self.acct = {"name": "alt", "dir": self.cfg, "email": None,
+                     "browser": False}
+        self.store = (L.BROWSER_ROOT / "alt" / "Default" /
+                      "Local Extension Settings" / L.EXTENSION_ID)
+        self.store.mkdir(parents=True)
+
+    def tearDown(self):
+        L.BROWSER_ROOT = self.real_root
+        self.tmp.cleanup()
+
+    def config(self, **top):
+        (self.cfg / ".claude.json").write_text(json.dumps(top))
+
+    def test_snappy_decodes_literals_and_overlapping_copies(self):
+        stream = (_vi(10) + b"\x0c" + b"abcd"      # literal "abcd"
+                  + b"\x01\x04"                     # copy-1: len 4, off 4
+                  + b"\x06\x08\x00")                # copy-2: len 2, off 8
+        self.assertEqual(L.snappy_decompress(stream), b"abcdabcdab")
+        with self.assertRaises(ValueError):
+            L.snappy_decompress(_vi(4) + b"\x01\x09")   # copy before start
+
+    def test_identity_takes_the_latest_write_across_table_and_log(self):
+        # Table: an unrelated first block that is deliberately unreadable
+        # (compression byte says Snappy, bytes say junk) — the reader must
+        # skip it by index instead of decompressing everything — then a
+        # compressed block holding the wanted keys.
+        write_ldb(self.store / "000005.ldb", [
+            ([(ikey(b"aaa", 3), b"\"x\"")], b"\xff\xff junk"),
+            ([(ikey(b"accountUuid", 7), b"\"acct-1\""),
+              (ikey(b"bridgeDeviceId", 9), b"\"dev-old\""),
+              (ikey(b"mcpConnected", 40), b"true")],
+             snappy_literals(ldb_block([
+                 (ikey(b"accountUuid", 7), b"\"acct-1\""),
+                 (ikey(b"bridgeDeviceId", 9), b"\"dev-old\""),
+                 (ikey(b"mcpConnected", 40), b"true")]))),
+        ])
+        # Log: a later write of the device id, split across two fragments,
+        # and a deletion of something else that carries no value.
+        write_log(self.store / "000007.log", 50,
+                  [(b"mcpConnected", None), (b"bridgeDeviceId", b"\"dev-new\"")],
+                  split=True)
+        self.assertEqual(L.extension_identity(self.acct),
+                         {"accountUuid": "acct-1", "deviceId": "dev-new"})
+
+    def test_identity_is_unknown_rather_than_stale_when_unreadable(self):
+        self.assertEqual(L.extension_identity({"name": "nobody", "dir": self.cfg,
+                                               "email": None, "browser": False}),
+                         {})
+        write_log(self.store / "000003.log", 1,
+                  [(b"bridgeDeviceId", b"\"dev-old\"")])
+        (self.store / "000004.ldb").write_bytes(b"not a table" * 8)
+        self.assertEqual(L.extension_identity(self.acct), {})
+
+    def test_default_account_config_is_home_claude_json(self):
+        self.assertEqual(L.claude_json_path({"name": "main", "dir": None}),
+                         Path.home() / ".claude.json")
+        self.assertEqual(L.claude_json_path(self.acct), self.cfg / ".claude.json")
+
+    def test_pin_states_and_the_advice_a_session_gets(self):
+        write_log(self.store / "000003.log", 1,
+                  [(b"accountUuid", b"\"acct-1\""),
+                   (b"bridgeDeviceId", b"\"dev-1\"")])
+        me = {"accountUuid": "acct-1", "emailAddress": "alt@example.com"}
+        accounts = [self.acct]
+
+        self.config(oauthAccount=me,
+                    chromeExtension={"pairedDeviceId": "dev-1",
+                                     "pairedDeviceName": "Browser 1"})
+        b = L.browser_identity(self.acct, accounts)
+        self.assertEqual((b["deviceId"], b["signedIn"], b["ownerOk"], b["pin"]),
+                         ("dev-1", "alt@example.com", True, "ok"))
+        advice = L.browser_identity_advice(self.acct, accounts)
+        for needle in (str(L.BROWSER_ROOT / "alt"), "alt@example.com", "dev-1",
+                       "auto-selects", "different machine", "never drive"):
+            self.assertIn(needle, advice)
+        self.assertNotIn("Browser 1", advice.split("not \"Browser N\"")[0])
+        self.assertIn("pin ok", L.browser_identity_summary(self.acct, accounts))
+
+        self.config(oauthAccount=me,
+                    chromeExtension={"pairedDeviceId": "dev-0"})
+        self.assertEqual(L.browser_identity(self.acct, accounts)["pin"], "drift")
+        self.assertIn("PIN DRIFT", L.browser_identity_advice(self.acct, accounts))
+        self.assertIn("dev-0", L.browser_identity_summary(self.acct, accounts))
+
+        self.config(oauthAccount=me)
+        self.assertEqual(L.browser_identity(self.acct, accounts)["pin"], "none")
+        self.assertIn("not pinned", L.browser_identity_advice(self.acct, accounts))
+
+    def test_extension_signed_into_another_account_is_called_out(self):
+        write_log(self.store / "000003.log", 1,
+                  [(b"accountUuid", b"\"acct-main\""),
+                   (b"bridgeDeviceId", b"\"dev-1\"")])
+        main_cfg = Path(self.tmp.name) / "cfg-main"
+        main_cfg.mkdir()
+        (main_cfg / ".claude.json").write_text(json.dumps({"oauthAccount": {
+            "accountUuid": "acct-main", "emailAddress": "main@example.com"}}))
+        self.config(oauthAccount={"accountUuid": "acct-1",
+                                  "emailAddress": "alt@example.com"})
+        main = {"name": "main", "dir": main_cfg, "email": None, "browser": False}
+        accounts = [main, self.acct]
+        advice = L.browser_identity_advice(self.acct, accounts)
+        self.assertIn("WRONG ACCOUNT", advice)
+        self.assertIn("main@example.com", advice)
+        self.assertIn("claude --acct-browser alt", advice)
+        self.assertIn("WRONG ACCOUNT",
+                      L.browser_identity_summary(self.acct, accounts))
+        self.assertEqual(L.browser_identity_advice(self.acct, accounts)[:5],
+                         "WRONG")
+
+    def test_no_store_means_no_advice(self):
+        self.assertEqual(L.browser_identity_advice(
+            {"name": "nobody", "dir": self.cfg, "email": None, "browser": False},
+            []), "")
+
+    def test_seeding_never_copies_the_browser_pin(self):
+        seeded = L.seed_claude_json({"mcpServers": {}, "chromeExtension": {
+            "pairedDeviceId": "dev-main", "pairedDeviceName": "Browser 1"}})
+        self.assertNotIn("chromeExtension", seeded)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
