@@ -732,8 +732,11 @@ def sandbox_direct_git_mountpoint(cwd):
                 children.append(entry)
         if not children:
             # An ordinary writable empty directory is project input and cannot
-            # be silently classified away as a sandbox artifact.
-            return not info.st_mode & stat.S_IWUSR
+            # be silently classified away as a sandbox artifact. Codex's
+            # synthetic mount retains the source directory's 0755 mode even
+            # though the mount itself is read-only, so inspect both signals.
+            return (bool(os.statvfs(marker).f_flag & os.ST_RDONLY)
+                    or not info.st_mode & stat.S_IWUSR)
         # Permission rules for optional read-only Git paths can materialize
         # zero-byte placeholders. A real checkout always has HEAD, objects,
         # and refs. The older Git profile left the parent directory writable,

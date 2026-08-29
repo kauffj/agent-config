@@ -576,6 +576,9 @@ class CodexWorktreeTest(unittest.TestCase):
         (projects / ".git").mkdir()
         wrapper = load_wrapper()
         self.assertFalse(wrapper.sandbox_direct_git_mountpoint(projects))
+        read_only = type("StatVfs", (), {"f_flag": os.ST_RDONLY})()
+        with mock.patch.object(wrapper.os, "statvfs", return_value=read_only):
+            self.assertTrue(wrapper.sandbox_direct_git_mountpoint(projects))
         (projects / ".git").chmod(0o555)
         self.git("init", "-q", child, cwd=self.base)
 
