@@ -1581,6 +1581,33 @@ class CodexWorktreeTest(unittest.TestCase):
         self.assertEqual((self.main / ".git" / "config").read_bytes(), config_before)
 
     @unittest.skipUnless(installed_codex(), "Codex CLI is not installed")
+    def test_installed_codex_offline_sandbox_runs_node_workspace_git(self):
+        policy = self.main / ".codex" / "config.toml"
+        policy.parent.mkdir()
+        policy.write_text('default_permissions = "git-workspace-offline"\n')
+        launch = self.run_wrapper("--version", cwd=self.main)
+        extra = self.argv(launch)[:-1]
+        module = ROOT / "lib" / "workspace-git.mjs"
+        script = (
+            f'import {{ git, stdout }} from {json.dumps(str(module))}; '
+            'console.log(stdout(git(["rev-parse", "--show-toplevel"])))')
+        env = self.env()
+        env["PATH"] = os.environ.get("PATH", env["PATH"])
+        sandbox_tmp = self.base / "offline-node-sandbox-runtime-tmp"
+        sandbox_tmp.mkdir()
+        env["TMPDIR"] = str(sandbox_tmp)
+
+        result = subprocess.run(
+            [str(installed_codex()), *extra, "sandbox", "--", "node",
+             "--input-type=module", "-e", script],
+            cwd=self.main, env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(self.main))
+        self.assertEqual(list(self.main.glob(".workspace-command-*")), [])
+
+    @unittest.skipUnless(installed_codex(), "Codex CLI is not installed")
     def test_installed_codex_sandbox_enforces_fleet_git_guards(self):
         projects = self.base / "projects"
         enabled = projects / "enabled"

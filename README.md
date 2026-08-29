@@ -89,7 +89,11 @@ reimplementing worktree setup. `feature` uses that branch for implementation
 and review, then integrates the remote's actual default branch, reruns the
 approved checks, pushes the verified commit directly to default, waits for CI,
 and removes the landed branch and worktree. PRs and parked branches are not
-completion paths in this workflow.
+completion paths in this workflow. Its synchronous command runner captures
+stdout and stderr through bounded, immediately-unlinked files and a trusted
+Python bridge. This avoids Node's captured-pipe `EPERM` inside Codex's offline
+Linux sandbox without broadening network or temporary-directory permissions,
+leaving capture artifacts, or allowing unbounded command output.
 
 **The review agents** (`agents/`, `skills/review-*`). Five specialist reviewers —
 security, simplicity, UI, visual, QA — that share one contract rather than one
