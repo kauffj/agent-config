@@ -28,7 +28,7 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from _claude_sessions_lib import (  # noqa: E402
     CLAUDE_DIR, SESSION_ID_RE, caller_session_ids, clear_recovery,
-    leased_session_ids, process_live_session_ids, recent_transcript_sessions,
+    leased_session_ids, native_live_session_ids, recent_transcript_sessions,
     resume_command, resume_set,
 )
 
@@ -118,9 +118,13 @@ def _mux_live_session_ids():
 
 def _effective_live_session_ids():
     """Use mux/hook liveness whenever this command runs inside WezTerm."""
-    process_ids = process_live_session_ids()
+    try:
+        native_ids = native_live_session_ids()
+    except OSError as exc:
+        sys.exit("claude-resume: cannot safely inspect Codex writer locks: %s"
+                 % exc)
     callers = caller_session_ids()
-    live = process_ids | leased_session_ids() | callers
+    live = native_ids | leased_session_ids() | callers
     if os.environ.get("WEZTERM_PANE"):
         mux_ids = _mux_live_session_ids()
         if mux_ids is None or (callers and not callers.issubset(mux_ids)):

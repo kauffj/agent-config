@@ -80,11 +80,20 @@ source and joins WezTerm's live pane list to the lifecycle state the hooks
 already publish. That join is read-only from a managed Codex sandbox, so it
 works from any project without executing a mutable helper on the host.
 
+Codex also owns a native per-thread writer lock under
+`~/.codex/thread-writer-locks/`. Recovery and snooze probe that kernel lock as
+another liveness source. This matters when a managed sandbox cannot see the host
+process: a held native lock is still exact evidence that `codex resume` would be
+a duplicate writer. The full lock-directory ancestry and peer-write state are
+validated; unsafe directories or entries fail closed, while unlocked stale
+files do not suppress recovery.
+
 The lease atomically excludes duplicate launches that cross this shared wrapper;
 the pane/hook join also detects directly started Claude and Codex sessions;
-wrapper-launched vendors publish the same pane identity. A direct native resume
-that races the wrapper cannot participate in its lock, so that detection is
-intentionally best-effort rather than an impossible cross-process guarantee.
+wrapper-launched vendors publish the same pane identity. Codex's native writer
+lock closes the corresponding direct-resume gap for Codex; other vendors'
+direct native resumes remain best-effort because they cannot participate in the
+shared wrapper lease.
 The lease follows the foreground agent process tree across supervisor failure,
 and an unlocked leftover file is not live. This is cooperative duplicate-writer
 coordination among trusted launch paths, not isolation from malicious same-UID

@@ -35,7 +35,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from _claude_sessions_lib import (  # noqa: E402
-    AGENT_STATE_DIR, CLAUDE_DIR, process_live_session_ids, resume_command,
+    AGENT_STATE_DIR, CLAUDE_DIR, native_live_session_ids, resume_command,
 )
 
 SCHEDULED = os.path.join(CLAUDE_DIR, "scheduled.json")
@@ -328,7 +328,11 @@ def _reopen(a, force_sid=None):
         else (_target_window() if have_wezterm else None)
     # A lease proves only that a launch is in flight. Drop durable snooze state
     # only for a native process that is observably running on the host.
-    live = process_live_session_ids()
+    try:
+        live = native_live_session_ids()
+    except OSError as exc:
+        _log("REOPEN REFUSED cannot inspect Codex writer locks: %s" % exc)
+        return False
     kept, requested, reopened, settled, dropped, failed = [], [], [], set(), 0, 0
     tab_shell = os.path.join(os.path.dirname(os.path.realpath(__file__)),
                              "agent-tab-shell")
@@ -384,7 +388,12 @@ def _reopen(a, force_sid=None):
         started = set()
         wanted = {e["session_id"] for e in requested}
         while time.monotonic() < deadline:
-            started = process_live_session_ids()
+            try:
+                started = native_live_session_ids()
+            except OSError as exc:
+                _log("STARTUP CHECK FAILED err=%s; keeping scheduled entries"
+                     % str(exc)[:200])
+                break
             if wanted.issubset(started):
                 break
             time.sleep(0.5)

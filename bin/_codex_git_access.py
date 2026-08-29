@@ -131,6 +131,7 @@ def parse_toml(text, path):
 
 
 def read_config(fd, path):
+    """Read one config without letting a hostile file exhaust the launcher."""
     chunks = []
     total = 0
     while True:
@@ -549,7 +550,7 @@ def open_parent_for_write(entry):
 def assert_source_unchanged(entry, parent_fd):
     name = entry["path"].name
     if entry["exists"]:
-        flags = os.O_RDONLY | os.O_CLOEXEC
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
         try:

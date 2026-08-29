@@ -16,6 +16,8 @@ import re
 import time
 from datetime import datetime
 
+import _secure_fs as secure_fs
+
 HOME = os.path.expanduser("~")
 CLAUDE_DIR = os.path.join(HOME, ".claude")
 REGISTRY_DIR = os.path.join(CLAUDE_DIR, "sessions")
@@ -29,6 +31,8 @@ AGENT_STATE_DIR = os.path.join(
     os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state"),
     "agent-fleet")
 LIVE_LEASE_DIR = os.path.join(AGENT_STATE_DIR, "live")
+CODEX_WRITER_LOCK_DIR = os.path.join(
+    HOME, ".codex", "thread-writer-locks")
 SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _CLK_TCK = os.sysconf("SC_CLK_TCK") if hasattr(os, "sysconf") else 100
 
@@ -360,6 +364,44 @@ def _snap_meta(path):
         return {}
 
 
+def _probe_session_locks(directory_fd):
+    """Classify validated lock names without assigning caller policy."""
+    locked = set()
+    unsafe = set()
+    for name in os.listdir(directory_fd):
+        if not name.endswith(".lock"):
+            continue
+        sid = name[:-5]
+        if not SESSION_ID_RE.fullmatch(sid):
+            continue
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK
+                         | os.O_NOFOLLOW | os.O_CLOEXEC,
+                         dir_fd=directory_fd)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            unsafe.add(sid)
+            continue
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_nlink != 1):
+                unsafe.add(sid)
+                continue
+            try:
+                fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            except BlockingIOError:
+                locked.add(sid)
+            else:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            unsafe.add(sid)
+        finally:
+            os.close(fd)
+    return {"locked": locked, "unsafe": unsafe}
+
+
 def leased_session_ids(directory=None):
     """Session ids whose launch wrappers currently hold a live lease.
 
@@ -375,33 +417,7 @@ def leased_session_ids(directory=None):
     except (OSError, TypeError):
         return out
     try:
-        for name in os.listdir(directory_fd):
-            if not name.endswith(".lock"):
-                continue
-            sid = name[:-5]
-            if not SESSION_ID_RE.fullmatch(sid):
-                continue
-            try:
-                fd = os.open(name, os.O_RDONLY | os.O_NONBLOCK
-                             | os.O_NOFOLLOW | os.O_CLOEXEC,
-                             dir_fd=directory_fd)
-            except OSError:
-                continue
-            try:
-                info = os.fstat(fd)
-                if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                        or info.st_nlink != 1):
-                    continue
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    out.add(sid)
-                else:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            finally:
-                os.close(fd)
+        out.update(_probe_session_locks(directory_fd)["locked"])
     finally:
         os.close(directory_fd)
     return out
@@ -461,9 +477,48 @@ def caller_session_ids(environ=None):
     return out
 
 
+def codex_writer_session_ids(directory=None):
+    """Codex threads whose native single-writer lock is currently held.
+
+    A restricted launcher may be unable to inspect the host process that owns
+    the thread, but the kernel lock remains observable across that PID namespace
+    boundary. Empty stale lock files are harmless: only lock contention proves
+    liveness. An unsafe entry is treated as live so it can suppress a duplicate
+    resume instead of becoming a path-confusion bypass.
+    """
+    directory = CODEX_WRITER_LOCK_DIR if directory is None else directory
+    # Unlike an unlocked stale file, an unsafe directory can hide or replace a
+    # genuinely held native lock. Validate the entire name chain, its peer-write
+    # mode, and ACLs before treating absence as evidence.
+    try:
+        secure_fs.validate_trusted_path(directory)
+    except secure_fs.Refusal as exc:
+        if isinstance(exc.__cause__, FileNotFoundError):
+            return set()
+        raise OSError(f"unsafe Codex writer-lock directory: {exc}") from exc
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        directory_fd = os.open(directory, flags)
+    except FileNotFoundError:
+        return set()
+    try:
+        info = os.fstat(directory_fd)
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise OSError("unsafe Codex writer-lock directory")
+        result = _probe_session_locks(directory_fd)
+        return result["locked"] | result["unsafe"]
+    finally:
+        os.close(directory_fd)
+
+
 def process_live_session_ids():
     """Live ids proved by processes visible in this PID namespace."""
     return set(live_sessions()) | set(other_vendor_sessions())
+
+
+def native_live_session_ids():
+    """Live native writers, including Codex writers hidden from /proc."""
+    return process_live_session_ids() | codex_writer_session_ids()
 
 
 def session_process_identity(session_id):
@@ -484,7 +539,7 @@ def process_identity_alive(identity):
 
 def known_live_session_ids():
     """Live ids visible through processes, launcher leases, or this caller."""
-    return process_live_session_ids() | leased_session_ids() | caller_session_ids()
+    return native_live_session_ids() | leased_session_ids() | caller_session_ids()
 
 
 def resume_set(snap_path=SNAPSHOT, recovery_max_age_h=12, live_ids=None):

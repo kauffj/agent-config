@@ -428,6 +428,36 @@ class TestLiveSessionIds(unittest.TestCase):
             self.assertEqual(L.leased_session_ids(leases), set(),
                              "links and non-regular files are not leases")
 
+    def test_codex_native_writer_lock_is_live(self):
+        with tempfile.TemporaryDirectory() as locks:
+            held_path = os.path.join(locks, "held-session.lock")
+            stale_path = os.path.join(locks, "stale-session.lock")
+            with open(held_path, "w") as held, open(stale_path, "w"):
+                fcntl.flock(held, fcntl.LOCK_EX)
+                self.assertEqual(
+                    L.codex_writer_session_ids(locks), {"held-session"})
+                fcntl.flock(held, fcntl.LOCK_UN)
+            self.assertEqual(L.codex_writer_session_ids(locks), set(),
+                             "an unlocked native lock is not liveness")
+
+    def test_unsafe_codex_writer_entries_fail_closed(self):
+        with tempfile.TemporaryDirectory() as locks:
+            target = os.path.join(locks, "target")
+            open(target, "w").close()
+            os.symlink(target, os.path.join(locks, "linked-session.lock"))
+            os.mkfifo(os.path.join(locks, "fifo-session.lock"))
+            self.assertEqual(L.codex_writer_session_ids(locks),
+                             {"linked-session", "fifo-session"})
+
+    def test_unsafe_codex_writer_directory_is_rejected(self):
+        with tempfile.TemporaryDirectory() as locks:
+            os.chmod(locks, 0o777)
+            try:
+                with self.assertRaisesRegex(OSError, "unsafe Codex writer-lock"):
+                    L.codex_writer_session_ids(locks)
+            finally:
+                os.chmod(locks, 0o700)
+
     def test_caller_and_leases_supplement_hidden_proc(self):
         with tempfile.TemporaryDirectory() as tmp:
             transcript = os.path.join(tmp, "rollout.jsonl")
@@ -501,8 +531,9 @@ class TestSandboxedResume(unittest.TestCase):
 
     def test_wezterm_caller_always_unions_mux_liveness(self):
         with mock.patch.dict(os.environ, {"WEZTERM_PANE": "7"}), \
-                mock.patch.object(self.resume, "process_live_session_ids",
-                                  return_value={"process-session"}), \
+                mock.patch.object(self.resume, "native_live_session_ids",
+                                  return_value={"process-session",
+                                                "native-writer"}), \
                 mock.patch.object(self.resume, "leased_session_ids",
                                   return_value={"leased-session"}), \
                 mock.patch.object(self.resume, "caller_session_ids",
@@ -511,12 +542,12 @@ class TestSandboxedResume(unittest.TestCase):
                                   return_value={"caller-session",
                                                 "ordinary-sibling"}):
             got = self.resume._effective_live_session_ids()
-        self.assertEqual(got, {"process-session", "leased-session",
+        self.assertEqual(got, {"process-session", "native-writer", "leased-session",
                                "caller-session", "ordinary-sibling"})
 
     def test_wezterm_caller_fails_closed_without_valid_mux_state(self):
         with mock.patch.dict(os.environ, {"WEZTERM_PANE": "7"}), \
-                mock.patch.object(self.resume, "process_live_session_ids",
+                mock.patch.object(self.resume, "native_live_session_ids",
                                   return_value=set()), \
                 mock.patch.object(self.resume, "leased_session_ids",
                                   return_value=set()), \
@@ -630,10 +661,25 @@ class TestScheduleState(unittest.TestCase):
                                   return_value="/usr/bin/wezterm"), \
                 mock.patch.object(self.schedule.subprocess, "run",
                                   return_value=spawn), \
-                mock.patch.object(self.schedule, "process_live_session_ids",
+                mock.patch.object(self.schedule, "native_live_session_ids",
                                   return_value=set()), \
                 mock.patch.object(self.schedule.time, "monotonic",
                                   side_effect=[0, 6]):
+            started = self.schedule._reopen(SimpleNamespace(dry_run=False),
+                                            force_sid="scheduled-session")
+        self.assertFalse(started)
+        self.assertEqual(self.schedule._read(), [self.entry])
+
+    def test_writer_lock_check_failure_after_spawn_preserves_schedule(self):
+        self.schedule._write([self.entry])
+        spawn = mock.Mock(returncode=0, stderr="")
+        with mock.patch.object(self.schedule, "_target_window", return_value=1), \
+                mock.patch.object(self.schedule.shutil, "which",
+                                  return_value="/usr/bin/wezterm"), \
+                mock.patch.object(self.schedule.subprocess, "run",
+                                  return_value=spawn), \
+                mock.patch.object(self.schedule, "native_live_session_ids",
+                                  side_effect=[set(), OSError("lock directory unreadable")]):
             started = self.schedule._reopen(SimpleNamespace(dry_run=False),
                                             force_sid="scheduled-session")
         self.assertFalse(started)
@@ -647,7 +693,7 @@ class TestScheduleState(unittest.TestCase):
                 mock.patch.object(self.schedule.subprocess, "run",
                                   side_effect=subprocess.TimeoutExpired(
                                       "wezterm", 3)), \
-                mock.patch.object(self.schedule, "process_live_session_ids",
+                mock.patch.object(self.schedule, "native_live_session_ids",
                                   return_value=set()):
             started = self.schedule._reopen(SimpleNamespace(dry_run=False),
                                             force_sid="scheduled-session")
@@ -662,7 +708,7 @@ class TestScheduleState(unittest.TestCase):
                                   return_value="/usr/bin/wezterm"), \
                 mock.patch.object(self.schedule.subprocess, "run",
                                   return_value=spawn), \
-                mock.patch.object(self.schedule, "process_live_session_ids",
+                mock.patch.object(self.schedule, "native_live_session_ids",
                                   side_effect=[set(), {"scheduled-session"}]), \
                 mock.patch.object(self.schedule, "_notify"):
             started = self.schedule._reopen(SimpleNamespace(dry_run=False),

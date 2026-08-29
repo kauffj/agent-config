@@ -116,7 +116,10 @@ def validate_trusted_path(path, *, current_owned_leaf=True):
         entries.append(current)
     for index, entry in enumerate(entries):
         leaf = index == len(entries) - 1
-        flags = os.O_RDONLY | os.O_CLOEXEC
+        # Never let a project-controlled FIFO or device leaf strand a launcher
+        # during trust validation. Callers that require a directory or regular
+        # file perform that type check on their pinned descriptor next.
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
         if not leaf:
             flags |= os.O_DIRECTORY
         if hasattr(os, "O_NOFOLLOW"):
@@ -133,7 +136,15 @@ def validate_trusted_path(path, *, current_owned_leaf=True):
             if info.st_uid not in allowed_owners or (leaf and current_owned_leaf
                                                      and info.st_uid != os.getuid()):
                 raise Refusal(f"{entry}: is not owned by the current user or the system")
-            if writable_by_peer(info, fd, entry):
+            # An owned sticky directory such as /tmp is safe as a
+            # non-leaf rendezvous: peers may create their own entries but
+            # cannot replace the user-owned child we validate next. No other
+            # peer-writable ancestor, and never a writable leaf, gets this
+            # exception.
+            sticky_owned_ancestor = (
+                not leaf and stat.S_ISDIR(info.st_mode)
+                and info.st_uid in allowed_owners and info.st_mode & stat.S_ISVTX)
+            if writable_by_peer(info, fd, entry) and not sticky_owned_ancestor:
                 raise Refusal(f"{entry}: is writable by another user")
         finally:
             os.close(fd)

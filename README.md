@@ -176,14 +176,16 @@ read-only, so it can edit source but cannot commit. `codex-git-access enable`
 replaces that legacy policy with four permission profiles: Git/no-Git crossed
 with network on/off. The user default becomes Git-enabled without granting
 write access outside the workspace. Hidden persistence surfaces remain
-protected: top-level config/hooks, initialized submodule pointers and their
-resolved Git directories, object-alternate pointers, linked-worktree
+protected: top-level config/hooks, pointer checkouts and their resolved Git
+directories, initialized submodule pointers, object-alternate pointers, linked-worktree
 pointer/config files, and every existing project `.codex/config.toml` policy
 source stay read-only while ordinary Git metadata is writable. Both temporary-directory
 exclusions and `approval_policy = "never"` remain unchanged. The command recognizes only the
 legacy shape used here, preserves unrelated TOML text, validates the result,
 creates a private backup under `~/.local/state/agent-config/backups/`, and is
-idempotent. It refuses ambiguous or conflicting policy instead of guessing.
+idempotent. Config reads are capped at 1 MiB and opened nonblocking, so a large
+file or special-file substitution cannot strand the migration. It refuses
+ambiguous or conflicting policy instead of guessing.
 
 Trusted project config has higher precedence than the user default. To keep one
 checkout's Git metadata read-only without changing its network posture, run:
@@ -201,50 +203,57 @@ validate the installed profiles. For each checkout it creates and removes one
 uniquely named inert file inside the resolved Git directory, proving the active
 sandbox can write Git metadata without changing the index or refs. When Codex
 starts from a non-Git umbrella such as `~/projects`, the managed launcher scans
-at most three levels for ordinary descendant checkouts and adds each eligible
-checkout as an exact runtime workspace root. That makes the user-level Git
+ordinary descendants recursively within hard directory, entry, and repository
+ceilings, then adds each eligible checkout as an exact runtime workspace root.
+That makes the user-level Git
 default effective for discovered child repositories; a discovered child-root
 `no-git` policy keeps that repository's metadata read-only, while a `no-git`
 policy at the umbrella root disables Git for every child. Network policy is
 session-wide, so project offline profiles are security boundaries only on a
-direct project launch. An online umbrella warns about discovered offline roots
-and excludes their Git metadata, but it cannot make their source network-isolated
-or prove no offline root exists beyond the scan budget or after startup. Root
-Git-policy discovery covers ordinary checkouts; worktree-specific untracked
-overrides require a direct worktree launch. The scan has directory, entry,
-depth, and repository budgets, skips
-generated/hidden trees, validates each Git root, and never treats a pointer-file
-worktree or submodule as an ordinary checkout. After policy validation, it
+direct project launch. If an online umbrella discovers any offline child or
+shared worktree policy, the launcher tightens the whole fleet session to offline
+and keeps eligible Git roots enabled. It cannot prove no offline root appeared
+after startup. The scan has directory, entry,
+repository, captured-output, elapsed-time, and runtime-profile-size budgets. It
+skips generated dependency/build trees while retaining workspace-worktree
+coverage, validates ordinary roots plus every shared worktree policy/config/hook
+layer, skips the fleet's archived `trash` tree, and never treats a pointer-file worktree or submodule as an ordinary
+checkout. A local `core.fsmonitor`, a Git config include, an unsafe policy or
+hook, an unexpected external submodule Git directory, or any exhausted budget
+makes the entire session read-only rather than applying partial rules. Every
+candidate is validated and the complete runtime profile is built, including
+individual and aggregate argument-limit checks, before any repository is
+changed. After that transaction-like preflight, the launcher
 materializes only standard empty optional Git metadata paths needed for the
-read-only guards; repositories that opt out of Git access remain untouched. It
-also caps both individual runtime-profile arguments and their aggregate size,
-and validates every repository before materializing any guard. For a
-linked worktree, the installed launcher first validates Git's `.git`,
+read-only guards; repositories that opt out of Git access remain untouched.
+For a linked worktree, the installed launcher first validates Git's `.git`,
 `commondir`, `gitdir`, and worktree-list pointers. It then starts Codex with an
 ephemeral profile that keeps the external common Git directory read-only and
 opens only shared objects/refs/logs plus that worktree's own admin directory.
-The source `.git` pointer, common config/hooks, current admin pointers/config,
-and sibling worktree admin directories remain read-only. The current admin
-HEAD/index and shared objects/refs/logs remain writable because ordinary linked
-worktree Git operations require them; use separate clones when those must be
-isolated too.
-Creating or removing worktrees is intentionally unavailable inside a managed
-Git session because `.git/worktrees` is a persistence boundary. A launch from
-the account home itself is read-only so the session cannot replace the trusted
-Codex/Node install or shell startup files. Any automatic-augmentation validation
-failure also makes the whole workspace read-only rather than leaving failed
-policy or nested Git control paths writable.
+The source `.git` pointer, checkout index and HEAD, common config/hooks, current
+admin pointers/config, and sibling worktree admin directories remain read-only.
+Initialized submodule pointers are checked recursively on direct and umbrella
+launches. Shared objects and refs are necessarily shared between linked
+worktrees; use separate clones when those must be isolated too. Creating or
+removing worktrees is intentionally unavailable inside a managed Git session
+because `.git/worktrees` is a persistence boundary. Any automatic-augmentation
+validation failure also makes the whole workspace read-only rather than leaving
+failed policy or nested Git control paths writable.
 
-The launcher derives `HOME` from the account database and accepts `CODEX_HOME`
-only through a trusted path outside project input; an account-home launch must
-use the default `~/.codex`. It treats the user's pre-existing global Git
-configuration and non-hook repository-local command settings (such as this
-repository's clean filter) as trusted configuration. It rejects repository-local
-config includes, `core.hooksPath`, `core.fsmonitor`, and unsafe active hooks,
-but it does not try to make arbitrary programs named by trusted Git
-configuration immutable.
-Explicit Codex sandbox, profile, or permission overrides bypass this automatic augmentation.
-Permission changes and launcher installs affect only new Codex
+The launcher derives `HOME` from the account database, removes project-set
+`XDG_CONFIG_HOME`, accepts only a trusted `CODEX_HOME` outside project input,
+and bounds every Git subprocess. An account-home launch must use the default
+`~/.codex` and is forced read-only so the session cannot replace the trusted
+Codex/Node install or shell startup files. The user's pre-existing global Git
+configuration and non-hook repository-local command settings are trusted only
+after every effective config origin is validated. Config includes and
+`core.fsmonitor` are rejected at every scope, while a custom hooks path is
+accepted only after its directory and every active hook are validated and
+protected exactly.
+Explicit Codex sandbox, profile, filesystem/network permission, or `--add-dir`
+overrides bypass this automatic augmentation. A trusted project config may
+select only `default_permissions`; any other project-local permission key makes
+automatic augmentation fail closed. Permission changes and launcher installs affect only new Codex
 sessions. See OpenAI's current
 [permission-profile](https://developers.openai.com/codex/permissions/) and
 [configuration-precedence](https://developers.openai.com/codex/config-basic/#configuration-precedence)
