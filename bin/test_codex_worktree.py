@@ -187,7 +187,12 @@ class CodexWorktreeTest(unittest.TestCase):
         projects.mkdir()
         wrapper = load_wrapper()
         executable = {"program": Path("/bin/true"), "argv": ["/bin/true"]}
-        with (mock.patch.object(wrapper, "find_real_codex", return_value=executable),
+        with (mock.patch.dict(
+                  os.environ, {"HOME": str(self.home)}, clear=True),
+              mock.patch.object(wrapper, "find_real_codex", return_value=executable),
+              mock.patch.object(wrapper, "account_home", return_value=self.home),
+              mock.patch.object(
+                  wrapper, "validated_codex_home", return_value=self.codex_home),
               mock.patch.object(
                   wrapper, "invocation_options",
                   return_value={"cwd": projects, "policyOverride": False}),
