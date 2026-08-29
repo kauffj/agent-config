@@ -23,6 +23,19 @@ SCRIPT = ROOT / "bin" / "codex-git-access"
 MODULE = ROOT / "bin" / "_codex_git_access.py"
 
 
+def installed_codex():
+    """Find the real CLI without recursively invoking an installed launcher."""
+    for directory in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = Path(directory) / "codex"
+        try:
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            continue
+        if resolved.name != "codex-worktree" and os.access(resolved, os.X_OK):
+            return resolved
+    return None
+
+
 def global_config(*, network=True, slash_tmp=True, env_tmp=True):
     return textwrap.dedent(f'''\
         approval_policy = "never"
@@ -141,6 +154,10 @@ class CodexGitAccessTest(unittest.TestCase):
                       ".git/config": "read",
                       ".git/config.worktree": "read",
                       ".git/hooks": "read",
+                      ".git/modules": "read",
+                      ".git/objects/info/alternates": "read",
+                      ".git/objects/info/http-alternates": "read",
+                      ".git/worktrees": "read",
                   })
         self.assertEqual(parsed["permissions"]["git-workspace"]["extends"],
                          "git-workspace-offline")
@@ -175,7 +192,11 @@ class CodexGitAccessTest(unittest.TestCase):
         old_block = module.PROFILE_BLOCK.replace(
             '".git/config" = "read"\n'
             '".git/config.worktree" = "read"\n'
-            '".git/hooks" = "read"\n', '')
+            '".git/hooks" = "read"\n'
+            '".git/modules" = "read"\n'
+            '".git/objects/info/alternates" = "read"\n'
+            '".git/objects/info/http-alternates" = "read"\n'
+            '".git/worktrees" = "read"\n', '')
         text = textwrap.dedent('''\
             approval_policy = "never"
             default_permissions = "git-workspace"
@@ -199,6 +220,28 @@ class CodexGitAccessTest(unittest.TestCase):
         self.assertEqual(len(self.backup_bundles()), 1)
         self.assertIn("updated user config", result.stdout)
 
+    def test_enable_adds_nested_git_persistence_guards_to_previous_profile(self):
+        module = load_script()
+        previous = module.PROFILE_BLOCK
+        for line in (
+                '".git/modules" = "read"\n',
+                '".git/objects/info/alternates" = "read"\n',
+                '".git/objects/info/http-alternates" = "read"\n',
+                '".git/worktrees" = "read"\n'):
+            previous = previous.replace(line, "")
+        self.write_global('approval_policy = "never"\n'
+                          'default_permissions = "git-workspace"\n\n' + previous)
+
+        result = self.run_cli("enable", check=True)
+
+        paths = tomllib.loads(self.config.read_text())["permissions"] \
+            ["git-workspace-offline"]["filesystem"][":workspace_roots"]
+        self.assertEqual(paths[".git/modules"], "read")
+        self.assertEqual(paths[".git/objects/info/alternates"], "read")
+        self.assertEqual(paths[".git/worktrees"], "read")
+        self.assertEqual(len(self.backup_bundles()), 1)
+        self.assertIn("updated user config", result.stdout)
+
     def test_migration_preserves_an_array_of_tables_after_the_legacy_table(self):
         text = global_config().replace(
             "\n[shell_environment_policy]",
@@ -208,12 +251,12 @@ class CodexGitAccessTest(unittest.TestCase):
         self.assertEqual(tomllib.loads(self.config.read_text())["trusted_commands"],
                          [{"name": "kept"}])
 
-    @unittest.skipUnless(shutil.which("codex"), "Codex CLI is not installed")
+    @unittest.skipUnless(installed_codex(), "Codex CLI is not installed")
     def test_installed_codex_strictly_accepts_the_generated_profiles(self):
         self.write_global()
         self.run_cli("enable", check=True)
         result = subprocess.run(
-            ["codex", "--strict-config", "doctor", "--json"],
+            [str(installed_codex()), "--strict-config", "doctor", "--json"],
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             env=self.env())
         report = json.loads(result.stdout)

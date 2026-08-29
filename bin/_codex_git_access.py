@@ -66,6 +66,10 @@ extends = "no-git-offline"
 ".git/config" = "read"
 ".git/config.worktree" = "read"
 ".git/hooks" = "read"
+".git/modules" = "read"
+".git/objects/info/alternates" = "read"
+".git/objects/info/http-alternates" = "read"
+".git/worktrees" = "read"
 
 [permissions.git-workspace]
 description = "Workspace editing with Git metadata writable and network enabled."
@@ -77,9 +81,17 @@ enabled = true
 """
 
 MANAGED_PROFILES = tomllib.loads(PROFILE_BLOCK)["permissions"]
+# The immediately previous managed profile protected only top-level Git
+# config/hooks. Recognize it so `enable` can add the nested persistence guards.
+PREVIOUS_MANAGED_PROFILES = copy.deepcopy(MANAGED_PROFILES)
+for _path in (
+        ".git/modules", ".git/objects/info/alternates",
+        ".git/objects/info/http-alternates", ".git/worktrees"):
+    del PREVIOUS_MANAGED_PROFILES["git-workspace-offline"]["filesystem"] \
+        [":workspace_roots"][_path]
 # The first shipped Git-capable profile made all of .git writable. Recognize
 # that exact owned shape so `enable` can narrow existing installs safely.
-LEGACY_MANAGED_PROFILES = copy.deepcopy(MANAGED_PROFILES)
+LEGACY_MANAGED_PROFILES = copy.deepcopy(PREVIOUS_MANAGED_PROFILES)
 LEGACY_MANAGED_PROFILES["git-workspace-offline"]["filesystem"] = {
     ":workspace_roots": {".git": "write"},
 }
@@ -269,7 +281,8 @@ def validate_upgradeable_managed_profiles(parsed, path):
     if not isinstance(permissions, dict):
         raise Refusal(f"{path}: managed permission profiles are missing")
     actual = {name: permissions.get(name) for name in MANAGED_CHOICES}
-    if actual not in (MANAGED_PROFILES, LEGACY_MANAGED_PROFILES):
+    if actual not in (
+            MANAGED_PROFILES, PREVIOUS_MANAGED_PROFILES, LEGACY_MANAGED_PROFILES):
         raise Refusal(f"{path}: managed permission profiles differ from known versions")
     choice = parsed.get("default_permissions")
     if choice not in MANAGED_CHOICES:
