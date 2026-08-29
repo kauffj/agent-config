@@ -21,6 +21,7 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "bin" / "codex-git-access"
 MODULE = ROOT / "bin" / "_codex_git_access.py"
+WRAPPER = ROOT / "bin" / "codex-worktree"
 
 
 def installed_codex():
@@ -31,7 +32,9 @@ def installed_codex():
             resolved = candidate.resolve(strict=True)
         except OSError:
             continue
-        if resolved.name != "codex-worktree" and os.access(resolved, os.X_OK):
+        if (resolved != WRAPPER.resolve()
+                and resolved.name != WRAPPER.name
+                and os.access(resolved, os.X_OK)):
             return resolved
     return None
 
@@ -313,6 +316,13 @@ class CodexGitAccessTest(unittest.TestCase):
             self.codex_home.chmod(0o700)
         self.assertEqual(result.returncode, 2)
         self.assertEqual(self.backup_bundles(), [])
+
+    def test_config_read_has_a_hard_byte_cap(self):
+        self.write_global("x" * 64)
+        module = load_script()
+        with (mock.patch.object(module, "CONFIG_MAX_BYTES", 16),
+              self.assertRaisesRegex(module.Refusal, "exceeds the safety limit")):
+            module.secure_read(self.config)
 
     def test_unconfirmable_group_and_extended_acl_fail_closed(self):
         module = load_script()

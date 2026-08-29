@@ -6,9 +6,11 @@ import os
 from pathlib import Path
 import pwd
 import re
+import selectors
 import stat
 import subprocess
 import sys
+import time
 from collections import deque
 
 import _codex_git_access as git_access
@@ -16,7 +18,10 @@ import _codex_git_access as git_access
 
 RUNTIME_PROFILE = "codex-git-linked-runtime"
 FLEET_RUNTIME_PROFILE = "codex-git-fleet-runtime"
-RESERVED_RUNTIME_PROFILES = (RUNTIME_PROFILE, FLEET_RUNTIME_PROFILE)
+GUARDED_RUNTIME_PROFILE = "codex-guarded-runtime"
+RESERVED_RUNTIME_PROFILES = (
+    RUNTIME_PROFILE, FLEET_RUNTIME_PROFILE, GUARDED_RUNTIME_PROFILE,
+)
 POLICY_OVERRIDES = ("default_permissions", "permissions.", "sandbox_mode", "sandbox_workspace_write")
 GIT_BIN = Path("/usr/bin/git")
 SYSTEM_UID = Path("/").stat().st_uid
@@ -39,14 +44,17 @@ ACTIVE_GIT_HOOKS = frozenset({
     "proc-receive", "push-to-checkout", "reference-transaction", "sendemail-validate",
     "update",
 })
+FLEET_SCAN_MAX_DEPTH = 3
 FLEET_SCAN_MAX_REPOSITORIES = 256
-FLEET_SCAN_MAX_DIRECTORIES = 32768
-FLEET_SCAN_MAX_ENTRIES = 65536
+FLEET_SCAN_MAX_DIRECTORIES = 4096
+FLEET_SCAN_MAX_ENTRIES = 32768
 EXACT_PROFILE_ARG_MAX_BYTES = 48 * 1024
 EXEC_ARG_MAX_BYTES = int(os.sysconf("SC_ARG_MAX"))
 EXACT_PROFILE_TOTAL_MAX_BYTES = min(512 * 1024, EXEC_ARG_MAX_BYTES // 4)
+GIT_OUTPUT_MAX_BYTES = 8 * 1024 * 1024
+GIT_TIMEOUT_SECONDS = 10
 FLEET_PRUNE = frozenset({
-    ".cache", ".git", ".next", ".venv", "build", "coverage",
+    ".cache", ".git", ".next", ".venv", ".workspaces", "build", "coverage",
     "dist", "node_modules", "target", "venv",
 })
 
@@ -54,7 +62,7 @@ FLEET_PRUNE = frozenset({
 def trusted_executable(path):
     """Accept an executable only below non-peer-writable root/user directories."""
     for index, item in enumerate((path, *path.parents)):
-        flags = os.O_RDONLY | os.O_CLOEXEC
+        flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
         if index > 0:
             flags |= os.O_DIRECTORY
         if hasattr(os, "O_NOFOLLOW"):
@@ -167,6 +175,33 @@ def account_home():
         return None
 
 
+def account_home_is_read_only(cwd):
+    """Return true when the broad account-home workspace must not be writable."""
+    return cwd == account_home()
+
+
+def validated_codex_home(cwd, access, home):
+    """Accept Codex config only from a trusted directory outside project input."""
+    raw = os.environ.get("CODEX_HOME")
+    candidate = Path(raw) if raw else home / ".codex"
+    if not candidate.is_absolute():
+        raise RuntimeError("CODEX_HOME must be an absolute trusted path")
+    try:
+        candidate = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(f"CODEX_HOME cannot be resolved safely: {candidate}") from exc
+    boundary = executable_boundary(cwd)
+    default_home_config = cwd == home and candidate == home / ".codex"
+    if cwd == home and not default_home_config:
+        raise RuntimeError(
+            f"account-home launches require the default CODEX_HOME: {home / '.codex'}")
+    if boundary is not None and inside(candidate, boundary) and not default_home_config:
+        raise RuntimeError(f"CODEX_HOME is project-controlled: {candidate}")
+    access.secure_fs.validate_trusted_path(candidate)
+    open_safe_directory(access, candidate)
+    return candidate
+
+
 def invocation_options(args):
     value = None
     policy_override = False
@@ -226,16 +261,65 @@ def scrub_git_routing(environment):
     return clean
 
 
+def bounded_process(command, env, label):
+    """Run one trusted binary while bounding combined captured output."""
+    process = subprocess.Popen(
+        command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    selected = selectors.DefaultSelector()
+    buffers = {"stdout": [], "stderr": []}
+    total = 0
+    deadline = time.monotonic() + GIT_TIMEOUT_SECONDS
+    try:
+        selected.register(process.stdout, selectors.EVENT_READ, "stdout")
+        selected.register(process.stderr, selectors.EVENT_READ, "stderr")
+        while selected.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(f"{label} timed out")
+            events = selected.select(remaining)
+            if not events:
+                raise RuntimeError(f"{label} timed out")
+            for key, _mask in events:
+                chunk = os.read(
+                    key.fileobj.fileno(),
+                    min(65536, GIT_OUTPUT_MAX_BYTES - total + 1))
+                if not chunk:
+                    selected.unregister(key.fileobj)
+                    continue
+                buffers[key.data].append(chunk)
+                total += len(chunk)
+                if total > GIT_OUTPUT_MAX_BYTES:
+                    raise RuntimeError(f"{label} output exceeded the safety limit")
+        remaining = max(0, deadline - time.monotonic())
+        try:
+            returncode = process.wait(timeout=remaining)
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"{label} timed out") from exc
+    except BaseException:
+        process.kill()
+        process.wait()
+        raise
+    finally:
+        selected.close()
+        process.stdout.close()
+        process.stderr.close()
+    try:
+        stdout = b"".join(buffers["stdout"]).decode()
+        stderr = b"".join(buffers["stderr"]).decode()
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"{label} returned invalid text") from exc
+    return {"returncode": returncode, "stdout": stdout, "stderr": stderr}
+
+
 def git_output(cwd, *args):
     env = scrub_git_routing(os.environ)
     env["GIT_OPTIONAL_LOCKS"] = "0"
-    result = subprocess.run(
+    result = bounded_process(
         [str(GIT_BIN), "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
-         "-C", str(cwd), *args], text=True, env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if result.returncode:
-        raise RuntimeError(result.stderr.strip() or "Git repository lookup failed")
-    return result.stdout.strip()
+         "-C", str(cwd), *args], env, "Git repository lookup")
+    if result["returncode"]:
+        raise RuntimeError(result["stderr"].strip() or "Git repository lookup failed")
+    return result["stdout"].strip()
 
 
 def open_safe_directory(access, path):
@@ -301,73 +385,63 @@ def ensure_guard_file(access, path):
     access.secure_read(path)
 
 
-def prepare_git_guards(root, common, worktree_config_paths, access, materialize=True):
-    """Validate persistence routing and optionally materialize guard paths."""
-    config_paths = [common / "config", common / "config.worktree", *worktree_config_paths]
-    access.secure_read(common / "config")
-    for path in config_paths:
-        source = access.secure_read(path, missing_ok=True)
-        if source["exists"]:
-            reject_config_includes(path)
-    hooks = effective_hooks_path(root, common, access)
-    validate_active_hooks(hooks, access)
-    if materialize:
-        ensure_guard_directory(access, common / "hooks")
-        ensure_guard_directory(access, common / "info")
-        ensure_guard_directory(access, common / "modules")
-        ensure_guard_directory(access, common / "objects")
-        ensure_guard_directory(access, common / "objects" / "info")
-        ensure_guard_directory(access, common / "worktrees")
-        for path in (
-                common / "config.worktree",
-                common / "objects" / "info" / "alternates",
-                common / "objects" / "info" / "http-alternates",
-                *worktree_config_paths):
-            ensure_guard_file(access, path)
-    return [] if hooks == common / "hooks" else [hooks]
+def prepare_git_guards(common, worktree_config_paths, access):
+    """Materialize optional read-only paths before Codex assembles mounts."""
+    validate_git_guards(common, worktree_config_paths, access)
+    materialize_git_guards(common, worktree_config_paths, access)
 
 
-def reject_config_includes(path):
+def validate_git_guards(common, worktree_config_paths, access):
+    """Validate every existing protected source without changing the repo."""
+    reject_local_config_indirection(
+        [common / "config", common / "config.worktree", *worktree_config_paths], access)
+    validate_active_hooks(common / "hooks", access)
+
+
+def materialize_git_guards(common, worktree_config_paths, access):
+    """Create the standard optional paths that the runtime profile guards."""
+    ensure_guard_directory(access, common / "hooks")
+    ensure_guard_directory(access, common / "info")
+    ensure_guard_directory(access, common / "modules")
+    ensure_guard_directory(access, common / "objects")
+    ensure_guard_directory(access, common / "objects" / "info")
+    ensure_guard_directory(access, common / "worktrees")
+    for path in (
+            common / "config.worktree",
+            common / "objects" / "info" / "alternates",
+            common / "objects" / "info" / "http-alternates",
+            *worktree_config_paths):
+        ensure_guard_file(access, path)
+
+
+def reject_local_config_indirection(config_paths, access):
+    """Reject local config paths that can escape the protected Git metadata."""
     env = scrub_git_routing(os.environ)
     env["GIT_OPTIONAL_LOCKS"] = "0"
-    result = subprocess.run(
-        [str(GIT_BIN), "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
-         "config", "--file", str(path), "--name-only", "--get-regexp",
-         r"^include(if\..*)?\.path$"],
-        text=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if result.returncode == 0:
-        raise RuntimeError("local Git config includes are incompatible with protected Git access")
-    if result.returncode != 1:
-        raise RuntimeError(result.stderr.strip() or "could not validate local Git config includes")
-
-
-def effective_hooks_path(root, common, access):
-    """Resolve the effective hooks directory after every local layer is validated."""
-    env = scrub_git_routing(os.environ)
-    env["GIT_OPTIONAL_LOCKS"] = "0"
-    result = subprocess.run(
-        [str(GIT_BIN), "-c", "core.fsmonitor=false", "-C", str(root),
-         "config", "--path", "-z", "--get", "core.hooksPath"],
-        text=True, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if result.returncode == 1:
-        return common / "hooks"
-    elif result.returncode == 0:
-        if not result.stdout.endswith("\0") or "\0" in result.stdout[:-1]:
-            raise RuntimeError("core.hooksPath did not have one NUL-terminated value")
-        raw = result.stdout[:-1]
-        if not raw:
-            raise RuntimeError("core.hooksPath is empty")
-        candidate = Path(raw).expanduser()
-        hooks = candidate if candidate.is_absolute() else root / candidate
-        # Normalize `.` and `..` without resolving symlinks. The trusted-path
-        # walk below rejects every symlink component, so the configured name
-        # cannot later be replaced to redirect host-side hook execution.
-        hooks = Path(os.path.abspath(hooks))
-    else:
-        raise RuntimeError(result.stderr.strip() or "could not resolve core.hooksPath")
-    access.secure_fs.validate_trusted_path(hooks)
-    open_safe_directory(access, hooks)
-    return hooks
+    for index, path in enumerate(dict.fromkeys(map(Path, config_paths))):
+        source = access.secure_read(path, missing_ok=index != 0)
+        if not source["exists"]:
+            continue
+        result = bounded_process(
+            [str(GIT_BIN), "-c", "core.fsmonitor=false",
+             "-c", "core.hooksPath=/dev/null", "config", "--file", str(path),
+             "--name-only", "--get-regexp",
+             r"^(include(if\..*)?\.path|core\.(hookspath|fsmonitor))$"],
+            env, f"local Git config validation: {path}")
+        if result["returncode"] == 0:
+            names = {name.casefold() for name in result["stdout"].splitlines()}
+            if "core.hookspath" in names:
+                raise RuntimeError(
+                    f"local core.hooksPath is incompatible with protected Git access: {path}")
+            if "core.fsmonitor" in names:
+                raise RuntimeError(
+                    f"local core.fsmonitor is incompatible with protected Git access: {path}")
+            raise RuntimeError(
+                f"local Git config includes are incompatible with protected Git access: {path}")
+        if result["returncode"] != 1:
+            raise RuntimeError(
+                result["stderr"].strip()
+                or f"could not validate local Git config indirection: {path}")
 
 
 def validate_active_hooks(hooks, access):
@@ -378,7 +452,7 @@ def validate_active_hooks(hooks, access):
         if isinstance(exc.__cause__, FileNotFoundError):
             return
         raise
-    flags = os.O_RDONLY | os.O_CLOEXEC
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -515,25 +589,25 @@ def linked_worktree(cwd, access):
     return {"root": root, "gitDir": git_dir, "common": common, "name": git_dir.name}
 
 
-def discover_ordinary_checkouts(root):
+def discover_ordinary_checkouts(root, protected_markers=None):
     """Find bounded descendant checkouts below a non-Git umbrella.
 
     Only ordinary `.git` directories are candidates. Linked worktrees and
     submodules use pointer files and need their own exact external-directory
     validation; their ordinary parent checkout is enough for fleet launches.
-    Return both outputs together so callers cannot omit the pointer guards.
     """
-    queue = deque([root])
+    queue = deque([(root, 0)])
     found = []
-    protected_paths = []
     directories_seen = 0
     entries_seen = 0
     while queue:
-        directory = queue.popleft()
+        directory, depth = queue.popleft()
         directories_seen += 1
         if directories_seen > FLEET_SCAN_MAX_DIRECTORIES:
-            raise RuntimeError(
-                f"child scan exceeded {FLEET_SCAN_MAX_DIRECTORIES} directories below {root}")
+            print(
+                f"codex-worktree: child scan stopped after "
+                f"{FLEET_SCAN_MAX_DIRECTORIES} directories below {root}", file=sys.stderr)
+            return found
         marker = directory / ".git"
         try:
             marker_info = marker.lstat()
@@ -553,15 +627,16 @@ def discover_ordinary_checkouts(root):
                 except RuntimeError:
                     reported = None
                 if reported == directory:
-                    protected_paths.append(marker)
+                    if protected_markers is not None:
+                        protected_markers.append(marker)
                     found.append(directory)
-                    if len(found) > FLEET_SCAN_MAX_REPOSITORIES:
-                        raise RuntimeError(
-                            f"child scan exceeded {FLEET_SCAN_MAX_REPOSITORIES} "
-                            f"repositories below {root}")
-                    # Keep scanning the checkout: opening this root makes its
-                    # source writable, so nested submodule/worktree pointer
-                    # files must be added to the exact read-only rules.
+                    if len(found) >= FLEET_SCAN_MAX_REPOSITORIES:
+                        print(
+                            f"codex-worktree: child scan stopped after "
+                            f"{FLEET_SCAN_MAX_REPOSITORIES} repositories below {root}",
+                            file=sys.stderr)
+                        return found
+                    continue
             elif stat.S_ISREG(marker_info.st_mode):
                 # A valid pointer-file checkout is a submodule or linked
                 # worktree, not an ordinary child root for this fleet path.
@@ -572,31 +647,88 @@ def discover_ordinary_checkouts(root):
                 except RuntimeError:
                     reported = None
                 if reported == directory:
-                    protected_paths.append(marker)
-                    # Keep scanning pointer-file checkouts too. A submodule or
-                    # linked worktree can itself contain nested pointer files,
-                    # all of which sit below writable source roots.
+                    if protected_markers is not None:
+                        protected_markers.append(marker)
+                    continue
+        if depth >= FLEET_SCAN_MAX_DEPTH:
+            continue
         children = []
         try:
             with os.scandir(directory) as entries:
                 for entry in entries:
-                    if not entry.is_dir(follow_symlinks=False):
-                        continue
-                    if directory.name == ".workspaces" and entry.name != "worktrees":
-                        continue
                     entries_seen += 1
                     if entries_seen > FLEET_SCAN_MAX_ENTRIES:
-                        raise RuntimeError(
-                            f"child scan exceeded {FLEET_SCAN_MAX_ENTRIES} "
-                            f"directory entries below {root}")
-                    if entry.name in FLEET_PRUNE:
+                        print(
+                            f"codex-worktree: child scan stopped after "
+                            f"{FLEET_SCAN_MAX_ENTRIES} entries below {root}", file=sys.stderr)
+                        return found
+                    if (entry.name in FLEET_PRUNE or entry.name.startswith(".")
+                            or not entry.is_dir(follow_symlinks=False)):
                         continue
                     children.append(Path(entry.path))
         except OSError as exc:
-            raise RuntimeError(f"child scan cannot inspect {directory}: {exc}") from exc
+            print(f"codex-worktree: child scan skipped {directory}: {exc}", file=sys.stderr)
+            continue
         for child in sorted(children):
-            queue.append(child)
-    return {"roots": found, "protectedPaths": protected_paths}
+            queue.append((child, depth + 1))
+    return found
+
+
+def discover_submodule_markers(root, access):
+    """Find initialized gitlink markers and validate their resolved Git dirs."""
+    queue = deque([(root, 0)])
+    markers = []
+    seen = set()
+    while queue:
+        checkout, depth = queue.popleft()
+        if checkout in seen:
+            continue
+        seen.add(checkout)
+        output = git_output(checkout, "ls-files", "--stage", "-z")
+        for record in output.split("\0"):
+            if not record or "\t" not in record:
+                continue
+            header, raw_path = record.split("\t", 1)
+            if header.split(" ", 1)[0] != "160000":
+                continue
+            candidate = checkout / raw_path
+            try:
+                submodule = candidate.resolve(strict=True)
+            except OSError:
+                continue
+            if not inside(submodule, root):
+                raise RuntimeError(f"submodule path escapes its checkout: {candidate}")
+            marker = submodule / ".git"
+            try:
+                info = marker.lstat()
+            except FileNotFoundError:
+                continue
+            if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+                raise RuntimeError(f"submodule marker has an unsafe type: {marker}")
+            access.secure_fs.validate_trusted_path(marker)
+            markers.append(marker)
+            if stat.S_ISREG(info.st_mode):
+                pointer = access.secure_read(marker)
+                match = re.fullmatch(r"gitdir: ([^\r\n]+)\r?\n?", pointer["text"])
+                if not match:
+                    raise RuntimeError(f"submodule marker is not a valid Git pointer: {marker}")
+                git_dir = resolve_pointer(submodule, match.group(1))
+                access.secure_fs.validate_trusted_path(git_dir)
+                open_safe_directory(access, git_dir)
+                reported = Path(git_output(
+                    submodule, "rev-parse", "--absolute-git-dir")).resolve(strict=True)
+                if reported != git_dir:
+                    raise RuntimeError(
+                        f"submodule pointer does not match Git's resolved directory: {marker}")
+                markers.append(git_dir)
+            else:
+                access.secure_fs.validate_trusted_path(marker)
+                open_safe_directory(access, marker)
+            if len(markers) > FLEET_SCAN_MAX_REPOSITORIES:
+                raise RuntimeError("submodule protected-path count exceeded the safety limit")
+            if depth < FLEET_SCAN_MAX_DEPTH:
+                queue.append((submodule, depth + 1))
+    return markers
 
 
 def ordinary_checkout(root, access):
@@ -619,9 +751,14 @@ def ordinary_checkout(root, access):
     return {"root": root}
 
 
-def shared_worktrees_allow_git(root, expected_common, global_online, access):
-    """Honor linked-worktree policy before opening their shared Git directory."""
+def shared_worktrees_allow_git(
+        root, expected_common, global_online, access, protected_configs,
+        protected_git_paths, source_root, global_policy):
+    """Honor sibling policy and return every linked worktree config to guard."""
     output = git_output(root, "worktree", "list", "--porcelain", "-z")
+    worktree_configs = []
+    worktree_roots = []
+    allowed = True
     for field in output.split("\0"):
         if not field.startswith("worktree "):
             continue
@@ -629,35 +766,55 @@ def shared_worktrees_allow_git(root, expected_common, global_online, access):
         try:
             worktree_root = Path(raw_path).resolve(strict=True)
         except OSError as exc:
-            print(
-                f"codex-worktree: shared Git augmentation disabled for {root}: "
-                f"cannot validate worktree {raw_path}: {exc}", file=sys.stderr)
-            return None
+            raise RuntimeError(
+                f"cannot validate shared worktree {raw_path}: {exc}") from exc
         if worktree_root == root:
             continue
+        worktree_roots.append(worktree_root)
+        try:
+            marker_info = (worktree_root / ".git").lstat()
+        except OSError:
+            marker_info = None
+        if (marker_info is not None and stat.S_ISREG(marker_info.st_mode)
+                and inside(worktree_root, source_root)):
+            # Collect every source-side pointer before policy validation. A
+            # later sibling failure must not leave unvisited in-tree pointers
+            # writable under the fallback profile.
+            protected_git_paths.append(worktree_root / ".git")
+
+    for worktree_root in worktree_roots:
         try:
             context = linked_worktree(worktree_root, access)
-            if context is None or context["common"] != expected_common:
+            if context is None:
+                context = ordinary_checkout(worktree_root, access)
+                context["common"] = (worktree_root / ".git").resolve(strict=True)
+            else:
+                worktree_configs.append(context["gitDir"] / "config.worktree")
+            if context["common"] != expected_common:
                 raise RuntimeError("worktree does not resolve to the expected common Git directory")
-            active = active_permission(context, worktree_root, access)
+            sibling_configs = []
+            active = active_permission(
+                context, worktree_root, access, protected_configs=sibling_configs,
+                global_policy=global_policy)
+            protected_configs.extend(
+                path for path in sibling_configs if inside(path, source_root))
         except (RuntimeError, access.Refusal, OSError) as exc:
-            print(
-                f"codex-worktree: shared Git augmentation disabled for {root}: "
-                f"cannot validate policy for {worktree_root}: {exc}", file=sys.stderr)
-            return None
+            raise RuntimeError(
+                f"cannot validate shared worktree policy for {worktree_root}: {exc}") from exc
         child_online = active in {"git-workspace", "no-git"}
         if global_online and not child_online:
             print(
                 f"codex-worktree: shared Git augmentation disabled for {root}: offline "
                 f"policy at {worktree_root} requires a direct project launch; umbrella "
                 "network access is session-wide", file=sys.stderr)
-            return None
+            allowed = False
+            continue
         if active not in {"git-workspace", "git-workspace-offline"}:
             print(
                 f"codex-worktree: shared Git augmentation disabled for {root}: "
                 f"linked worktree opts out at {worktree_root}", file=sys.stderr)
-            return None
-    return True
+            allowed = False
+    return worktree_configs if allowed else None
 
 
 def exact_profile_args(name, description, parent, rules):
@@ -693,7 +850,7 @@ def exact_profile_args(name, description, parent, rules):
     final_name = f"{name}-{len(chunks) - 1}"
     arguments.extend(("-c", f"default_permissions={toml_string(final_name)}"))
     if argument_bytes(arguments) > EXACT_PROFILE_TOTAL_MAX_BYTES:
-        raise RuntimeError("aggregate runtime profile argument budget was exceeded")
+        raise RuntimeError("runtime profile arguments exceeded the total safety budget")
     return arguments
 
 
@@ -724,37 +881,55 @@ def exact_profile_argument(name, description, parent, rules):
 
 
 def normal_checkout_runtime(root, cwd, access):
-    """Protect existing sibling worktree pointers in an ordinary checkout."""
+    """Protect sibling-worktree config and initialized submodule pointers."""
     context = ordinary_checkout(root, access)
-    active = active_permission(context, cwd, access)
-    git_enabled = active in {"git-workspace", "git-workspace-offline"}
-    protected = prepare_git_guards(
-        root, (root / ".git").resolve(strict=True), [], access,
-        materialize=git_enabled)
-    if not git_enabled:
-        return profile_with_exact_reads(active, protected)
-    shared_allowed = shared_worktrees_allow_git(
+    protected_configs = []
+    protected_git_paths = []
+    global_policy = load_global_permission(access)
+    active = active_permission(
+        context, cwd, access, protected_configs=protected_configs,
+        global_policy=global_policy)
+    worktree_configs = shared_worktrees_allow_git(
         root, (root / ".git").resolve(strict=True),
-        active in {"git-workspace", "no-git"}, access)
-    if not shared_allowed:
+        active in {"git-workspace", "no-git"}, access, protected_configs,
+        protected_git_paths, root, global_policy)
+    markers = discover_submodule_markers(root, access)
+    protected_paths = [*markers, *protected_configs, *protected_git_paths]
+    if active not in {"git-workspace", "git-workspace-offline"}:
+        return exact_read_profile(active, protected_paths)
+    if worktree_configs is None:
         fallback = "no-git" if active == "git-workspace" else "no-git-offline"
-        return profile_with_exact_reads(fallback, protected)
-    return profile_with_exact_reads(active, protected)
+        return exact_read_profile(fallback, protected_paths)
+    extra = exact_read_profile(active, protected_paths)
+    prepare_git_guards(
+        (root / ".git").resolve(strict=True), worktree_configs, access)
+    return extra
 
 
-def fleet_runtime_profile(roots, protected_paths, active):
+def exact_read_profile(parent, paths):
+    """Overlay exact read-only rules for project policy and nested Git paths."""
+    if not paths:
+        return ["-c", f"default_permissions={toml_string(parent)}"]
+    return exact_profile_args(
+        GUARDED_RUNTIME_PROFILE,
+        "Project policy and nested Git control paths are read-only.", parent,
+        [(path, "read") for path in paths])
+
+
+def fleet_runtime_profile(roots, protected_markers, protected_configs, active):
     if active not in git_access.MANAGED_CHOICES:
         return []
     online = active in {"git-workspace", "no-git"}
     parent = "no-git" if online else "no-git-offline"
     enabled_markers = {root / ".git" for root in roots}
-    read_only_paths = set(protected_paths) - enabled_markers
-    if not roots and not read_only_paths:
+    read_only_markers = set(protected_markers) - enabled_markers
+    if not roots and not read_only_markers and not protected_configs:
         # A non-Git umbrella is itself a workspace root. Do not apply the
         # relative Git profile there when no eligible child needs exact access.
         fallback = active if active in {"no-git", "no-git-offline"} else parent
         return ["-c", f"default_permissions={toml_string(fallback)}"]
-    rules = [(path, "read") for path in read_only_paths]
+    rules = [(marker, "read") for marker in read_only_markers]
+    rules.extend((path, "read") for path in protected_configs)
     for root in roots:
         git_dir = root / ".git"
         rules.extend((
@@ -778,56 +953,60 @@ def pinned_profile(active):
     return []
 
 
-def profile_with_exact_reads(parent, paths):
-    if not paths:
-        return pinned_profile(parent)
-    return exact_profile_args(
-        FLEET_RUNTIME_PROFILE,
-        "Effective Git persistence paths are read-only.", parent,
-        [(path, "read") for path in paths])
-
-
 def fleet_workspace_args(cwd, access):
     """Make eligible child repos effective roots for a non-Git umbrella."""
     arguments = []
-    umbrella_active = active_permission({"root": cwd}, cwd, access)
+    access.secure_fs.validate_trusted_path(cwd)
+    open_safe_directory(access, cwd)
+    protected_configs = []
+    global_policy = load_global_permission(access)
+    umbrella_active = active_permission(
+        {"root": cwd}, cwd, access, protected_configs=protected_configs,
+        global_policy=global_policy)
     umbrella_online = umbrella_active in {"git-workspace", "no-git"}
-    discovery = discover_ordinary_checkouts(cwd)
     roots = []
-    protected_paths = discovery["protectedPaths"]
-    for root in discovery["roots"]:
+    guard_contexts = []
+    protected_markers = []
+    for root in discover_ordinary_checkouts(cwd, protected_markers):
         try:
-            context = ordinary_checkout(root, access)
-            active = active_permission(context, root, access, base_active=umbrella_active)
-            child_online = active in {"git-workspace", "no-git"}
-            git_enabled = active in {"git-workspace", "git-workspace-offline"}
-            materialize = git_enabled and not (umbrella_online and not child_online)
-            protected_paths.extend(prepare_git_guards(
-                root, (root / ".git").resolve(strict=True), [], access,
-                materialize=materialize))
-            if umbrella_online and not child_online:
-                print(
-                    f"codex-worktree: child Git augmentation disabled for {root}: offline "
-                    "policy requires a direct project launch; umbrella network access is "
-                    "session-wide", file=sys.stderr)
-                continue
-            if not git_enabled:
-                print(
-                    f"codex-worktree: child Git augmentation disabled by local policy: {root}",
-                    file=sys.stderr)
-                continue
-            expected_common = (root / ".git").resolve(strict=True)
-            shared_allowed = shared_worktrees_allow_git(
-                root, expected_common, umbrella_online, access)
-            if not shared_allowed:
-                continue
-            roots.append(root)
-        except (RuntimeError, access.Refusal, OSError) as exc:
-            print(f"codex-worktree: child Git augmentation skipped for {root}: {exc}", file=sys.stderr)
-            protected_paths.append(root)
+            protected_markers.extend(discover_submodule_markers(root, access))
+        except (RuntimeError, OSError) as exc:
+            raise RuntimeError(f"cannot protect nested Git markers below {root}: {exc}") from exc
+        context = ordinary_checkout(root, access)
+        active = active_permission(
+            context, root, access, base_active=umbrella_active,
+            protected_configs=protected_configs, global_policy=global_policy)
+        child_online = active in {"git-workspace", "no-git"}
+        expected_common = (root / ".git").resolve(strict=True)
+        worktree_configs = shared_worktrees_allow_git(
+            root, expected_common, umbrella_online, access, protected_configs,
+            protected_markers, cwd, global_policy)
+        if umbrella_online and not child_online:
+            print(
+                f"codex-worktree: child Git augmentation disabled for {root}: offline "
+                "policy requires a direct project launch; umbrella network access is "
+                "session-wide", file=sys.stderr)
+            continue
+        if active not in {"git-workspace", "git-workspace-offline"}:
+            print(
+                f"codex-worktree: child Git augmentation disabled by local policy: {root}",
+                file=sys.stderr)
+            continue
+        if worktree_configs is None:
+            continue
+        roots.append(root)
+        guard_contexts.append((expected_common, worktree_configs))
+    profile = fleet_runtime_profile(
+        roots, protected_markers, protected_configs, umbrella_active)
+    # Build and budget the full runtime profile before materializing guard
+    # paths. A too-large fleet must fail closed without mutating repositories.
+    for common, worktree_configs in guard_contexts:
+        validate_git_guards(common, worktree_configs, access)
+    for common, worktree_configs in guard_contexts:
+        materialize_git_guards(common, worktree_configs, access)
     for root in roots:
         arguments.extend(("--add-dir", str(root)))
-    arguments.extend(fleet_runtime_profile(roots, protected_paths, umbrella_active))
+    arguments.extend(profile)
     return arguments
 
 
@@ -843,16 +1022,27 @@ def config_layers(root, cwd):
         yield cursor / ".codex" / "config.toml"
 
 
-def active_permission(context, cwd, access, base_active=None):
+def load_global_permission(access):
     source = access.secure_read(access.codex_home() / "config.toml")
     parsed = access.parse_toml(source["text"], source["path"])
-    global_active = access.validate_managed_profiles(parsed, source["path"])
-    active = global_active if base_active is None else base_active
+    active = access.validate_managed_profiles(parsed, source["path"])
     reject_reserved_runtime_profiles(parsed, source["path"])
+    return active
+
+
+def active_permission(
+        context, cwd, access, base_active=None, protected_configs=None,
+        global_policy=None):
+    global_active = (
+        global_policy if global_policy is not None else load_global_permission(access))
+    active = global_active if base_active is None else base_active
     for path in config_layers(context["root"], cwd):
         local_source = access.secure_read(path, missing_ok=True)
         if not local_source["exists"]:
             continue
+        access.secure_fs.validate_trusted_path(path)
+        if protected_configs is not None:
+            protected_configs.append(path)
         local = access.parse_toml(local_source["text"], path)
         access.reject_project_managed_profiles(local, path)
         reject_reserved_runtime_profiles(local, path)
@@ -885,7 +1075,7 @@ def toml_string(value):
     return json.dumps(str(value), ensure_ascii=False)
 
 
-def runtime_profile(context, active):
+def runtime_profile(context, active, protected_paths=()):
     if active == "git-workspace":
         parent = "no-git"
     elif active == "git-workspace-offline":
@@ -925,16 +1115,37 @@ def runtime_profile(context, active):
         f"extends={toml_string(parent)},"
         f"filesystem={{{toml_string(common)}={{{rule_text}}}}}}}"
     )
-    return [
+    arguments = [
         "--add-dir", common,
         "-c", f"permissions.{RUNTIME_PROFILE}={profile}",
-        "-c", f"default_permissions={toml_string(RUNTIME_PROFILE)}",
     ]
+    if protected_paths:
+        arguments.extend(exact_profile_args(
+            GUARDED_RUNTIME_PROFILE,
+            "Project policy and nested Git control paths are read-only.", RUNTIME_PROFILE,
+            [(path, "read") for path in protected_paths]))
+    else:
+        arguments.extend((
+            "-c", f"default_permissions={toml_string(RUNTIME_PROFILE)}"))
+    return arguments
 
 
 def main():
     args = sys.argv[1:]
     invocation = invocation_options(args)
+    try:
+        home = account_home()
+        if home is None:
+            raise RuntimeError("could not resolve the account home directory")
+        # Git and the final Codex process must not inherit a project-selected
+        # home. CODEX_HOME may be explicit, but only outside project input and
+        # below a fully trusted ancestry.
+        os.environ["HOME"] = str(home)
+        os.environ["CODEX_HOME"] = str(
+            validated_codex_home(invocation["cwd"], git_access, home))
+    except (RuntimeError, git_access.Refusal, OSError) as exc:
+        print(f"codex-worktree: unsafe configuration environment: {exc}", file=sys.stderr)
+        raise SystemExit(2)
     try:
         real = find_real_codex(invocation["cwd"])
     except RuntimeError as exc:
@@ -945,33 +1156,54 @@ def main():
         access = git_access
         try:
             cwd = invocation["cwd"]
-            context = linked_worktree(cwd, access)
-            if context is not None:
-                active = active_permission(context, cwd, access)
-                git_enabled = active in {"git-workspace", "git-workspace-offline"}
-                protected = prepare_git_guards(
-                    context["root"], context["common"],
-                    [context["gitDir"] / "config.worktree"], access,
-                    materialize=git_enabled)
-                extra = runtime_profile(context, active) or pinned_profile(active)
-                if protected:
-                    parent = RUNTIME_PROFILE if git_enabled else active
-                    extra.extend(exact_profile_args(
-                        FLEET_RUNTIME_PROFILE,
-                        "Effective Git persistence paths are read-only.", parent,
-                        [(path, "read") for path in protected]))
+            if account_home_is_read_only(cwd):
+                # The trusted Codex/Node install and shell startup files live
+                # below the account home. Never make that whole directory a
+                # writable workspace merely because Codex started there.
+                extra = ["-c", 'default_permissions=":read-only"']
             else:
-                boundary = project_boundary(cwd)
-                if boundary is not None:
-                    extra = normal_checkout_runtime(boundary, cwd, access)
+                context = linked_worktree(cwd, access)
+                if context is not None:
+                    protected_configs = []
+                    protected_git_paths = []
+                    global_policy = load_global_permission(access)
+                    active = active_permission(
+                        context, cwd, access, protected_configs=protected_configs,
+                        global_policy=global_policy)
+                    worktree_configs = shared_worktrees_allow_git(
+                        context["root"], context["common"],
+                        active in {"git-workspace", "no-git"}, access,
+                        protected_configs, protected_git_paths, context["root"],
+                        global_policy)
+                    markers = discover_submodule_markers(context["root"], access)
+                    protected_paths = [
+                        *markers, *protected_configs, *protected_git_paths]
+                    if active in {"git-workspace", "git-workspace-offline"}:
+                        if worktree_configs is None:
+                            fallback = (
+                                "no-git" if active == "git-workspace"
+                                else "no-git-offline")
+                            extra = exact_read_profile(fallback, protected_paths)
+                        else:
+                            extra = runtime_profile(context, active, protected_paths)
+                            prepare_git_guards(
+                                context["common"],
+                                [context["gitDir"] / "config.worktree",
+                                 *worktree_configs], access)
+                    else:
+                        extra = exact_read_profile(active, protected_paths)
                 else:
-                    extra = fleet_workspace_args(cwd, access)
+                    boundary = project_boundary(cwd)
+                    if boundary is not None:
+                        extra = normal_checkout_runtime(boundary, cwd, access)
+                    else:
+                        extra = fleet_workspace_args(cwd, access)
         except (RuntimeError, access.Refusal, OSError) as exc:
-            # A non-Git umbrella is itself one recursively writable workspace.
-            # If discovery or policy validation is incomplete, a relative
-            # `.git` guard cannot protect unknown descendants. Make the whole
-            # session read-only instead of granting partial fleet coverage.
-            extra = ["--sandbox", "read-only"]
+            # A validation failure can involve project policy or a nested Git
+            # control path, not only the top-level `.git`. Freeze the whole
+            # workspace rather than letting the failed source rewrite the
+            # boundary that will be trusted on the next launch.
+            extra = ["-c", 'default_permissions=":read-only"']
             print(f"codex-worktree: Git augmentation failed closed: {exc}", file=sys.stderr)
     environment = scrub_git_routing(os.environ)
     for key in ("NODE_OPTIONS", "NODE_PATH"):

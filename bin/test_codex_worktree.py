@@ -6,6 +6,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import pwd
 import stat
 import subprocess
 import tempfile
@@ -71,7 +72,7 @@ class CodexWorktreeTest(unittest.TestCase):
         fake = package / "codex.js"
         fake.write_text(textwrap.dedent('''\
             #!/usr/bin/env node
-            exec /usr/bin/python3 -E -c 'import json, os, sys; routed={"GIT_DIR","GIT_WORK_TREE","GIT_COMMON_DIR","GIT_CEILING_DIRECTORIES","GIT_CONFIG_COUNT","GIT_CONFIG_PARAMETERS","GIT_GRAFT_FILE","GIT_INTERNAL_SUPER_PREFIX","GIT_NAMESPACE","GIT_PREFIX","GIT_REPLACE_REF_BASE","GIT_SHALLOW_FILE"}; bad=sorted(k for k in os.environ if k in routed or k.startswith(("GIT_CONFIG_KEY_","GIT_CONFIG_VALUE_","GIT_TRACE"))); print(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd(), "gitEnv": bad})); raise SystemExit(int(os.environ.get("FAKE_CODEX_EXIT", "0")))' "$@"
+            exec /usr/bin/python3 -E -c 'import json, os, sys; routed={"GIT_DIR","GIT_WORK_TREE","GIT_COMMON_DIR","GIT_CEILING_DIRECTORIES","GIT_CONFIG_COUNT","GIT_CONFIG_PARAMETERS","GIT_GRAFT_FILE","GIT_INTERNAL_SUPER_PREFIX","GIT_NAMESPACE","GIT_PREFIX","GIT_REPLACE_REF_BASE","GIT_SHALLOW_FILE"}; bad=sorted(k for k in os.environ if k in routed or k.startswith(("GIT_CONFIG_KEY_","GIT_CONFIG_VALUE_","GIT_TRACE"))); print(json.dumps({"argv": sys.argv[1:], "cwd": os.getcwd(), "gitEnv": bad, "home": os.environ.get("HOME"), "codexHome": os.environ.get("CODEX_HOME")})); raise SystemExit(int(os.environ.get("FAKE_CODEX_EXIT", "0")))' "$@"
             '''))
         fake.chmod(0o755)
         (self.real_bin / "codex").symlink_to(fake)
@@ -142,34 +143,24 @@ class CodexWorktreeTest(unittest.TestCase):
             args, ["-c", 'default_permissions="git-workspace"', "--version"])
         self.assertTrue((self.main / ".git" / "worktrees").is_dir())
 
+    def test_normal_launch_protects_an_in_tree_linked_worktree_pointer(self):
+        nested = self.main / ".workspaces" / "nested"
+        nested.parent.mkdir()
+        self.git("worktree", "add", "-q", "-b", "nested-test", nested)
+        result = self.run_wrapper("--version", cwd=self.main)
+        args = self.argv(result)
+        self.assertTrue(any(
+            f'{json.dumps(str(nested / ".git"))}="read"' in argument
+            for argument in args), (args, result.stderr))
+
     def test_normal_checkout_augmentation_error_fails_closed(self):
         config = self.codex_home / "config.toml"
         config.write_text(config.read_text() + '\n[permissions.codex-git-fleet-runtime-0]\n'
                           'description = "collision"\n')
         result = self.run_wrapper("--version", cwd=self.main)
         self.assertEqual(
-            self.argv(result), ["--sandbox", "read-only", "--version"])
+            self.argv(result), ["-c", 'default_permissions=":read-only"', "--version"])
         self.assertIn("Git augmentation failed closed", result.stderr)
-
-    def test_fleet_scan_error_makes_the_whole_session_read_only(self):
-        projects = self.base / "projects"
-        projects.mkdir()
-        wrapper = load_wrapper()
-        executable = {"program": Path("/bin/true"), "argv": ["/bin/true"]}
-        with (mock.patch.object(wrapper, "find_real_codex", return_value=executable),
-              mock.patch.object(
-                  wrapper, "invocation_options",
-                  return_value={"cwd": projects, "policyOverride": False}),
-              mock.patch.object(wrapper, "linked_worktree", return_value=None),
-              mock.patch.object(wrapper, "project_boundary", return_value=None),
-              mock.patch.object(
-                  wrapper, "fleet_workspace_args",
-                  side_effect=RuntimeError("scan budget exceeded")),
-              mock.patch.object(wrapper.os, "execve") as execve,
-              mock.patch.object(wrapper.sys, "argv", [str(WRAPPER), "--version"])):
-            wrapper.main()
-        argv = execve.call_args.args[1]
-        self.assertEqual(argv[1:4], ["--sandbox", "read-only", "--version"])
 
     def test_exec_budget_error_makes_the_whole_session_read_only(self):
         projects = self.base / "projects"
@@ -182,12 +173,15 @@ class CodexWorktreeTest(unittest.TestCase):
                   return_value={"cwd": projects, "policyOverride": False}),
               mock.patch.object(wrapper, "linked_worktree", return_value=None),
               mock.patch.object(wrapper, "project_boundary", return_value=None),
-              mock.patch.object(wrapper, "fleet_workspace_args", return_value=["-c", "large"]),
+              mock.patch.object(
+                  wrapper, "fleet_workspace_args", return_value=["-c", "large"]),
               mock.patch.object(
                   wrapper, "ensure_exec_budget",
-                  side_effect=RuntimeError("aggregate exec argument budget was exceeded")),
+                  side_effect=RuntimeError(
+                      "aggregate exec argument budget was exceeded")),
               mock.patch.object(wrapper.os, "execve") as execve,
-              mock.patch.object(wrapper.sys, "argv", [str(WRAPPER), "--version"])):
+              mock.patch.object(
+                  wrapper.sys, "argv", [str(WRAPPER), "--version"])):
             wrapper.main()
         argv = execve.call_args.args[1]
         self.assertEqual(argv[1:4], ["--sandbox", "read-only", "--version"])
@@ -204,6 +198,28 @@ class CodexWorktreeTest(unittest.TestCase):
                   "HOME": str(self.home), "CODEX_HOME": str(self.codex_home), "PATH": path})):
             command = wrapper.find_real_codex(self.home)
         self.assertEqual(command["program"], Path("/bin/sh").resolve())
+
+    def test_account_home_launch_is_forced_read_only(self):
+        wrapper = load_wrapper()
+        with (mock.patch.object(wrapper, "account_home", return_value=self.home),
+              mock.patch.object(
+                  wrapper, "find_real_codex",
+                  return_value={"program": "/bin/true", "argv": ["/bin/true"]}),
+              mock.patch.object(wrapper.sys, "argv", [str(WRAPPER), "--version"]),
+              mock.patch.dict(os.environ, {
+                  "HOME": str(self.home), "CODEX_HOME": str(self.codex_home)}),
+              mock.patch.object(wrapper.os, "execve", side_effect=RuntimeError("exec"))
+              as execute):
+            self.assertTrue(wrapper.account_home_is_read_only(self.home))
+            self.assertFalse(wrapper.account_home_is_read_only(self.home / "projects"))
+            with (mock.patch.object(
+                      wrapper, "invocation_options",
+                      return_value={"cwd": self.home, "policyOverride": False}),
+                  self.assertRaisesRegex(RuntimeError, "exec")):
+                wrapper.main()
+        self.assertEqual(
+            execute.call_args.args[1],
+            ["/bin/true", "-c", 'default_permissions=":read-only"', "--version"])
 
     def test_home_launch_rejects_a_project_path_codex(self):
         project_bin = self.home / "projects" / "hostile" / "bin"
@@ -274,39 +290,6 @@ class CodexWorktreeTest(unittest.TestCase):
             self.assertTrue((root / ".git" / "objects" / "info" / "alternates").is_file())
             self.git("status", "--porcelain", cwd=root)
 
-    def test_fleet_scan_protects_nested_pointer_checkouts(self):
-        projects = self.base / "projects"
-        enabled = projects / "enabled"
-        submodule_source = self.base / "submodule-source"
-        nested_source = self.base / "nested-source"
-        projects.mkdir()
-        for repository in (enabled, submodule_source, nested_source):
-            self.git("init", "-q", repository, cwd=self.base)
-            self.git("config", "user.email", "test@example.com", cwd=repository)
-            self.git("config", "user.name", "Test", cwd=repository)
-            (repository / "tracked").write_text("one\n")
-            self.git("add", "tracked", cwd=repository)
-            self.git("commit", "-qm", "initial", cwd=repository)
-        self.git(
-            "-c", "protocol.file.allow=always", "submodule", "add", "-q",
-            nested_source, "nested", cwd=submodule_source)
-        self.git("commit", "-qam", "add nested submodule", cwd=submodule_source)
-        self.git(
-            "-c", "protocol.file.allow=always", "submodule", "add", "-q",
-            submodule_source, "sub", cwd=enabled)
-        self.git(
-            "-c", "protocol.file.allow=always", "submodule", "update",
-            "--init", "--recursive", "-q", cwd=enabled)
-
-        wrapper = load_wrapper()
-        discovery = wrapper.discover_ordinary_checkouts(projects)
-        self.assertEqual(discovery["roots"], [enabled])
-        self.assertTrue({
-            enabled / ".git",
-            enabled / "sub" / ".git",
-            enabled / "sub" / "nested" / ".git",
-        }.issubset(set(discovery["protectedPaths"])))
-
     def test_empty_non_git_parent_uses_no_git_profile(self):
         projects = self.base / "projects"
         projects.mkdir()
@@ -322,22 +305,32 @@ class CodexWorktreeTest(unittest.TestCase):
         roots = [Path("/workspace") / ("project-" + str(index).zfill(3) + "-" + "x" * 80)
                  for index in range(wrapper.FLEET_SCAN_MAX_REPOSITORIES)]
         args = wrapper.fleet_runtime_profile(
-            roots, [root / ".git" for root in roots], "git-workspace")
+            roots, [root / ".git" for root in roots], [], "git-workspace")
         self.assertLessEqual(
             max(len(arg.encode()) for arg in args), wrapper.EXACT_PROFILE_ARG_MAX_BYTES)
         profiles = [arg for arg in args if arg.startswith(
             f"permissions.{wrapper.FLEET_RUNTIME_PROFILE}-")]
         self.assertGreater(len(profiles), 1)
-        self.assertLessEqual(
-            wrapper.argument_bytes(args), wrapper.EXACT_PROFILE_TOTAL_MAX_BYTES)
 
-    def test_fleet_profile_rejects_an_aggregate_argument_overflow(self):
+    def test_fleet_profile_total_budget_fails_before_guard_mutation(self):
+        projects = self.base / "budgeted-projects"
+        child = projects / "child"
+        projects.mkdir()
+        self.git("init", "-q", child, cwd=self.base)
         wrapper = load_wrapper()
-        with (mock.patch.object(wrapper, "EXACT_PROFILE_TOTAL_MAX_BYTES", 64),
-              self.assertRaisesRegex(RuntimeError, "aggregate runtime profile")):
-            wrapper.exact_profile_args(
-                wrapper.FLEET_RUNTIME_PROFILE, "test", "no-git",
-                [(Path("/workspace/project/.git"), "read")])
+        access = load_access()
+        with (mock.patch.object(wrapper, "EXACT_PROFILE_TOTAL_MAX_BYTES", 100),
+              mock.patch.dict(os.environ, {
+                  "HOME": str(self.home), "CODEX_HOME": str(self.codex_home)}),
+              self.assertRaisesRegex(RuntimeError, "total safety budget")):
+            wrapper.fleet_workspace_args(projects, access)
+        self.assertFalse((child / ".git" / "config.worktree").exists())
+
+    def test_git_output_is_streamed_with_a_hard_byte_cap(self):
+        wrapper = load_wrapper()
+        with mock.patch.object(wrapper, "GIT_OUTPUT_MAX_BYTES", 4):
+            with self.assertRaisesRegex(RuntimeError, "output exceeded"):
+                wrapper.git_output(self.main, "rev-parse", "--show-toplevel")
 
     def test_empty_sandbox_git_mountpoint_does_not_hide_child_repositories(self):
         projects = self.base / "projects"
@@ -398,6 +391,55 @@ class CodexWorktreeTest(unittest.TestCase):
         self.assertTrue((enabled / ".git" / "config.worktree").exists())
         self.assertFalse((disabled / ".git" / "config.worktree").exists())
 
+    def test_fleet_unsafe_child_policy_fails_entire_workspace_read_only(self):
+        projects = self.base / "unsafe-policy-projects"
+        child = projects / "child"
+        projects.mkdir()
+        self.git("init", "-q", child, cwd=self.base)
+        external = self.base / "unsafe-child-policy"
+        external.write_text('default_permissions = "no-git"\n')
+        local = child / ".codex" / "config.toml"
+        local.parent.mkdir()
+        local.symlink_to(external)
+        wrapper = load_wrapper()
+        access = load_access()
+        with (mock.patch.dict(os.environ, {
+                  "HOME": str(self.home), "CODEX_HOME": str(self.codex_home)}),
+              self.assertRaises(access.Refusal)):
+            wrapper.fleet_workspace_args(projects, access)
+        self.assertFalse((child / ".git" / "config.worktree").exists())
+
+    def test_account_home_rejects_project_controlled_codex_home(self):
+        hostile = self.home / "projects" / "hostile" / ".codex"
+        hostile.mkdir(parents=True)
+        wrapper = load_wrapper()
+        with (mock.patch.object(wrapper, "account_home", return_value=self.home),
+              mock.patch.object(
+                  wrapper, "invocation_options",
+                  return_value={"cwd": self.home, "policyOverride": False}),
+              mock.patch.object(
+                  wrapper, "find_real_codex",
+                  return_value={"program": "/bin/true", "argv": ["/bin/true"]}),
+              mock.patch.object(wrapper.sys, "argv", [str(WRAPPER), "--version"]),
+              mock.patch.dict(os.environ, {
+                  "HOME": str(self.home), "CODEX_HOME": str(hostile)}),
+              self.assertRaisesRegex(SystemExit, "2")):
+            wrapper.main()
+
+    def test_in_tree_worktree_unsafe_policy_fails_entire_workspace_read_only(self):
+        nested = self.main / ".workspaces" / "unsafe-policy-linked"
+        nested.parent.mkdir()
+        self.git("worktree", "add", "-q", "-b", "unsafe-policy-linked", nested)
+        external = self.base / "unsafe-linked-policy"
+        external.write_text('default_permissions = "no-git"\n')
+        local = nested / ".codex" / "config.toml"
+        local.parent.mkdir()
+        local.symlink_to(external)
+        result = self.run_wrapper("--version", cwd=self.main)
+        self.assertEqual(
+            self.argv(result), ["-c", 'default_permissions=":read-only"', "--version"])
+        self.assertIn("cannot validate shared worktree policy", result.stderr)
+
     def test_non_git_parent_no_git_policy_disables_all_children(self):
         projects = self.base / "projects"
         child = projects / "child"
@@ -443,8 +485,24 @@ class CodexWorktreeTest(unittest.TestCase):
         access = load_access()
         with mock.patch.dict(os.environ, {
                 "HOME": str(self.home), "CODEX_HOME": str(self.codex_home)}):
-            args = wrapper.fleet_workspace_args(projects, access)
-        self.assertNotIn(str(child), args)
+            with self.assertRaises(access.Refusal):
+                wrapper.fleet_workspace_args(projects, access)
+        self.assertFalse((child / ".git" / "config.worktree").exists())
+
+    def test_peer_writable_policy_ancestor_fails_read_only(self):
+        peer = self.main / "peer-policy"
+        nested = peer / "nested"
+        local = nested / ".codex" / "config.toml"
+        local.parent.mkdir(parents=True)
+        local.write_text('default_permissions = "no-git"\n')
+        peer.chmod(0o777)
+        try:
+            result = self.run_wrapper("--version", cwd=nested)
+        finally:
+            peer.chmod(0o700)
+        self.assertEqual(
+            self.argv(result), ["-c", 'default_permissions=":read-only"', "--version"])
+        self.assertIn("writable by another user", result.stderr)
 
     def test_symlinked_ordinary_git_directory_is_never_mutated(self):
         project = self.base / "symlinked-git"
@@ -474,8 +532,7 @@ class CodexWorktreeTest(unittest.TestCase):
                 else:
                     os.link(config, external)
                 with self.assertRaises(access.Refusal):
-                    wrapper.prepare_git_guards(
-                        self.main, self.main / ".git", [], access)
+                    wrapper.prepare_git_guards(self.main / ".git", [], access)
                 self.assertFalse((self.main / ".git" / "config.worktree").exists())
                 if shape == "symlink":
                     config.unlink()
@@ -493,29 +550,95 @@ class CodexWorktreeTest(unittest.TestCase):
         with config.open("a") as target:
             target.write(f"\n[include]\n\tpath = {included}\n")
         with self.assertRaisesRegex(RuntimeError, "config includes"):
-            wrapper.prepare_git_guards(self.main, self.main / ".git", [], access)
+            wrapper.prepare_git_guards(self.main / ".git", [], access)
         self.assertFalse((self.main / ".git" / "config.worktree").exists())
 
-    def test_worktree_config_includes_fail_closed_before_guard_mutation(self):
+    def test_local_hooks_path_fails_closed_before_guard_mutation(self):
         wrapper = load_wrapper()
         access = load_access()
-        included = self.base / "included-worktree-config"
-        included.write_text("[core]\n\thooksPath = hostile\n")
-        admin = Path(self.git(
-            "rev-parse", "--absolute-git-dir", cwd=self.linked).stdout.strip())
-        cases = (
-            (self.main, self.main / ".git" / "config.worktree", []),
-            (self.linked, admin / "config.worktree", [admin / "config.worktree"]),
-        )
-        for root, config, worktree_paths in cases:
-            with self.subTest(config=config):
-                config.write_text(f"[include]\n\tpath = {included}\n")
-                with self.assertRaisesRegex(RuntimeError, "config includes"):
-                    wrapper.prepare_git_guards(
-                        root, self.main / ".git", worktree_paths, access)
-                config.unlink()
+        config = self.main / ".git" / "config"
+        self.git("config", "--file", config, "core.hooksPath", ".git/custom-hooks",
+                 cwd=self.base)
+        with self.assertRaisesRegex(RuntimeError, "core.hooksPath"):
+            wrapper.prepare_git_guards(self.main / ".git", [], access)
         self.assertFalse((self.main / ".git" / "config.worktree").exists())
-        self.assertFalse((admin / "config.worktree").exists())
+
+    def test_local_fsmonitor_fails_closed_before_guard_mutation(self):
+        wrapper = load_wrapper()
+        access = load_access()
+        config = self.main / ".git" / "config"
+        self.git("config", "--file", config, "core.fsmonitor", "./mutable-monitor",
+                 cwd=self.base)
+        with self.assertRaisesRegex(RuntimeError, "core.fsmonitor"):
+            wrapper.prepare_git_guards(self.main / ".git", [], access)
+        self.assertFalse((self.main / ".git" / "config.worktree").exists())
+
+    def test_worktree_hooks_path_fails_closed_before_guard_mutation(self):
+        sibling_config = self.main / ".git" / "worktrees" / "linked" / "config.worktree"
+        self.git(
+            "config", "--file", sibling_config, "core.hooksPath", "custom-hooks",
+            cwd=self.base)
+        result = self.run_wrapper("--version", cwd=self.main)
+        self.assertEqual(
+            self.argv(result), ["-c", 'default_permissions=":read-only"', "--version"])
+        self.assertIn("core.hooksPath", result.stderr)
+        self.assertFalse(
+            (self.main / ".git" / "objects" / "info" / "alternates").exists())
+
+    def test_worktree_fsmonitor_fails_closed_before_guard_mutation(self):
+        sibling_config = self.main / ".git" / "worktrees" / "linked" / "config.worktree"
+        self.git(
+            "config", "--file", sibling_config, "core.fsmonitor", "./mutable-monitor",
+            cwd=self.base)
+        result = self.run_wrapper("--version", cwd=self.main)
+        self.assertEqual(
+            self.argv(result), ["-c", 'default_permissions=":read-only"', "--version"])
+        self.assertIn("core.fsmonitor", result.stderr)
+
+    def test_common_worktree_config_include_fails_closed_before_guard_mutation(self):
+        wrapper = load_wrapper()
+        access = load_access()
+        included = self.base / "common-worktree-include"
+        included.write_text("[core]\n\thooksPath = hostile\n")
+        config = self.main / ".git" / "config.worktree"
+        config.write_text(f"[include]\n\tpath = {included}\n")
+        with self.assertRaisesRegex(RuntimeError, "config includes"):
+            wrapper.prepare_git_guards(self.main / ".git", [], access)
+        self.assertFalse(
+            (self.main / ".git" / "objects" / "info" / "alternates").exists())
+
+    def test_sibling_worktree_config_include_fails_closed_before_guard_mutation(self):
+        included = self.base / "sibling-worktree-include"
+        included.write_text("[core]\n\thooksPath = hostile\n")
+        sibling_config = self.main / ".git" / "worktrees" / "linked" / "config.worktree"
+        sibling_config.write_text(f"[includeIf \"gitdir:**\"]\n\tpath = {included}\n")
+        result = self.run_wrapper("--version", cwd=self.main)
+        self.assertEqual(
+            self.argv(result), ["-c", 'default_permissions=":read-only"', "--version"])
+        self.assertIn("config includes", result.stderr)
+        self.assertFalse(
+            (self.main / ".git" / "objects" / "info" / "alternates").exists())
+
+    def test_fleet_validates_every_config_before_mutating_any_repository(self):
+        projects = self.base / "config-validation-projects"
+        clean = projects / "a-clean"
+        hostile = projects / "z-hostile"
+        projects.mkdir()
+        self.git("init", "-q", clean, cwd=self.base)
+        self.git("init", "-q", hostile, cwd=self.base)
+        included = self.base / "fleet-included-config"
+        included.write_text("[core]\n\thooksPath = hostile\n")
+        with (hostile / ".git" / "config").open("a") as target:
+            target.write(f"\n[include]\n\tpath = {included}\n")
+        wrapper = load_wrapper()
+        access = load_access()
+        with (mock.patch.dict(os.environ, {
+                  "HOME": str(self.home), "CODEX_HOME": str(self.codex_home)}),
+              self.assertRaisesRegex(RuntimeError, "config includes")):
+            wrapper.fleet_workspace_args(projects, access)
+        self.assertFalse((clean / ".git" / "config.worktree").exists())
+        self.assertFalse(
+            (clean / ".git" / "objects" / "info" / "alternates").exists())
 
     def test_symlinked_active_hook_fails_closed_before_guard_mutation(self):
         wrapper = load_wrapper()
@@ -525,29 +648,8 @@ class CodexWorktreeTest(unittest.TestCase):
         hook = self.main / ".git" / "hooks" / "pre-commit"
         hook.symlink_to(external)
         with self.assertRaisesRegex(RuntimeError, "cannot be opened safely"):
-            wrapper.prepare_git_guards(self.main, self.main / ".git", [], access)
+            wrapper.prepare_git_guards(self.main / ".git", [], access)
         self.assertFalse((self.main / ".git" / "config.worktree").exists())
-
-    def test_hooks_path_preserves_trailing_whitespace(self):
-        wrapper = load_wrapper()
-        access = load_access()
-        hooks = self.main / ".githooks "
-        hooks.mkdir()
-        self.git("config", "core.hooksPath", ".githooks ")
-        protected = wrapper.prepare_git_guards(
-            self.main, self.main / ".git", [], access, materialize=False)
-        self.assertEqual(protected, [hooks])
-
-    def test_symlinked_hooks_path_fails_closed(self):
-        wrapper = load_wrapper()
-        access = load_access()
-        target = self.main / ".hooks-safe"
-        target.mkdir()
-        (self.main / ".hook-link").symlink_to(target, target_is_directory=True)
-        self.git("config", "core.hooksPath", ".hook-link")
-        with self.assertRaisesRegex(access.Refusal, "cannot open safely"):
-            wrapper.prepare_git_guards(
-                self.main, self.main / ".git", [], access, materialize=False)
 
     def test_peer_writable_ancestor_fails_closed_for_linked_worktree(self):
         peer = self.base / "peer"
@@ -565,7 +667,7 @@ class CodexWorktreeTest(unittest.TestCase):
 
         result = self.run_wrapper("--version", cwd=linked)
         self.assertEqual(
-            self.argv(result), ["--sandbox", "read-only", "--version"])
+            self.argv(result), ["-c", 'default_permissions=":read-only"', "--version"])
         self.assertIn("writable by another user", result.stderr)
         self.assertFalse((main / ".git" / "config.worktree").exists())
 
@@ -614,9 +716,11 @@ class CodexWorktreeTest(unittest.TestCase):
 
         local.write_text('default_permissions = "no-git-offline"\n')
         disabled = self.argv(self.run_wrapper("resume", "two"))
-        self.assertEqual(
-            disabled,
-            ["-c", 'default_permissions="no-git-offline"', "resume", "two"])
+        self.assertTrue(any(
+            f'{json.dumps(str(local))}="read"' in argument for argument in disabled))
+        self.assertIn(
+            f'default_permissions="{load_wrapper().GUARDED_RUNTIME_PROFILE}-0"',
+            disabled)
 
     def test_local_policy_cannot_widen_global_git_or_network_access(self):
         access = load_access()
@@ -629,7 +733,7 @@ class CodexWorktreeTest(unittest.TestCase):
         git_result = self.run_wrapper("resume", "git")
         self.assertEqual(
             self.argv(git_result),
-            ["--sandbox", "read-only", "resume", "git"])
+            ["-c", 'default_permissions=":read-only"', "resume", "git"])
         self.assertIn("cannot re-enable Git", git_result.stderr)
 
         (self.codex_home / "config.toml").write_text(
@@ -638,7 +742,7 @@ class CodexWorktreeTest(unittest.TestCase):
         network_result = self.run_wrapper("resume", "network")
         self.assertEqual(
             self.argv(network_result),
-            ["--sandbox", "read-only", "resume", "network"])
+            ["-c", 'default_permissions=":read-only"', "resume", "network"])
         self.assertIn("cannot re-enable network", network_result.stderr)
 
     def test_reserved_runtime_profile_collision_fails_closed(self):
@@ -648,7 +752,7 @@ class CodexWorktreeTest(unittest.TestCase):
         result = self.run_wrapper("resume", "one")
         self.assertEqual(
             self.argv(result),
-            ["--sandbox", "read-only", "resume", "one"])
+            ["-c", 'default_permissions=":read-only"', "resume", "one"])
         self.assertIn("reserved runtime profile name", result.stderr)
 
     def test_project_path_codex_binary_is_never_executed(self):
@@ -736,6 +840,22 @@ class CodexWorktreeTest(unittest.TestCase):
         self.assertEqual(self.payload(result)["gitEnv"], [])
         self.assertFalse(trace.exists())
 
+    def test_project_environment_cannot_redirect_home_or_codex_config(self):
+        contaminated_home = self.main / "hostile-home"
+        contaminated_home.mkdir()
+        result = self.run_wrapper("--version", cwd=self.main, HOME=str(contaminated_home))
+        payload = self.payload(result)
+        self.assertEqual(payload["home"], pwd.getpwuid(os.getuid()).pw_dir)
+        self.assertEqual(payload["codexHome"], str(self.codex_home.resolve()))
+
+        hostile_codex_home = self.main / "hostile-codex-home"
+        hostile_codex_home.mkdir()
+        refused = self.run_wrapper(
+            "--version", cwd=self.main, CODEX_HOME=str(hostile_codex_home))
+        self.assertEqual(refused.returncode, 2)
+        self.assertIn("CODEX_HOME is project-controlled", refused.stderr)
+        self.assertFalse(refused.stdout)
+
     def test_explicit_policy_override_is_preserved(self):
         args = self.argv(self.run_wrapper("--sandbox", "read-only", "resume", "one"))
         self.assertEqual(args, ["--sandbox", "read-only", "resume", "one"])
@@ -778,7 +898,7 @@ class CodexWorktreeTest(unittest.TestCase):
         result = self.run_wrapper("resume", "one")
         self.assertEqual(
             self.argv(result),
-            ["--sandbox", "read-only", "resume", "one"])
+            ["-c", 'default_permissions=":read-only"', "resume", "one"])
         self.assertIn("augmentation failed closed", result.stderr)
 
     def test_submodule_shape_is_not_treated_as_a_worktree(self):
@@ -786,8 +906,94 @@ class CodexWorktreeTest(unittest.TestCase):
         self.git("-c", "protocol.file.allow=always", "submodule", "add", "-q", str(self.main), "sub")
         result = self.run_wrapper("--version", cwd=sub)
         self.assertEqual(
-            self.argv(result), ["--sandbox", "read-only", "--version"])
+            self.argv(result), ["-c", 'default_permissions=":read-only"', "--version"])
         self.assertIn("augmentation failed closed", result.stderr)
+
+    def test_normal_launch_protects_initialized_submodule_pointer(self):
+        source = self.base / "normal-submodule-source"
+        self.git("init", "-q", source, cwd=self.base)
+        self.git("config", "user.email", "test@example.com", cwd=source)
+        self.git("config", "user.name", "Test", cwd=source)
+        (source / "tracked").write_text("source\n")
+        self.git("add", "tracked", cwd=source)
+        self.git("commit", "-qm", "source", cwd=source)
+        self.git(
+            "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+            source, "normal-sub", cwd=self.main)
+        marker = self.main / "normal-sub" / ".git"
+        original_git_dir = Path(self.git(
+            "rev-parse", "--absolute-git-dir",
+            cwd=self.main / "normal-sub").stdout.strip()).resolve()
+        writable_git_dir = self.main / "writable-submodule-git"
+        original_git_dir.rename(writable_git_dir)
+        marker.write_text(f"gitdir: {writable_git_dir}\n")
+        self.git(
+            "config", "--file", writable_git_dir / "config", "core.worktree",
+            self.main / "normal-sub", cwd=self.base)
+        result = self.run_wrapper("--version", cwd=self.main)
+        args = self.argv(result)
+        self.assertTrue(any(
+            f'{json.dumps(str(marker))}="read"' in argument for argument in args),
+            (args, result.stderr))
+        self.assertTrue(any(
+            f'{json.dumps(str(writable_git_dir))}="read"' in argument
+            for argument in args), (args, result.stderr))
+        self.assertIn(
+            f'default_permissions="{load_wrapper().GUARDED_RUNTIME_PROFILE}-0"', args)
+
+    def test_linked_launch_protects_initialized_submodule_pointer(self):
+        source = self.base / "linked-submodule-source"
+        self.git("init", "-q", source, cwd=self.base)
+        self.git("config", "user.email", "test@example.com", cwd=source)
+        self.git("config", "user.name", "Test", cwd=source)
+        (source / "tracked").write_text("source\n")
+        self.git("add", "tracked", cwd=source)
+        self.git("commit", "-qm", "source", cwd=source)
+        self.git(
+            "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+            source, "linked-sub", cwd=self.linked)
+        marker = self.linked / "linked-sub" / ".git"
+        original_git_dir = Path(self.git(
+            "rev-parse", "--absolute-git-dir",
+            cwd=self.linked / "linked-sub").stdout.strip()).resolve()
+        writable_git_dir = self.linked / "writable-submodule-git"
+        original_git_dir.rename(writable_git_dir)
+        marker.write_text(f"gitdir: {writable_git_dir}\n")
+        self.git(
+            "config", "--file", writable_git_dir / "config", "core.worktree",
+            self.linked / "linked-sub", cwd=self.base)
+        result = self.run_wrapper("--version", cwd=self.linked)
+        args = self.argv(result)
+        self.assertTrue(any(
+            f'{json.dumps(str(marker))}="read"' in argument for argument in args),
+            (args, result.stderr))
+        self.assertTrue(any(
+            f'{json.dumps(str(writable_git_dir))}="read"' in argument
+            for argument in args), (args, result.stderr))
+        self.assertIn(
+            f'default_permissions="{load_wrapper().GUARDED_RUNTIME_PROFILE}-0"', args)
+
+    def test_peer_writable_submodule_ancestor_fails_read_only(self):
+        source = self.base / "peer-submodule-source"
+        self.git("init", "-q", source, cwd=self.base)
+        self.git("config", "user.email", "test@example.com", cwd=source)
+        self.git("config", "user.name", "Test", cwd=source)
+        (source / "tracked").write_text("source\n")
+        self.git("add", "tracked", cwd=source)
+        self.git("commit", "-qm", "source", cwd=source)
+        peer = self.main / "peer-submodule"
+        peer.mkdir()
+        self.git(
+            "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+            source, "peer-submodule/sub", cwd=self.main)
+        peer.chmod(0o777)
+        try:
+            result = self.run_wrapper("--version", cwd=self.main)
+        finally:
+            peer.chmod(0o700)
+        self.assertEqual(
+            self.argv(result), ["-c", 'default_permissions=":read-only"', "--version"])
+        self.assertIn("writable by another user", result.stderr)
 
     def test_real_binary_exit_status_is_propagated(self):
         result = self.run_wrapper("--version", cwd=self.main, FAKE_CODEX_EXIT="23")
@@ -816,6 +1022,55 @@ class CodexWorktreeTest(unittest.TestCase):
             json.dumps(report["checks"]["config.load"], indent=2))
 
     @unittest.skipUnless(installed_codex(), "Codex CLI is not installed")
+    def test_installed_codex_sandbox_enforces_linked_worktree_guards(self):
+        wrapper = load_wrapper()
+        access = load_access()
+        with mock.patch.dict(os.environ, {
+                "HOME": str(self.home), "CODEX_HOME": str(self.codex_home)}):
+            context = wrapper.linked_worktree(self.linked, access)
+            wrapper.prepare_git_guards(
+                context["common"], [context["gitDir"] / "config.worktree"], access)
+            extra = wrapper.runtime_profile(context, "git-workspace")
+        script = textwrap.dedent('''\
+            attempt() { label="$1"; shift; if "$@" 2>/dev/null; then
+              printf '%s=allowed\\n' "$label"
+            else
+              printf '%s=denied\\n' "$label"
+            fi; }
+            attempt source /usr/bin/touch "$1/source-allowed"
+            attempt pointer /bin/sh -c 'printf x >> "$1"' sh "$1/.git"
+            attempt object /usr/bin/touch "$2/objects/linked-probe"
+            attempt config /bin/sh -c 'printf x >> "$1"' sh "$2/config"
+            attempt hook /usr/bin/touch "$2/hooks/new-hook"
+            attempt new-worktree /usr/bin/mkdir "$2/worktrees/new"
+            attempt admin-head /bin/sh -c 'printf x >> "$1"' sh "$3/HEAD"
+            attempt admin-config /bin/sh -c 'printf x >> "$1"' sh "$3/config.worktree"
+            attempt admin-scratch /usr/bin/touch "$3/allowed-probe"
+            ''')
+        env = self.env()
+        env["PATH"] = os.environ.get("PATH", env["PATH"])
+        sandbox_tmp = self.base / "linked-sandbox-tmp"
+        sandbox_tmp.mkdir()
+        env["TMPDIR"] = str(sandbox_tmp)
+        result = subprocess.run(
+            [str(installed_codex()), *extra, "sandbox", "--", "/bin/sh", "-c", script,
+             "probe", str(self.linked), str(context["common"]), str(context["gitDir"])],
+            cwd=self.linked, env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outcomes = {
+            line.strip() for line in result.stdout.splitlines()
+            if "=" in line and line.split("=", 1)[0] in {
+                "source", "pointer", "object", "config", "hook", "new-worktree",
+                "admin-head", "admin-config", "admin-scratch"}
+        }
+        self.assertEqual(outcomes, {
+            "source=allowed", "pointer=denied", "object=allowed", "config=denied",
+            "hook=denied", "new-worktree=denied", "admin-head=allowed",
+            "admin-config=denied", "admin-scratch=allowed",
+        })
+
+    @unittest.skipUnless(installed_codex(), "Codex CLI is not installed")
     def test_installed_codex_strictly_accepts_fleet_profile(self):
         projects = self.base / "projects"
         child = projects / "child"
@@ -842,42 +1097,12 @@ class CodexWorktreeTest(unittest.TestCase):
         projects = self.base / "projects"
         enabled = projects / "enabled"
         disabled = projects / "disabled"
-        deep_disabled = projects / "a" / "b" / "c" / "d" / "repo"
-        submodule_source = self.base / "submodule-source"
-        nested_source = self.base / "nested-source"
         projects.mkdir()
         self.git("init", "-q", enabled, cwd=self.base)
         self.git("init", "-q", disabled, cwd=self.base)
-        self.git("init", "-q", deep_disabled, cwd=self.base)
-        self.git("init", "-q", submodule_source, cwd=self.base)
-        self.git("init", "-q", nested_source, cwd=self.base)
-        for repository in (submodule_source, nested_source):
-            self.git("config", "user.email", "test@example.com", cwd=repository)
-            self.git("config", "user.name", "Test", cwd=repository)
-            (repository / "tracked").write_text("one\n")
-            self.git("add", "tracked", cwd=repository)
-            self.git("commit", "-qm", "initial", cwd=repository)
-        self.git(
-            "-c", "protocol.file.allow=always", "submodule", "add", "-q",
-            nested_source, "nested", cwd=submodule_source)
-        self.git("commit", "-qam", "add nested submodule", cwd=submodule_source)
-        self.git(
-            "-c", "protocol.file.allow=always", "submodule", "add", "-q",
-            submodule_source, "sub", cwd=enabled)
-        self.git(
-            "-c", "protocol.file.allow=always", "submodule", "update",
-            "--init", "--recursive", "-q", cwd=enabled)
-        (enabled / ".githooks").mkdir()
-        self.git("config", "core.hooksPath", ".githooks", cwd=enabled)
         local = disabled / ".codex" / "config.toml"
         local.parent.mkdir()
         local.write_text('default_permissions = "no-git"\n')
-        (disabled / ".githooks").mkdir()
-        self.git("config", "core.hooksPath", ".githooks", cwd=disabled)
-        deep_local = deep_disabled / ".codex" / "config.toml"
-        deep_local.parent.mkdir()
-        deep_local.write_text('default_permissions = "no-git"\n')
-        (enabled / "node_modules").mkdir()
         wrapper = load_wrapper()
         access = load_access()
         with mock.patch.dict(os.environ, {
@@ -895,13 +1120,8 @@ class CodexWorktreeTest(unittest.TestCase):
             attempt hooks /usr/bin/touch "$1/.git/hooks/new-hook"
             attempt worktrees /usr/bin/mkdir "$1/.git/worktrees/new"
             attempt alternates /bin/sh -c 'printf x >> "$1"' sh "$1/.git/objects/info/alternates"
-            attempt nested /bin/sh -c 'printf x >> "$1"' sh "$1/sub/.git"
-            attempt nested2 /bin/sh -c 'printf x >> "$1"' sh "$1/sub/nested/.git"
-            attempt hooksource /usr/bin/touch "$1/.githooks/new-hook"
-            attempt generated /usr/bin/touch "$1/node_modules/probe"
             attempt disabled /usr/bin/touch "$2/.git/objects/disabled-probe"
-            attempt disabledhook /usr/bin/touch "$2/.githooks/new-hook"
-            attempt deep /usr/bin/touch "$3/.git/objects/deep-probe"
+            attempt disabled-config /bin/sh -c 'printf x >> "$1"' sh "$2/.codex/config.toml"
             ''')
         env = self.env()
         env["PATH"] = os.environ.get("PATH", env["PATH"])
@@ -910,26 +1130,23 @@ class CodexWorktreeTest(unittest.TestCase):
         env["TMPDIR"] = str(sandbox_tmp)
         result = subprocess.run(
             [str(installed_codex()), *extra, "sandbox", "--",
-             "/bin/sh", "-c", script, "probe", str(enabled), str(disabled),
-             str(deep_disabled)],
+             "/bin/sh", "-c", script, "probe", str(enabled), str(disabled)],
             cwd=projects, env=env, text=True,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.assertEqual(result.returncode, 0, result.stderr)
         outcomes = {
             line.strip() for line in result.stdout.splitlines()
             if "=" in line and line.split("=", 1)[0] in {
-                "object", "config", "hooks", "worktrees", "alternates", "nested", "nested2",
-                "hooksource", "generated", "disabled", "disabledhook", "deep"}
+                "object", "config", "hooks", "worktrees", "alternates", "disabled",
+                "disabled-config"}
         }
         self.assertEqual(outcomes, {
             "object=allowed", "config=denied", "hooks=denied", "worktrees=denied",
-            "alternates=denied", "nested=denied", "nested2=denied", "hooksource=denied",
-            "generated=allowed", "disabled=denied", "disabledhook=denied", "deep=denied",
+            "alternates=denied", "disabled=denied", "disabled-config=denied",
         })
         self.assertEqual((enabled / ".git" / "config").read_bytes(), config_before)
         self.assertTrue((enabled / ".git" / "objects" / "allowed-probe").exists())
         self.assertFalse((disabled / ".git" / "objects" / "disabled-probe").exists())
-        self.assertFalse((deep_disabled / ".git" / "objects" / "deep-probe").exists())
 
 
 if __name__ == "__main__":

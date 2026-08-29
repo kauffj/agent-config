@@ -176,10 +176,10 @@ read-only, so it can edit source but cannot commit. `codex-git-access enable`
 replaces that legacy policy with four permission profiles: Git/no-Git crossed
 with network on/off. The user default becomes Git-enabled without granting
 write access outside the workspace. Hidden persistence surfaces remain
-protected: every applicable local/worktree config layer, the effective hooks
-directory, nested submodule metadata, object-alternate pointers, and
-linked-worktree pointer/config files stay read-only while
-ordinary Git metadata is writable. Both temporary-directory
+protected: top-level config/hooks, initialized submodule pointers and their
+resolved Git directories, object-alternate pointers, linked-worktree
+pointer/config files, and every existing project `.codex/config.toml` policy
+source stay read-only while ordinary Git metadata is writable. Both temporary-directory
 exclusions and `approval_policy = "never"` remain unchanged. The command recognizes only the
 legacy shape used here, preserves unrelated TOML text, validates the result,
 creates a private backup under `~/.local/state/agent-config/backups/`, and is
@@ -201,7 +201,7 @@ validate the installed profiles. For each checkout it creates and removes one
 uniquely named inert file inside the resolved Git directory, proving the active
 sandbox can write Git metadata without changing the index or refs. When Codex
 starts from a non-Git umbrella such as `~/projects`, the managed launcher scans
-recursively for ordinary descendant checkouts and adds each eligible
+at most three levels for ordinary descendant checkouts and adds each eligible
 checkout as an exact runtime workspace root. That makes the user-level Git
 default effective for discovered child repositories; a discovered child-root
 `no-git` policy keeps that repository's metadata read-only, while a `no-git`
@@ -209,25 +209,42 @@ policy at the umbrella root disables Git for every child. Network policy is
 session-wide, so project offline profiles are security boundaries only on a
 direct project launch. An online umbrella warns about discovered offline roots
 and excludes their Git metadata, but it cannot make their source network-isolated
-or prove no offline root appeared after startup. Root
+or prove no offline root exists beyond the scan budget or after startup. Root
 Git-policy discovery covers ordinary checkouts; worktree-specific untracked
 overrides require a direct worktree launch. The scan has directory, entry,
-and repository budgets, skips generated dependency/build trees while retaining
-workspace-worktree coverage, validates each Git root, and never treats a
-pointer-file worktree or submodule as an ordinary checkout. Exhausting a scan
-budget makes the entire session read-only rather than applying partial rules.
-After policy validation, it
+depth, and repository budgets, skips
+generated/hidden trees, validates each Git root, and never treats a pointer-file
+worktree or submodule as an ordinary checkout. After policy validation, it
 materializes only standard empty optional Git metadata paths needed for the
-read-only guards; repositories that opt out of Git access remain untouched. For a
+read-only guards; repositories that opt out of Git access remain untouched. It
+also caps both individual runtime-profile arguments and their aggregate size,
+and validates every repository before materializing any guard. For a
 linked worktree, the installed launcher first validates Git's `.git`,
 `commondir`, `gitdir`, and worktree-list pointers. It then starts Codex with an
 ephemeral profile that keeps the external common Git directory read-only and
 opens only shared objects/refs/logs plus that worktree's own admin directory.
-The source checkout's index, HEAD, config, hooks, and sibling worktree admin
-directories remain read-only. Shared objects and refs are necessarily shared
-between linked worktrees; use separate clones when those must be isolated too.
-Explicit Codex sandbox, profile, or permission overrides bypass this automatic
-augmentation. Permission changes and launcher installs affect only new Codex
+The source `.git` pointer, common config/hooks, current admin pointers/config,
+and sibling worktree admin directories remain read-only. The current admin
+HEAD/index and shared objects/refs/logs remain writable because ordinary linked
+worktree Git operations require them; use separate clones when those must be
+isolated too.
+Creating or removing worktrees is intentionally unavailable inside a managed
+Git session because `.git/worktrees` is a persistence boundary. A launch from
+the account home itself is read-only so the session cannot replace the trusted
+Codex/Node install or shell startup files. Any automatic-augmentation validation
+failure also makes the whole workspace read-only rather than leaving failed
+policy or nested Git control paths writable.
+
+The launcher derives `HOME` from the account database and accepts `CODEX_HOME`
+only through a trusted path outside project input; an account-home launch must
+use the default `~/.codex`. It treats the user's pre-existing global Git
+configuration and non-hook repository-local command settings (such as this
+repository's clean filter) as trusted configuration. It rejects repository-local
+config includes, `core.hooksPath`, `core.fsmonitor`, and unsafe active hooks,
+but it does not try to make arbitrary programs named by trusted Git
+configuration immutable.
+Explicit Codex sandbox, profile, or permission overrides bypass this automatic augmentation.
+Permission changes and launcher installs affect only new Codex
 sessions. See OpenAI's current
 [permission-profile](https://developers.openai.com/codex/permissions/) and
 [configuration-precedence](https://developers.openai.com/codex/config-basic/#configuration-precedence)

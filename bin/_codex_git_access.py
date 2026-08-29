@@ -26,7 +26,6 @@ from _secure_fs import (
     group_is_private,
     has_extended_access_acl,
     open_owned_directory,
-    read_all,
     writable_by_peer,
 )
 
@@ -98,6 +97,7 @@ LEGACY_MANAGED_PROFILES["git-workspace-offline"]["filesystem"] = {
 BEGIN_MARKER = "# BEGIN managed by codex-git-access"
 END_MARKER = "# END managed by codex-git-access"
 MANAGED_CHOICES = frozenset(MANAGED_PROFILES)
+CONFIG_MAX_BYTES = 1024 * 1024
 LEGACY_KEYS = frozenset({
     "network_access", "exclude_slash_tmp", "exclude_tmpdir_env_var",
 })
@@ -130,6 +130,19 @@ def parse_toml(text, path):
         raise Refusal(f"{path}: invalid TOML: {exc}") from exc
 
 
+def read_config(fd, path):
+    chunks = []
+    total = 0
+    while True:
+        chunk = os.read(fd, min(65536, CONFIG_MAX_BYTES - total + 1))
+        if not chunk:
+            return b"".join(chunks)
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > CONFIG_MAX_BYTES:
+            raise Refusal(f"{path}: config exceeds the safety limit")
+
+
 def secure_read(path, *, missing_ok=False):
     path = Path(path)
     try:
@@ -149,7 +162,7 @@ def secure_read(path, *, missing_ok=False):
             raise Refusal(f"{path.parent}: changed while checking the missing directory")
         finally:
             os.close(grand_fd)
-    flags = os.O_RDONLY | os.O_CLOEXEC
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NONBLOCK
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
@@ -170,7 +183,7 @@ def secure_read(path, *, missing_ok=False):
                     or info.st_nlink != 1 or writable_by_peer(info, fd, path)):
                 raise Refusal(
                     f"{path}: must be one user-owned file not writable by another user")
-            data = read_all(fd)
+            data = read_config(fd, path)
         finally:
             os.close(fd)
     finally:
@@ -551,7 +564,7 @@ def assert_source_unchanged(entry, parent_fd):
                     and not writable_by_peer(info, fd, entry["path"])
                     and stat.S_IMODE(info.st_mode) == entry["mode"]
                     and (info.st_dev, info.st_ino) == entry["identity"])
-            data = read_all(fd) if safe else None
+            data = read_config(fd, entry["path"]) if safe else None
         finally:
             os.close(fd)
         if not safe or data != entry["data"]:
