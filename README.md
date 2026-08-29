@@ -174,8 +174,12 @@ grants the capability only when `/usr/bin/bwrap` runs.
 Codex's legacy `workspace-write` sandbox deliberately protects `.git` as
 read-only, so it can edit source but cannot commit. `codex-git-access enable`
 replaces that legacy policy with four permission profiles: Git/no-Git crossed
-with network on/off. The user default becomes Git-enabled without granting
-write access outside the workspace. Hidden persistence surfaces remain
+with network on/off. Those profiles carry intent and network policy; the managed
+launcher adds write access only for exact Git directories it has validated.
+The static profile deliberately contains no workspace-relative `.git` rule, so
+starting Codex in a non-repository umbrella cannot create a synthetic `.git`
+mount target there. The user default becomes Git-enabled without granting write
+access outside validated repositories. Hidden persistence surfaces remain
 protected: top-level config/hooks, pointer checkouts and their resolved Git
 directories, initialized submodule pointers, object-alternate pointers, linked-worktree
 pointer/config files, and every existing project `.codex/config.toml` policy

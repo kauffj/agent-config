@@ -83,6 +83,32 @@ def load_script():
     return module
 
 
+def relative_profile_block(module):
+    """Recreate the last shipped workspace-relative profile fixture."""
+    return module.PROFILE_BLOCK.replace(
+        "Workspace editing with exact Git metadata access added by the managed launcher; "
+        "network disabled.",
+        "Workspace editing with Git metadata writable and network disabled.").replace(
+        "Workspace editing with exact Git metadata access added by the managed launcher; "
+        "network enabled.",
+        "Workspace editing with Git metadata writable and network enabled.").replace(
+        "\n[permissions.git-workspace]\n",
+        '''
+
+[permissions.git-workspace-offline.filesystem.":workspace_roots"]
+".git" = "write"
+".git/config" = "read"
+".git/config.worktree" = "read"
+".git/hooks" = "read"
+".git/modules" = "read"
+".git/objects/info/alternates" = "read"
+".git/objects/info/http-alternates" = "read"
+".git/worktrees" = "read"
+
+[permissions.git-workspace]
+''')
+
+
 class CodexGitAccessTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -150,18 +176,8 @@ class CodexGitAccessTest(unittest.TestCase):
         self.assertFalse(parsed["permissions"]["no-git-offline"]["network"]["enabled"])
         self.assertEqual(parsed["permissions"]["no-git"]["extends"], "no-git-offline")
         self.assertTrue(parsed["permissions"]["no-git"]["network"]["enabled"])
-        self.assertEqual(
-            parsed["permissions"]["git-workspace-offline"]["filesystem"]
-                  [":workspace_roots"], {
-                      ".git": "write",
-                      ".git/config": "read",
-                      ".git/config.worktree": "read",
-                      ".git/hooks": "read",
-                      ".git/modules": "read",
-                      ".git/objects/info/alternates": "read",
-                      ".git/objects/info/http-alternates": "read",
-                      ".git/worktrees": "read",
-                  })
+        self.assertNotIn(
+            "filesystem", parsed["permissions"]["git-workspace-offline"])
         self.assertEqual(parsed["permissions"]["git-workspace"]["extends"],
                          "git-workspace-offline")
         self.assertTrue(parsed["permissions"]["git-workspace"]["network"]["enabled"])
@@ -190,9 +206,24 @@ class CodexGitAccessTest(unittest.TestCase):
         parsed = tomllib.loads(self.config.read_text())
         self.assertEqual(parsed["default_permissions"], "git-workspace-offline")
 
+    def test_enable_replaces_workspace_relative_git_rules(self):
+        module = load_script()
+        self.write_global(
+            'approval_policy = "never"\n'
+            'default_permissions = "git-workspace"\n\n'
+            + relative_profile_block(module))
+
+        result = self.run_cli("enable", check=True)
+
+        profile = tomllib.loads(self.config.read_text())["permissions"] \
+            ["git-workspace-offline"]
+        self.assertNotIn("filesystem", profile)
+        self.assertEqual(len(self.backup_bundles()), 1)
+        self.assertIn("updated user config", result.stdout)
+
     def test_enable_upgrades_the_original_owned_profile_shape(self):
         module = load_script()
-        old_block = module.PROFILE_BLOCK.replace(
+        old_block = relative_profile_block(module).replace(
             '".git/config" = "read"\n'
             '".git/config.worktree" = "read"\n'
             '".git/hooks" = "read"\n'
@@ -215,17 +246,16 @@ class CodexGitAccessTest(unittest.TestCase):
 
         parsed = tomllib.loads(self.config.read_text())
         self.assertEqual(parsed["default_permissions"], "git-workspace")
-        self.assertEqual(
-            parsed["permissions"]["git-workspace-offline"]["filesystem"]
-                  [":workspace_roots"][".git/hooks"], "read")
+        self.assertNotIn(
+            "filesystem", parsed["permissions"]["git-workspace-offline"])
         self.assertEqual(parsed["hooks"]["state"]["fixture"]["trusted_hash"],
                          "sha256:kept")
         self.assertEqual(len(self.backup_bundles()), 1)
         self.assertIn("updated user config", result.stdout)
 
-    def test_enable_adds_nested_git_persistence_guards_to_previous_profile(self):
+    def test_enable_replaces_intermediate_relative_git_rules(self):
         module = load_script()
-        previous = module.PROFILE_BLOCK
+        previous = relative_profile_block(module)
         for line in (
                 '".git/modules" = "read"\n',
                 '".git/objects/info/alternates" = "read"\n',
@@ -237,11 +267,9 @@ class CodexGitAccessTest(unittest.TestCase):
 
         result = self.run_cli("enable", check=True)
 
-        paths = tomllib.loads(self.config.read_text())["permissions"] \
-            ["git-workspace-offline"]["filesystem"][":workspace_roots"]
-        self.assertEqual(paths[".git/modules"], "read")
-        self.assertEqual(paths[".git/objects/info/alternates"], "read")
-        self.assertEqual(paths[".git/worktrees"], "read")
+        profile = tomllib.loads(self.config.read_text())["permissions"] \
+            ["git-workspace-offline"]
+        self.assertNotIn("filesystem", profile)
         self.assertEqual(len(self.backup_bundles()), 1)
         self.assertIn("updated user config", result.stdout)
 

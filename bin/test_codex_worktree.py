@@ -159,8 +159,11 @@ class CodexWorktreeTest(unittest.TestCase):
     def test_normal_checkout_pins_profile_and_protects_worktree_admin_root(self):
         result = self.run_wrapper("--version", cwd=self.main)
         args = self.argv(result)
-        self.assertEqual(
-            args, ["-c", 'default_permissions="git-workspace"', "--version"])
+        self.assertTrue(any(
+            f'{json.dumps(str(self.main / ".git"))}="write"' in argument
+            for argument in args), args)
+        self.assertEqual(args[-1], "--version")
+        self.assertNotIn('default_permissions="git-workspace"', args)
         self.assertTrue((self.main / ".git" / "worktrees").is_dir())
 
     def test_normal_launch_protects_an_in_tree_linked_worktree_pointer(self):
@@ -1537,6 +1540,45 @@ class CodexWorktreeTest(unittest.TestCase):
             "adminhead=allowed", "adminscratch=allowed", "policy=denied", "hooksource=denied",
             "source=allowed", "mainsource=denied",
         })
+
+    @unittest.skipUnless(installed_codex(), "Codex CLI is not installed")
+    def test_installed_codex_sandbox_enforces_ordinary_git_guards(self):
+        launch = self.run_wrapper("--version", cwd=self.main)
+        extra = self.argv(launch)[:-1]
+        config_before = (self.main / ".git" / "config").read_bytes()
+        script = textwrap.dedent('''\
+            attempt() { label="$1"; shift; if "$@" 2>/dev/null; then
+              printf '%s=allowed\\n' "$label"
+            else
+              printf '%s=denied\\n' "$label"
+            fi; }
+            attempt object /usr/bin/touch "$1/.git/objects/allowed-probe"
+            attempt config /bin/sh -c 'printf x >> "$1"' sh "$1/.git/config"
+            attempt hooks /usr/bin/touch "$1/.git/hooks/new-hook"
+            attempt worktrees /usr/bin/mkdir "$1/.git/worktrees/new"
+            attempt source /usr/bin/touch "$1/source-probe"
+            ''')
+        env = self.env()
+        env["PATH"] = os.environ.get("PATH", env["PATH"])
+        sandbox_tmp = self.base / "ordinary-sandbox-runtime-tmp"
+        sandbox_tmp.mkdir()
+        env["TMPDIR"] = str(sandbox_tmp)
+        result = subprocess.run(
+            [str(installed_codex()), *extra, "sandbox", "--",
+             "/bin/sh", "-c", script, "probe", str(self.main)],
+            cwd=self.main, env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outcomes = {
+            line.strip() for line in result.stdout.splitlines()
+            if "=" in line and line.split("=", 1)[0] in {
+                "object", "config", "hooks", "worktrees", "source"}
+        }
+        self.assertEqual(outcomes, {
+            "object=allowed", "config=denied", "hooks=denied",
+            "worktrees=denied", "source=allowed",
+        })
+        self.assertEqual((self.main / ".git" / "config").read_bytes(), config_before)
 
     @unittest.skipUnless(installed_codex(), "Codex CLI is not installed")
     def test_installed_codex_sandbox_enforces_fleet_git_guards(self):

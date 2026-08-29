@@ -57,21 +57,11 @@ extends = "no-git-offline"
 enabled = true
 
 [permissions.git-workspace-offline]
-description = "Workspace editing with Git metadata writable and network disabled."
+description = "Workspace editing with exact Git metadata access added by the managed launcher; network disabled."
 extends = "no-git-offline"
 
-[permissions.git-workspace-offline.filesystem.":workspace_roots"]
-".git" = "write"
-".git/config" = "read"
-".git/config.worktree" = "read"
-".git/hooks" = "read"
-".git/modules" = "read"
-".git/objects/info/alternates" = "read"
-".git/objects/info/http-alternates" = "read"
-".git/worktrees" = "read"
-
 [permissions.git-workspace]
-description = "Workspace editing with Git metadata writable and network enabled."
+description = "Workspace editing with exact Git metadata access added by the managed launcher; network enabled."
 extends = "git-workspace-offline"
 
 [permissions.git-workspace.network]
@@ -80,9 +70,30 @@ enabled = true
 """
 
 MANAGED_PROFILES = tomllib.loads(PROFILE_BLOCK)["permissions"]
-# The immediately previous managed profile protected only top-level Git
-# config/hooks. Recognize it so `enable` can add the nested persistence guards.
-PREVIOUS_MANAGED_PROFILES = copy.deepcopy(MANAGED_PROFILES)
+# The previous managed profiles applied workspace-relative `.git` rules. At a
+# non-Git umbrella Codex can materialize that missing path as an empty mount
+# target, so the current schema leaves all Git writes to the launcher's exact,
+# validated paths. Recognize every shipped owned shape for safe upgrades.
+RELATIVE_MANAGED_PROFILES = copy.deepcopy(MANAGED_PROFILES)
+RELATIVE_MANAGED_PROFILES["git-workspace-offline"]["description"] = (
+    "Workspace editing with Git metadata writable and network disabled.")
+RELATIVE_MANAGED_PROFILES["git-workspace"]["description"] = (
+    "Workspace editing with Git metadata writable and network enabled.")
+RELATIVE_MANAGED_PROFILES["git-workspace-offline"]["filesystem"] = {
+    ":workspace_roots": {
+        ".git": "write",
+        ".git/config": "read",
+        ".git/config.worktree": "read",
+        ".git/hooks": "read",
+        ".git/modules": "read",
+        ".git/objects/info/alternates": "read",
+        ".git/objects/info/http-alternates": "read",
+        ".git/worktrees": "read",
+    },
+}
+# The immediately preceding relative profile protected only top-level Git
+# config/hooks. Recognize it so `enable` can replace it with exact-path access.
+PREVIOUS_MANAGED_PROFILES = copy.deepcopy(RELATIVE_MANAGED_PROFILES)
 for _path in (
         ".git/modules", ".git/objects/info/alternates",
         ".git/objects/info/http-alternates", ".git/worktrees"):
@@ -296,7 +307,8 @@ def validate_upgradeable_managed_profiles(parsed, path):
         raise Refusal(f"{path}: managed permission profiles are missing")
     actual = {name: permissions.get(name) for name in MANAGED_CHOICES}
     if actual not in (
-            MANAGED_PROFILES, PREVIOUS_MANAGED_PROFILES, LEGACY_MANAGED_PROFILES):
+            MANAGED_PROFILES, RELATIVE_MANAGED_PROFILES,
+            PREVIOUS_MANAGED_PROFILES, LEGACY_MANAGED_PROFILES):
         raise Refusal(f"{path}: managed permission profiles differ from known versions")
     choice = parsed.get("default_permissions")
     if choice not in MANAGED_CHOICES:

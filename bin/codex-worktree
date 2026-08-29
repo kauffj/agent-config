@@ -1212,7 +1212,11 @@ def render_checkout_launch(context, plan):
                 RUNTIME_PROFILE,
                 [(path, "read") for path in protected]))
     else:
-        arguments = profile_with_exact_reads(active, protected)
+        # The installed profile records Git intent but deliberately has no
+        # workspace-relative `.git` write. Use the same exact, validated rules
+        # as fleet launches so a non-repository workspace can never acquire a
+        # synthetic `.git` mount target from the static profile.
+        arguments = fleet_runtime_profile([root], protected, active)
     return {
         "arguments": arguments,
         "guardContexts": ((plan["common"], plan["worktreeConfigPaths"]),),
