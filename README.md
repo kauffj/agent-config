@@ -1,4 +1,4 @@
-# claude-config
+# agent-config
 
 An opinionated agent configuration with shared instructions and skills for
 Claude Code, Codex, and Grok. Claude still consumes the whole repository as its
@@ -118,21 +118,21 @@ a moved doc, a missing Codex link) into a loud, early failure.
 ## Install
 
 ```bash
-git clone <this repo> ~/projects/claude-config
-~/projects/claude-config/bin/agent-config-install
-~/projects/claude-config/bin/agent-config-install --check
+git clone <this repo> ~/projects/agent-config
+~/projects/agent-config/bin/agent-config-install
+~/projects/agent-config/bin/agent-config-install --check
 
 # One-time Codex permission migration: Git works by default.
-~/projects/claude-config/bin/codex-git-access enable
+~/projects/agent-config/bin/codex-git-access enable
 
 # After restarting Codex, run this inside the new session to prove its active
 # sandbox can write Git metadata.
-~/projects/claude-config/bin/codex-git-access check ~/projects/claude-config
+~/projects/agent-config/bin/codex-git-access check ~/projects/agent-config
 
 # Ubuntu 24.04 only: permit Codex's bubblewrap workspace sandbox without
 # disabling AppArmor's global unprivileged-user-namespace restriction
-~/projects/claude-config/bin/install-codex-bwrap-profile
-~/projects/claude-config/bin/install-codex-bwrap-profile --check
+~/projects/agent-config/bin/install-codex-bwrap-profile
+~/projects/agent-config/bin/install-codex-bwrap-profile --check
 
 mkdir -p ~/.claude/state ~/.config/wezterm
 ln -s ~/.claude/wezterm/wezterm.lua ~/.config/wezterm/wezterm.lua

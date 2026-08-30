@@ -4,7 +4,7 @@ Turns a single WezTerm window into a **fleet dashboard**: every tab is one agent
 session, colored by how long it has been waiting on you, labeled by what
 distinguishes it, and reachable through a fuzzy picker and a content search.
 
-Part of [claude-config](README.md) — see the README for install and for the rest
+Part of [agent-config](README.md) — see the README for install and for the rest
 of the repo. Linux + systemd + WezTerm.
 
 ## The idea: two layers
