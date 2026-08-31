@@ -20,11 +20,12 @@ case "$TOOL" in
     Bash)
         CMD=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 
-        # Match Git only where a shell command can begin. The old patterns
-        # searched the entire tool input, so harmless prose such as
+        # Match a program name only where a shell command can begin. The old
+        # patterns searched the entire tool input, so harmless prose such as
         # `printf '%s\n' 'git reset --hard is forbidden'` was blocked. This is
         # an accidental-safety backstop, not a shell parser; command-boundary
         # matching keeps it useful without making documentation unwriteable.
+        # Both the Git checks and the SQL-client check below share it.
         CMD_HEAD='(^|[;&|()])[[:space:]]*((if|then|elif|while|until|do|else)[[:space:]]+|![[:space:]]+)?((command|exec|sudo)[[:space:]]+)?'
         GIT_HEAD="${CMD_HEAD}git[[:space:]]+"
 
@@ -48,14 +49,22 @@ case "$TOOL" in
             exit 2
         fi
 
-        # 2. Destructive SQL — but only when a client is actually EXECUTING it.
-        #    Grepping a migration for the phrase is reading, not dropping. A
-        #    per-workspace database (…_ws_<name>) is exempt: /workspace creates
-        #    it and is expected to drop it again at teardown.
-        if echo "$CMD" | grep -qE '(^|[;&|[:space:]])(psql|mysql|mariadb|sqlite3|mongosh|clickhouse-client)([[:space:]]|$)' \
+        # 2. Destructive SQL — but only when a client is actually EXECUTING it,
+        #    at command position. Grepping a migration for the phrase is
+        #    reading, not dropping, and the client name used to match anywhere
+        #    after whitespace, so prose about this guard ("never run psql -c
+        #    DROP TABLE …") could not be written down at all.
+        #    Databases whose NAME says they are disposable are exempt: a
+        #    /workspace clone (…_ws_<name>), which /workspace itself must drop
+        #    at teardown, and a project's own throwaway scratch database
+        #    (…_scratch_<label>), which its scratch-db helper creates and
+        #    reclaims. Refusing those taught callers to route around the guard
+        #    by provisioning an empty database instead.
+        SQL_CLIENT="${CMD_HEAD}(psql|mysql|mariadb|sqlite3|mongosh|clickhouse-client)([[:space:]]|$)"
+        if echo "$CMD" | grep -qE "$SQL_CLIENT" \
            && echo "$CMD" | grep -qiE '(DROP[[:space:]]+(TABLE|DATABASE|SCHEMA)|TRUNCATE[[:space:]])' \
-           && ! echo "$CMD" | grep -q '_ws_'; then
-            echo "Blocked: destructive SQL against a database that is not a /workspace clone (…_ws_<name>)." >&2
+           && ! echo "$CMD" | grep -qE '_(ws|scratch)_'; then
+            echo "Blocked: destructive SQL against a database that is neither a /workspace clone (…_ws_<name>) nor a throwaway scratch database (…_scratch_<label>)." >&2
             exit 2
         fi
 

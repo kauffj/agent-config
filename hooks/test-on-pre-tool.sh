@@ -62,6 +62,25 @@ check BLOCK "git reset --hard origin/main"
 check BLOCK "cd /tmp && git reset --hard origin/main"
 check BLOCK "if git push --force origin main; then echo bad; fi"
 
+echo "--- destructive SQL: disposable targets, prose, real execution ---"
+# Disposable by NAME: a /workspace clone and a project's own scratch database.
+check ALLOW "$(printf 'psql "$U" -c "%sROP DATABASE IF EXISTS \\"app_scratch_probe\\" WITH (FORCE);"' $D)"
+check ALLOW "$(printf 'psql "$U" -c "%sROP DATABASE IF EXISTS \\"app_ws_papercuts\\" WITH (FORCE);"' $D)"
+check ALLOW 'psql "postgres://localhost/app_ws_x" -c "TRUNCATE members;"'
+check ALLOW 'psql "postgres://localhost/app_scratch_probe" -c "TRUNCATE members;"'
+# A plain name is still a real database, and '_scratch_' means the whole token.
+check BLOCK "$(printf 'psql "$U" -c "%sROP DATABASE app_staging;"' $D)"
+check BLOCK "$(printf 'psql "postgres://localhost/app_scratchpad" -c "%sROP TABLE members;"' $D)"
+# Writing ABOUT the guard is not running the client.
+check ALLOW "$(printf 'echo "never run psql -c %sROP TABLE users"' $D)"
+check ALLOW "$(printf '# psql -c "%sROP DATABASE app" is what NOT to do' $D)"
+# ...but the client at command position still is, however it is reached.
+check BLOCK "$(printf 'cd app && psql "$U" -c "%sROP TABLE users;"' $D)"
+check BLOCK "$(printf 'sudo psql "$U" -c "%sROP TABLE users;"' $D)"
+check BLOCK "$(printf 'echo start; psql "$U" -c "%sROP TABLE users;"' $D)"
+check BLOCK "$(printf '(psql "$U" -c "%sROP SCHEMA public CASCADE;")' $D)"
+check BLOCK "$(printf 'mysql app -e "%sROP TABLE users;"' $D)"
+
 echo "--- worktree branch-sharing overrides: must be BLOCKED ---"
 check BLOCK "git checkout --ignore-other-worktrees main"
 check BLOCK "git switch --ignore-other-worktrees main"

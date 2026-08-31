@@ -61,7 +61,9 @@ verbatim by the `workspace get` operation — into the transcript, and from ther
 that exports one. It is derived on demand from the recorded env file and primary
 variable in the main checkout. Provisioning stores the credential-free identity
 before creating the database, so every later failure remains recoverable through
-the record.
+the record. A record written before `dbEndpoint` existed is re-derived from that
+same env file on the next read; if it cannot be, teardown refuses with the exact
+`update` command that repairs it rather than stranding the workspace.
 
 ---
 
