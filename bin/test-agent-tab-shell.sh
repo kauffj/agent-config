@@ -362,6 +362,34 @@ else
     fails=$((fails + 1))
 fi
 
+if grep -q "dofile(HOME .. '/.claude/wezterm/session-picker-core.lua')" \
+        "$ROOT/wezterm/wezterm.lua" \
+   && grep -q 'PICKER.matches_session(vars, session_id)' "$ROOT/wezterm/wezterm.lua" \
+   && grep -q 'PICKER.refresh_record(rec, live, scheduled, schedule_err)' \
+        "$ROOT/wezterm/wezterm.lua"; then
+    echo "  ok    picker config loads the tested selection rules"
+else
+    echo "  FAIL  picker config bypasses its tested selection rules"
+    fails=$((fails + 1))
+fi
+
+if command -v wezterm >/dev/null 2>&1; then
+    if AGENT_CONFIG_TEST_ROOT="$ROOT" wezterm \
+        --config-file "$ROOT/wezterm/test-session-picker.lua" show-keys >/dev/null; then
+        echo "  ok    picker behavior fails closed on stale records and pane identities"
+    else
+        echo "  FAIL  executable session-picker behavior regression"
+        fails=$((fails + 1))
+    fi
+else
+    if [[ ${REQUIRE_WEZTERM_TESTS:-0} == 1 ]]; then
+        echo "  FAIL  executable picker behavior requires wezterm"
+        fails=$((fails + 1))
+    else
+        echo "  SKIP  executable picker behavior (wezterm is unavailable)"
+    fi
+fi
+
 if grep -q "claude-schedule', 'reopen'" "$ROOT/wezterm/wezterm.lua" \
    && ! grep -q "claude-schedule', 'cancel'" "$ROOT/wezterm/wezterm.lua" \
    && ! grep -q 'pane_by_id\|cwd_by_id\|cmd_by_id\|scheduled_ids' \

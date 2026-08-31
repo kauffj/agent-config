@@ -19,6 +19,7 @@ local act = wezterm.action
 local config = wezterm.config_builder()
 local HOME = wezterm.home_dir
 local AGENT_TAB_SHELL = HOME .. '/.claude/bin/agent-tab-shell'
+local PICKER = dofile(HOME .. '/.claude/wezterm/session-picker-core.lua')
 
 -- ---------------------------------------------------------------------------
 -- Base config — deliberately conservative so it loads on a fresh box. Font is
@@ -865,41 +866,37 @@ local function run_registry()
   return recs, nil
 end
 
--- The mux pane a session is REALLY on right now, or nil if it's gone. Two ways to
--- miss: get_pane RAISES on a closed/unknown pane id (e.g. a snoozed tab), and
--- WezTerm RECYCLES pane ids, so a closed session's recorded pane can now belong to
--- a DIFFERENT session — trusting it would land you on the wrong tab (or right where
--- you are). A cwd mismatch is what identifies that reuse. One definition, so the
--- tab number the picker SHOWS and the pane it JUMPS to can never disagree.
-local function session_pane(paneid, cwd)
+local function run_schedule()
+  local ok, stdout, stderr = wezterm.run_child_process({
+    HOME .. '/.claude/bin/claude-schedule', 'list', '--json',
+  })
+  if not ok then return nil, (stderr or 'claude-schedule failed') end
+  if not stdout or stdout == '' then return {}, nil end
+  local okj, recs = pcall(wezterm.json_parse, stdout)
+  if not okj or type(recs) ~= 'table' then return nil, 'could not parse schedule JSON' end
+  for _, rec in ipairs(recs) do rec.scheduled = true end
+  return recs, nil
+end
+
+-- The mux pane a session is REALLY on right now, or nil if it's gone. WezTerm
+-- recycles numeric pane ids, while agent_session is owned by the pane lifetime.
+-- Only that exact identity may authorize a jump or move; cwd is not identity
+-- because multiple sessions routinely share a repository.
+local function session_pane(paneid, session_id)
   if not paneid then return nil end
   local ok, mux_pane = pcall(wezterm.mux.get_pane, tonumber(paneid))
   if not ok or not mux_pane then return nil end
-  if cwd and cwd ~= '' then
-    local okc, cur = pcall(function()
-      local url = mux_pane:get_current_working_dir()
-      if not url then return nil end
-      if type(url) == 'string' then return url end
-      return url.file_path or url.path or tostring(url)
-    end)
-    if okc and cur then
-      cur = cur:gsub('^file://[^/]*', ''):gsub('/+$', '')
-      if cur ~= cwd:gsub('/+$', '') then return nil end   -- reused pane, wrong session
-    end
-  end
+  local ok_vars, vars = pcall(function() return mux_pane:get_user_vars() end)
+  if not ok_vars or not PICKER.matches_session(vars, session_id) then return nil end
   return mux_pane
 end
 
-local function activate_or_resume(win, pane, rec)
-  local mux_pane = session_pane(rec.wezterm_pane, rec.cwd)
+local function activate_or_resume(win, rec)
+  local mux_pane = session_pane(rec.wezterm_pane, rec.session_id)
   if mux_pane then
-    -- MuxPane:activate() focuses pane + its tab + window (recent WezTerm).
-    -- pcall + tab-activate fallback keeps it working on older builds.
     if not pcall(function() mux_pane:activate() end) then
-      pcall(function()
-        local t = mux_pane:tab()
-        if t then t:activate() end
-      end)
+      win:toast_notification('fleet', 'session tab could not be focused', nil, 4000)
+      return false
     end
     return true
   end
@@ -907,7 +904,7 @@ local function activate_or_resume(win, pane, rec)
   -- runs outside this WezTerm mux; resuming it would create a second writer.
   -- Snoozed rows are the only closed-session records this function receives.
   if not rec.scheduled then
-    win:toast_notification('fleet', 'session is active outside this WezTerm window', nil, 4000)
+    win:toast_notification('fleet', 'session is running, but its tab cannot be found', nil, 4000)
     return false
   end
   if not rec.resume_command or rec.resume_command == '' then
@@ -924,42 +921,51 @@ local function activate_or_resume(win, pane, rec)
   return true
 end
 
--- Resurface a hidden (still-running) session and clear its hidden record. Preferred
--- path: reattach the live pane as a TAB in the window you're looking at now. The Lua
--- pane API can only move a pane into a *new* window, but `wezterm cli
--- move-pane-to-new-tab --window-id` can target an EXISTING one. If that CLI move
--- fails (wezterm not on PATH, a cross-workspace refusal, any non-zero exit), fall
--- back to move_to_new_window so the session still comes back — just standalone. If
--- the pane is gone (WezTerm restarted, tab manually closed), drop the record and
--- fall through to the normal resume path. Distinct from activate_or_resume: this
--- RELOCATES a known-live pane; that one FINDS-or-RESTARTS.
-local function resurface_hidden(win, pane, rec)
+-- Resurface a hidden (still-running) session and clear its hidden record only
+-- after its exact pane object moves. Moving by numeric id would reopen the race:
+-- the pane can close and its id can be recycled after validation.
+local function resurface_hidden(win, rec)
+  local mux_pane = session_pane(rec.wezterm_pane, rec.session_id)
+  if not mux_pane then
+    win:toast_notification('fleet', 'hidden session tab is no longer available', nil, 4000)
+    return false
+  end
+  if not pcall(function() mux_pane:move_to_new_window(win:active_workspace()) end) then
+    win:toast_notification('fleet', 'hidden session tab could not be reopened', nil, 4000)
+    return false
+  end
   local m = hidden_map()
   m[rec.session_id] = nil
   set_hidden_map(m)
-  local mux_pane
-  if rec.wezterm_pane then
-    local ok, p = pcall(wezterm.mux.get_pane, tonumber(rec.wezterm_pane))
-    if ok then mux_pane = p end
+  if not pcall(function() mux_pane:activate() end) then
+    win:toast_notification('fleet', 'reopened session tab could not be focused', nil, 4000)
+    return false
   end
-  if mux_pane then
-    -- run_child_process returns success=false (it does NOT raise) on a non-zero
-    -- exit, and raises only if the binary is missing — so a reattach counts only
-    -- when the pcall did NOT raise AND the command reported success.
-    local ok, reattached = pcall(function()
-      return wezterm.run_child_process({
-        'wezterm', 'cli', 'move-pane-to-new-tab',
-        '--pane-id', tostring(rec.wezterm_pane),
-        '--window-id', tostring(win:mux_window():window_id()),
-      })
-    end)
-    if not (ok and reattached) then
-      pcall(function() mux_pane:move_to_new_window(win:active_workspace()) end)  -- fallback: standalone window
-    end
-    pcall(function() mux_pane:activate() end)
-    return true
+  return true
+end
+
+-- A picker can sit open while its registry snapshot goes stale. Resolve the
+-- selected id again at Enter time and use only the fresh record. Ordinary live
+-- rows never spawn: disappearance is an error. Explicitly snoozed rows retain
+-- their intentional reopen behavior, but only while their schedule still exists.
+local function open_picker_record(win, rec)
+  local live, live_err = run_registry()
+  if not live then
+    win:toast_notification('fleet', live_err, nil, 4000)
+    return false
   end
-  return activate_or_resume(win, pane, rec)
+  local scheduled, schedule_err
+  if rec.scheduled then scheduled, schedule_err = run_schedule() end
+  local fresh, refresh_err = PICKER.refresh_record(rec, live, scheduled, schedule_err)
+  if not fresh then
+    win:toast_notification('fleet', refresh_err, nil, 4000)
+    return false
+  end
+  rec = fresh
+  if hidden_map()[rec.session_id] then
+    return resurface_hidden(win, rec)
+  end
+  return activate_or_resume(win, rec)
 end
 
 -- Content search (the picker's '🔍 search transcripts…' row): prompt for text,
@@ -1003,14 +1009,10 @@ local function session_search(window, pane)
         title = 'Fleet — search: ' .. line,
         fuzzy = true,
         choices = choices,
-        action = wezterm.action_callback(function(w2, p2, id)
+        action = wezterm.action_callback(function(w2, _, id)
           if not id then return end
           local rec = record_by_id[id]
-          if hidden_map()[id] then
-            resurface_hidden(w2, p2, rec)
-          else
-            activate_or_resume(w2, p2, rec)
-          end
+          open_picker_record(w2, rec)
         end),
       }, p)
     end),
@@ -1050,8 +1052,8 @@ local function session_picker(window, pane)
 
   -- Right-aligned so the digits line up; blank (but still padded) for a session with
   -- no open tab — snoozed, closed, or running under another mux.
-  local function tabcell(paneid, cwd)
-    local n = session_pane(paneid, cwd) and tab_of_pane[tostring(paneid)] or nil
+  local function tabcell(paneid, session_id)
+    local n = session_pane(paneid, session_id) and tab_of_pane[tostring(paneid)] or nil
     local s = n and tostring(n) or ''
     return string.rep(' ', tabw - #s) .. s .. ' '
   end
@@ -1065,7 +1067,7 @@ local function session_picker(window, pane)
     -- way string.format's byte-based %-Ns padding does. Order leads with the FOLDER
     -- (the real identity), then the branch/·tag, age, and finally the topic — kept
     -- untruncated so it stays fully fuzzy-searchable and distinguishes siblings.
-    local row = tabcell(r.wezterm_pane, r.cwd)
+    local row = tabcell(r.wezterm_pane, r.session_id)
       .. fit(r.glyph or '·', 2) .. ' '
       .. fit(r.project or '', fw) .. ' '
       .. fit(r.label or r.session_id, lw) .. ' '
@@ -1080,21 +1082,17 @@ local function session_picker(window, pane)
   -- Union in SNOOZED (closed, scheduled-to-reopen) sessions so you can reopen one
   -- early. They have no live pane, so activate_or_resume resumes them; selecting
   -- one asks the schedule owner to spawn, confirm startup, then remove it.
-  local sok, sched = wezterm.run_child_process({ HOME .. '/.claude/bin/claude-schedule', 'list', '--json' })
-  if sok and sched and sched ~= '' then
-    local okj, list = pcall(wezterm.json_parse, sched)
-    if okj and type(list) == 'table' then
-      for _, e in ipairs(list) do
-        local id = e.session_id
-        if id and not seen_ids[id] then
-          table.insert(choices, {
-            id = id,
-            label = blankcell .. fit('⏰', 2) .. ' ' .. fit(e.label or id, fw + lw + 1)
-              .. '  reopens in ' .. (e.wakes_in or '?'),
-          })
-          e.scheduled = true
-          record_by_id[id] = e
-        end
+  local schedule = run_schedule()
+  if schedule then
+    for _, e in ipairs(schedule) do
+      local id = e.session_id
+      if id and not seen_ids[id] then
+        table.insert(choices, {
+          id = id,
+          label = blankcell .. fit('⏰', 2) .. ' ' .. fit(e.label or id, fw + lw + 1)
+            .. '  reopens in ' .. (e.wakes_in or '?'),
+        })
+        record_by_id[id] = e
       end
     end
   end
@@ -1114,12 +1112,7 @@ local function session_picker(window, pane)
       if not id then return end       -- cancelled
       if id == '__search__' then return session_search(win, p) end
       local rec = record_by_id[id]
-      local activated
-      if hidden_map()[id] then
-        activated = resurface_hidden(win, p, rec)
-      else
-        activated = activate_or_resume(win, p, rec)
-      end
+      open_picker_record(win, rec)
     end),
   }, pane)
 end
