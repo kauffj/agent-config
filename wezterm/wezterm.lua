@@ -641,7 +641,7 @@ local function tab_essential(t)
   local p = t.active_pane
   local st = p and pane_state[tostring(p.pane_id)] or nil
   local glyph = status_glyph(st, p and p.title or '')
-  local tag = (st and st.acr and st.n) and (st.acr .. st.n) or tostring((t.tab_index or 0) + 1)
+  local tag = PICKER.tab_tag(st, t.tab_index)
   return dispw(' ' .. tag .. ' ' .. glyph .. ' '), tag, glyph
 end
 
@@ -878,33 +878,47 @@ local function run_schedule()
   return recs, nil
 end
 
--- The mux pane a session is REALLY on right now, or nil if it's gone. WezTerm
--- recycles numeric pane ids, while agent_session is owned by the pane lifetime.
--- Only that exact identity may authorize a jump or move; cwd is not identity
--- because multiple sessions routinely share a repository.
-local function session_pane(paneid, session_id)
-  if not paneid then return nil end
-  local ok, mux_pane = pcall(wezterm.mux.get_pane, tonumber(paneid))
+-- Capture the pane object named by a registry record. The object is important:
+-- unlike its recyclable numeric id, it cannot silently become a later pane
+-- between validation and use.
+local function record_pane(rec)
+  if not rec or not rec.wezterm_pane then return nil end
+  local ok, mux_pane = pcall(wezterm.mux.get_pane, tonumber(rec.wezterm_pane))
   if not ok or not mux_pane then return nil end
-  local ok_vars, vars = pcall(function() return mux_pane:get_user_vars() end)
-  if not ok_vars or not PICKER.matches_session(vars, session_id) then return nil end
   return mux_pane
 end
 
+-- Claude's hook sandbox cannot publish OSC 1337, so after capturing the object,
+-- re-read the host's native-process registry and require the same session + pid
+-- + pane tuple. Even an exact user var is insufficient by itself: it remains on
+-- the pane after the agent exits to a shell. If anything exited, moved, or was
+-- recycled during this interval, fail closed.
+local function verified_session_pane(rec)
+  local mux_pane = record_pane(rec)
+  if not mux_pane then return nil end
+  local live = run_registry()
+  if not live or not PICKER.same_live_process(rec, live) then return nil end
+  return mux_pane
+end
+
+-- Picker rows are rendered from a registry snapshot that was just produced by
+-- native process discovery. It is safe to show that snapshot's pane position;
+-- Enter-time activation performs the stronger second read above.
+local function snapshot_session_pane(rec, snapshot)
+  local mux_pane = record_pane(rec)
+  if mux_pane and PICKER.same_live_process(rec, snapshot) then return mux_pane end
+  return nil
+end
+
 local function activate_or_resume(win, pane, rec, selection_state)
-  local mux_pane = session_pane(rec.wezterm_pane, rec.session_id)
-  if mux_pane then
-    if not pcall(function() mux_pane:activate() end) then
-      win:toast_notification('fleet', 'session tab could not be focused', nil, 4000)
-      return false
-    end
-    return true
-  end
+  local mux_pane
+  if selection_state ~= 'closed' then mux_pane = verified_session_pane(rec) end
+  local direct = PICKER.direct_action(selection_state, mux_pane ~= nil)
   -- The selected agent exited after the picker snapshot was drawn. Its stale
   -- record came from our registry, and refresh_record retained it only when it
   -- had a validated vendor-specific resume command and cwd. The tab wrapper's
   -- per-session lease closes the remaining race with another concurrent reopen.
-  if selection_state == 'closed' then
+  if direct == 'resume' then
     local ok, spawn_err = pcall(function()
       win:perform_action(act.SpawnCommandInNewTab {
         cwd = rec.cwd,
@@ -913,6 +927,13 @@ local function activate_or_resume(win, pane, rec, selection_state)
     end)
     if not ok then
       win:toast_notification('fleet', 'session could not be resumed: ' .. tostring(spawn_err), nil, 4000)
+      return false
+    end
+    return true
+  end
+  if direct == 'activate' then
+    if not pcall(function() mux_pane:activate() end) then
+      win:toast_notification('fleet', 'session tab could not be focused', nil, 4000)
       return false
     end
     return true
@@ -942,7 +963,7 @@ end
 -- after its exact pane object moves. Moving by numeric id would reopen the race:
 -- the pane can close and its id can be recycled after validation.
 local function resurface_hidden(win, rec)
-  local mux_pane = session_pane(rec.wezterm_pane, rec.session_id)
+  local mux_pane = verified_session_pane(rec)
   if not mux_pane then
     win:toast_notification('fleet', 'hidden session tab is no longer available', nil, 4000)
     return false
@@ -982,11 +1003,9 @@ local function open_picker_record(win, pane, rec)
   rec = fresh
   if hidden_map()[rec.session_id] then
     -- A hidden agent can also exit while the picker is open. Resurface only an
-    -- exact surviving pane; otherwise discard the dead hidden marker after a
-    -- replacement tab has actually been requested.
-    if selection_state ~= 'closed' or session_pane(rec.wezterm_pane, rec.session_id) then
-      return resurface_hidden(win, rec)
-    end
+    -- exact surviving process; otherwise discard the dead hidden marker after
+    -- a replacement tab has actually been requested.
+    if selection_state ~= 'closed' then return resurface_hidden(win, rec) end
     local reopened = activate_or_resume(win, pane, rec, selection_state)
     if reopened then
       local m = hidden_map()
@@ -1064,28 +1083,29 @@ local function session_picker(window, pane)
   end
   fw, lw = math.min(fw, 26), math.min(lw, 22)
 
-  -- Which tab each live pane sits in, so a row can lead with the number you'd press
-  -- to get there. Position within its window (0-based -> 1-based), matching both the
-  -- tab bar and ActivateTab. tabs_with_info carries the index explicitly; plain
-  -- tabs() doesn't document its ordering, and a confidently WRONG number is worse
-  -- than none — so on any failure the map stays empty and the column goes blank.
+  -- The exact tag the tab bar renders for each live pane. Agent tabs use their
+  -- project acronym + per-project instance (e.g. e1/f7); ordinary tabs retain
+  -- WezTerm's one-based positional fallback. One shared helper prevents the
+  -- picker from claiming a local tab number while the bar shows another key.
   local tab_of_pane, tabw = {}, 1
   pcall(function()
     for _, w in ipairs(wezterm.mux.all_windows()) do
       for _, e in ipairs(w:tabs_with_info()) do
-        local n = e.index + 1
-        tabw = math.max(tabw, #tostring(n))
-        for _, p in ipairs(e.tab:panes()) do tab_of_pane[tostring(p:pane_id())] = n end
+        local ap = e.tab:active_pane()
+        local st = ap and pane_state[tostring(ap:pane_id())] or nil
+        local tag = PICKER.tab_tag(st, e.index)
+        tabw = math.max(tabw, dispw(tag))
+        for _, p in ipairs(e.tab:panes()) do tab_of_pane[tostring(p:pane_id())] = tag end
       end
     end
   end)
 
-  -- Right-aligned so the digits line up; blank (but still padded) for a session with
-  -- no open tab — snoozed, closed, or running under another mux.
-  local function tabcell(paneid, session_id)
-    local n = session_pane(paneid, session_id) and tab_of_pane[tostring(paneid)] or nil
-    local s = n and tostring(n) or ''
-    return string.rep(' ', tabw - #s) .. s .. ' '
+  -- Right-aligned so the tags line up; blank (but still padded) for a session
+  -- with no open tab — snoozed, closed, or running under another mux.
+  local function tabcell(rec)
+    local paneid = rec.wezterm_pane
+    local s = snapshot_session_pane(rec, recs) and tab_of_pane[tostring(paneid)] or ''
+    return string.rep(' ', tabw - dispw(s)) .. s .. ' '
   end
   local blankcell = string.rep(' ', tabw + 1)
 
@@ -1098,7 +1118,7 @@ local function session_picker(window, pane)
     -- (the real identity), then the unique ·tag before the branch so truncation
     -- cannot make sibling sessions look identical, then age and the untruncated
     -- topic (which stays fully fuzzy-searchable).
-    local row = tabcell(r.wezterm_pane, r.session_id)
+    local row = tabcell(r)
       .. fit(r.glyph or '·', 2) .. ' '
       .. fit(r.project or '', fw) .. ' '
       .. fit(PICKER.distinguishing_label(r.label or r.session_id), lw) .. ' '

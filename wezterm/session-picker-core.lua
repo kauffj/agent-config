@@ -1,6 +1,6 @@
--- Pure data decisions for wezterm.lua's session picker. WezTerm I/O and pane
--- mutation stay in the config; these rules can run in a scratch config without
--- creating, focusing, or moving real user tabs.
+-- Pure data decisions for wezterm.lua's session picker and shared tab identity.
+-- WezTerm I/O and pane mutation stay in the config; these rules can run in a
+-- scratch config without creating, focusing, or moving real user tabs.
 
 local M = {}
 
@@ -32,10 +32,41 @@ function M.refresh_record(record, live_records, scheduled_records, schedule_err)
   return fresh, nil, 'scheduled'
 end
 
-function M.matches_session(user_vars, session_id)
-  return type(session_id) == 'string' and session_id ~= ''
-    and type(user_vars) == 'table'
-    and user_vars.agent_session == session_id
+-- A registry snapshot proves which native process owned a pane when the
+-- snapshot was taken. Re-reading it after capturing the pane object gives the
+-- caller a safe fallback when the terminal cannot publish OSC 1337 user vars:
+-- the same session, process, and pane must still be live. The captured object
+-- cannot turn into a later pane merely because its numeric id is recycled.
+function M.same_live_process(record, live_records)
+  if type(record) ~= 'table' or type(record.session_id) ~= 'string'
+     or record.session_id == '' or type(record.pid) ~= 'number'
+     or record.pid <= 0 or record.wezterm_pane == nil then
+    return false
+  end
+  local fresh = record_with_id(live_records, record.session_id)
+  return type(fresh) == 'table'
+    and fresh.pid == record.pid
+    and fresh.wezterm_pane ~= nil
+    and tostring(fresh.wezterm_pane) == tostring(record.wezterm_pane)
+end
+
+-- The picker must show the same navigation key that the tab bar renders. Agent
+-- tabs use a stable project acronym + per-project instance; ordinary tabs keep
+-- WezTerm's one-based positional fallback.
+function M.tab_tag(state, tab_index)
+  if type(state) == 'table' and state.acr ~= nil and state.n ~= nil then
+    return tostring(state.acr) .. tostring(state.n)
+  end
+  return tostring((tonumber(tab_index) or 0) + 1)
+end
+
+-- A refreshed closed classification outranks any stale pane marker left behind
+-- on the shell. This is deliberately pure so the resume-vs-activate ordering is
+-- executable without creating or focusing real tabs.
+function M.direct_action(selection_state, pane_available)
+  if selection_state == 'closed' then return 'resume' end
+  if pane_available then return 'activate' end
+  return nil
 end
 
 -- Registry-generated labels end in a short, unique session tag. The picker

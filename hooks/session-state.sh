@@ -56,9 +56,10 @@ eval "$(jq -r '@sh "event=\(.hook_event_name // "") agent_id=\(.agent_id // "") 
 # Bind the full native session id to the pane itself. Unlike pane numbers, this
 # user variable dies with the pane and survives mux clients reconnecting; WezTerm
 # publishes the current set for sandboxed recovery commands that cannot see host
-# /proc. The direct terminal write is Codex's only route because its hook stdout
-# is a JSON control channel. Claude also receives the sequence in its supported
-# terminalSequence response below: its sandbox can make /dev/tty unwritable.
+# /proc. A direct terminal write is the only valid OSC 1337 route: Claude's
+# terminalSequence hook field allowlists notification/title OSCs and rejects
+# user variables. When its sandbox makes /dev/tty unwritable, the picker instead
+# authenticates the host registry's session + process + pane tuple.
 identity_seq=""
 if [[ -n "${WEZTERM_PANE:-}" ]] && command -v base64 >/dev/null; then
   encoded_sid=$(printf %s "$session_id" | base64 -w 0)
@@ -218,6 +219,6 @@ marker=""
 [[ "$status" == "waiting" ]] && marker="●"
 [[ "$status" == "delegating" ]] && marker="◐"
 title="$project $label"; [[ -n "$marker" ]] && title="$title $marker"
-seq=$(printf '%s\033]0;%s\007' "$identity_seq" "$title")
+seq=$(printf '\033]0;%s\007' "$title")
 jq -nc --arg seq "$seq" '{terminalSequence:$seq}'
 exit 0

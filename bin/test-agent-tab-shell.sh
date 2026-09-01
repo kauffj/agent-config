@@ -366,10 +366,11 @@ fi
 
 if grep -q "dofile(HOME .. '/.claude/wezterm/session-picker-core.lua')" \
         "$ROOT/wezterm/wezterm.lua" \
-   && grep -q 'PICKER.matches_session(vars, session_id)' "$ROOT/wezterm/wezterm.lua" \
    && grep -q 'PICKER.refresh_record(rec, live, scheduled, schedule_err)' \
-        "$ROOT/wezterm/wezterm.lua"; then
-    echo "  ok    picker config loads the tested selection rules"
+        "$ROOT/wezterm/wezterm.lua" \
+   && grep -q 'PICKER.same_live_process(rec, live)' "$ROOT/wezterm/wezterm.lua" \
+   && grep -q 'PICKER.tab_tag(st, e.index)' "$ROOT/wezterm/wezterm.lua"; then
+    echo "  ok    picker config loads tested identity and tab-tag rules"
 else
     echo "  FAIL  picker config bypasses its tested selection rules"
     fails=$((fails + 1))
@@ -405,8 +406,9 @@ fi
 if grep -q 'SetUserVar=agent_session' "$ROOT/bin/_agent_session_lease.py" \
    && grep -q 'SetUserVar=agent_session' "$ROOT/hooks/session-state.sh" \
    && grep -q 'vars.agent_session' "$ROOT/wezterm/wezterm.lua" \
+   && grep -q 'PICKER.same_live_process(rec, live)' "$ROOT/wezterm/wezterm.lua" \
    && grep -q 'LIVE_SESSION_CACHE' "$ROOT/bin/claude-resume"; then
-    echo "  ok    pane-scoped identity reaches sandboxed recovery end to end"
+    echo "  ok    pane identity has OSC and host-verified process paths"
 else
     echo "  FAIL  pane-scoped identity wiring is incomplete"
     fails=$((fails + 1))
