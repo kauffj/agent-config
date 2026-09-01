@@ -63,6 +63,22 @@ marker() { # marker <hook-stdout> <glyph|none> <label>
   fi
 }
 
+pane_identity() { # pane_identity <hook-stdout> <label>
+  local seq encoded ok=1
+  seq=$(jq -r '.terminalSequence // ""' <<<"$1" 2>/dev/null)
+  encoded=$(printf %s "$SID" | base64 -w 0)
+  case "$seq" in
+    *"SetUserVar=agent_session=$encoded"*) : ;;
+    *) ok=0 ;;
+  esac
+  if [[ "$ok" == 1 ]]; then
+    printf '  ok    %-28s pane identity published\n' "$2"
+  else
+    printf '  FAIL  %-28s pane identity missing\n' "$2"
+    fails=$((fails + 1))
+  fi
+}
+
 echo "Codex config wires every status transition:"
 for ev in SessionStart UserPromptSubmit PreToolUse PermissionRequest SubagentStart SubagentStop Stop; do
   command=$(jq -r --arg ev "$ev" '.hooks[$ev][0].hooks[0].command // ""' "$CODEX_HOOKS")
@@ -80,10 +96,11 @@ escape_name='escape.json'
 SID='test-session-1'; SF="$HOME/.claude/state/$SID.json"
 
 echo "lifecycle without subagents stays as before:"
-out=$(fire SessionStart)
+out=$(WEZTERM_PANE=42 fire SessionStart)
 expect status waiting  "SessionStart"
 expect agents 0        "SessionStart"
 marker "$out" '●'      "SessionStart"
+pane_identity "$out"   "SessionStart"
 out=$(fire UserPromptSubmit)
 expect status working  "UserPromptSubmit"
 marker "$out" none     "UserPromptSubmit"

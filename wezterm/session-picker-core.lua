@@ -38,4 +38,15 @@ function M.matches_session(user_vars, session_id)
     and user_vars.agent_session == session_id
 end
 
+-- Registry-generated labels end in a short, unique session tag. The picker
+-- caps this column, so leaving the tag at the right edge turns sibling rows
+-- such as "canonical-prose-view ·d126" into the same truncated label. Lead
+-- with the tag there; custom labels (which have no generated suffix) stay put.
+function M.distinguishing_label(label)
+  if type(label) ~= 'string' then return label end
+  local stem, tag = label:match('^(.-)%s+(·[%w._%-]+)%s*$')
+  if not stem or stem == '' then return label end
+  return tag .. ' ' .. stem
+end
+
 return M

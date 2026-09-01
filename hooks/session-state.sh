@@ -56,12 +56,16 @@ eval "$(jq -r '@sh "event=\(.hook_event_name // "") agent_id=\(.agent_id // "") 
 # Bind the full native session id to the pane itself. Unlike pane numbers, this
 # user variable dies with the pane and survives mux clients reconnecting; WezTerm
 # publishes the current set for sandboxed recovery commands that cannot see host
-# /proc. Write directly to the controlling terminal because Codex hook stdout is
-# a JSON control channel.
-if [[ -n "${WEZTERM_PANE:-}" && -w /dev/tty ]] && command -v base64 >/dev/null; then
+# /proc. The direct terminal write is Codex's only route because its hook stdout
+# is a JSON control channel. Claude also receives the sequence in its supported
+# terminalSequence response below: its sandbox can make /dev/tty unwritable.
+identity_seq=""
+if [[ -n "${WEZTERM_PANE:-}" ]] && command -v base64 >/dev/null; then
   encoded_sid=$(printf %s "$session_id" | base64 -w 0)
-  printf '\033]1337;SetUserVar=agent_session=%s\007' "$encoded_sid" \
-    >/dev/tty 2>/dev/null || true
+  identity_seq=$(printf '\033]1337;SetUserVar=agent_session=%s\007' "$encoded_sid")
+  if [[ -w /dev/tty ]]; then
+    printf %s "$identity_seq" >/dev/tty 2>/dev/null || true
+  fi
 fi
 
 state_file="$STATE_DIR/$session_id.json"
@@ -214,6 +218,6 @@ marker=""
 [[ "$status" == "waiting" ]] && marker="●"
 [[ "$status" == "delegating" ]] && marker="◐"
 title="$project $label"; [[ -n "$marker" ]] && title="$title $marker"
-seq=$(printf '\033]0;%s\007' "$title")
+seq=$(printf '%s\033]0;%s\007' "$identity_seq" "$title")
 jq -nc --arg seq "$seq" '{terminalSequence:$seq}'
 exit 0

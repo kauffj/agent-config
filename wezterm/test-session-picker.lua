@@ -45,5 +45,13 @@ assert(not picker.matches_session({ agent_session = 'chosen' }, ''),
 assert(not picker.matches_session(nil, 'chosen'),
        'missing pane identity was accepted')
 
+assert(picker.distinguishing_label('canonical-prose-view ·d126')
+         == '·d126 canonical-prose-view',
+       'generated session tag was left at the truncated edge')
+assert(picker.distinguishing_label('site refresh') == 'site refresh',
+       'custom picker label was reordered')
+assert(picker.distinguishing_label(nil) == nil,
+       'missing picker label was not preserved')
+
 io.stderr:write('session picker behavior: all cases pass\n')
 return wezterm.config_builder()

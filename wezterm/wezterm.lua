@@ -1095,12 +1095,13 @@ local function session_picker(window, pane)
     -- Columns are padded by DISPLAY width (fit/column_width), not bytes, so the
     -- 2-cell colored glyphs and the multibyte ·tags don't drift the alignment the
     -- way string.format's byte-based %-Ns padding does. Order leads with the FOLDER
-    -- (the real identity), then the branch/·tag, age, and finally the topic — kept
-    -- untruncated so it stays fully fuzzy-searchable and distinguishes siblings.
+    -- (the real identity), then the unique ·tag before the branch so truncation
+    -- cannot make sibling sessions look identical, then age and the untruncated
+    -- topic (which stays fully fuzzy-searchable).
     local row = tabcell(r.wezterm_pane, r.session_id)
       .. fit(r.glyph or '·', 2) .. ' '
       .. fit(r.project or '', fw) .. ' '
-      .. fit(r.label or r.session_id, lw) .. ' '
+      .. fit(PICKER.distinguishing_label(r.label or r.session_id), lw) .. ' '
       .. fit(r.age_str or '', 4) .. '  '
       .. (r.topic or '') .. grp
       .. (hid[r.session_id] and '  💤 hidden' or '')
