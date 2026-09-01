@@ -340,6 +340,8 @@ fi
 if grep -q 'tab_shell, "--session", sid, cmd' "$ROOT/bin/claude-resume" \
    && grep -q 'tab_shell, "--session", sid, command' "$ROOT/bin/claude-schedule" \
    && grep -q "claude-schedule', 'reopen'" "$ROOT/wezterm/wezterm.lua" \
+   && grep -q "AGENT_TAB_SHELL, '--session', rec.session_id, rec.resume_command" \
+        "$ROOT/wezterm/wezterm.lua" \
    && grep -q '"--session", sid, "--wait-session", resume' "$ROOT/bin/claude-model"; then
     echo "  ok    every known-session launch carries its live lease id"
 else
@@ -376,7 +378,7 @@ fi
 if command -v wezterm >/dev/null 2>&1; then
     if AGENT_CONFIG_TEST_ROOT="$ROOT" wezterm \
         --config-file "$ROOT/wezterm/test-session-picker.lua" show-keys >/dev/null; then
-        echo "  ok    picker behavior fails closed on stale records and pane identities"
+        echo "  ok    picker resumes closed selections and rejects unsafe identities"
     else
         echo "  FAIL  executable session-picker behavior regression"
         fails=$((fails + 1))

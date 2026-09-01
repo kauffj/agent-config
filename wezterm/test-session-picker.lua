@@ -2,22 +2,28 @@ local wezterm = require 'wezterm'
 local root = assert(os.getenv('AGENT_CONFIG_TEST_ROOT'), 'AGENT_CONFIG_TEST_ROOT is required')
 local picker = dofile(root .. '/wezterm/session-picker-core.lua')
 
-local selected, err = picker.refresh_record(
+local selected, err, state = picker.refresh_record(
   { session_id = 'chosen' },
   { { session_id = 'chosen', wezterm_pane = '22' } },
   nil, nil)
-assert(selected.wezterm_pane == '22' and err == nil,
+assert(selected.wezterm_pane == '22' and err == nil and state == 'live',
        'fresh live selection was not used')
 
-selected, err = picker.refresh_record(
-  { session_id = 'gone' }, {}, nil, nil)
-assert(selected == nil and err == 'session is no longer open',
-       'missing live selection did not fail closed')
+selected, err, state = picker.refresh_record(
+  { session_id = 'gone', cwd = '/repo', resume_command = 'claude --resume gone' },
+  {}, nil, nil)
+assert(selected and selected.session_id == 'gone' and err == nil and state == 'closed',
+       'session that exited while the picker was open was not preserved for resume')
 
-selected, err = picker.refresh_record(
+selected, err, state = picker.refresh_record(
+  { session_id = 'unsafe', cwd = '/repo' }, {}, nil, nil)
+assert(selected == nil and err == 'cannot safely resume this session' and state == nil,
+       'stale selection without a validated resume command did not fail closed')
+
+selected, err, state = picker.refresh_record(
   { session_id = 'snoozed', scheduled = true }, {},
   { { session_id = 'snoozed', scheduled = true } }, nil)
-assert(selected and selected.scheduled and err == nil,
+assert(selected and selected.scheduled and err == nil and state == 'scheduled',
        'current snooze record was not preserved')
 
 selected, err = picker.refresh_record(

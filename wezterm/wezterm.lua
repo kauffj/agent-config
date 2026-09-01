@@ -891,11 +891,28 @@ local function session_pane(paneid, session_id)
   return mux_pane
 end
 
-local function activate_or_resume(win, rec)
+local function activate_or_resume(win, pane, rec, selection_state)
   local mux_pane = session_pane(rec.wezterm_pane, rec.session_id)
   if mux_pane then
     if not pcall(function() mux_pane:activate() end) then
       win:toast_notification('fleet', 'session tab could not be focused', nil, 4000)
+      return false
+    end
+    return true
+  end
+  -- The selected agent exited after the picker snapshot was drawn. Its stale
+  -- record came from our registry, and refresh_record retained it only when it
+  -- had a validated vendor-specific resume command and cwd. The tab wrapper's
+  -- per-session lease closes the remaining race with another concurrent reopen.
+  if selection_state == 'closed' then
+    local ok, spawn_err = pcall(function()
+      win:perform_action(act.SpawnCommandInNewTab {
+        cwd = rec.cwd,
+        args = { AGENT_TAB_SHELL, '--session', rec.session_id, rec.resume_command },
+      }, pane)
+    end)
+    if not ok then
+      win:toast_notification('fleet', 'session could not be resumed: ' .. tostring(spawn_err), nil, 4000)
       return false
     end
     return true
@@ -945,10 +962,10 @@ local function resurface_hidden(win, rec)
 end
 
 -- A picker can sit open while its registry snapshot goes stale. Resolve the
--- selected id again at Enter time and use only the fresh record. Ordinary live
--- rows never spawn: disappearance is an error. Explicitly snoozed rows retain
--- their intentional reopen behavior, but only while their schedule still exists.
-local function open_picker_record(win, rec)
+-- selected id again at Enter time. A still-live row uses only the fresh record;
+-- one that exited meanwhile may resume from its validated stale record through
+-- the single-writer lease. Snoozed rows reopen only while their schedule exists.
+local function open_picker_record(win, pane, rec)
   local live, live_err = run_registry()
   if not live then
     win:toast_notification('fleet', live_err, nil, 4000)
@@ -956,16 +973,29 @@ local function open_picker_record(win, rec)
   end
   local scheduled, schedule_err
   if rec.scheduled then scheduled, schedule_err = run_schedule() end
-  local fresh, refresh_err = PICKER.refresh_record(rec, live, scheduled, schedule_err)
+  local fresh, refresh_err, selection_state =
+    PICKER.refresh_record(rec, live, scheduled, schedule_err)
   if not fresh then
     win:toast_notification('fleet', refresh_err, nil, 4000)
     return false
   end
   rec = fresh
   if hidden_map()[rec.session_id] then
-    return resurface_hidden(win, rec)
+    -- A hidden agent can also exit while the picker is open. Resurface only an
+    -- exact surviving pane; otherwise discard the dead hidden marker after a
+    -- replacement tab has actually been requested.
+    if selection_state ~= 'closed' or session_pane(rec.wezterm_pane, rec.session_id) then
+      return resurface_hidden(win, rec)
+    end
+    local reopened = activate_or_resume(win, pane, rec, selection_state)
+    if reopened then
+      local m = hidden_map()
+      m[rec.session_id] = nil
+      set_hidden_map(m)
+    end
+    return reopened
   end
-  return activate_or_resume(win, rec)
+  return activate_or_resume(win, pane, rec, selection_state)
 end
 
 -- Content search (the picker's '🔍 search transcripts…' row): prompt for text,
@@ -1009,10 +1039,10 @@ local function session_search(window, pane)
         title = 'Fleet — search: ' .. line,
         fuzzy = true,
         choices = choices,
-        action = wezterm.action_callback(function(w2, _, id)
+        action = wezterm.action_callback(function(w2, p2, id)
           if not id then return end
           local rec = record_by_id[id]
-          open_picker_record(w2, rec)
+          open_picker_record(w2, p2, rec)
         end),
       }, p)
     end),
@@ -1112,7 +1142,7 @@ local function session_picker(window, pane)
       if not id then return end       -- cancelled
       if id == '__search__' then return session_search(win, p) end
       local rec = record_by_id[id]
-      open_picker_record(win, rec)
+      open_picker_record(win, p, rec)
     end),
   }, pane)
 end
