@@ -28,7 +28,7 @@ Windows without work, and the interesting parts assume all three.
 | `agents/` | 5 review subagents — security, simplicity, UI, visual, QA. |
 | `hooks/` | 8 hooks — session state, an accidental-destructive-command backstop, auto-format, lessons injection, transcript fsync, and a pre-commit leak guard. |
 | `codex/` | Codex-native lifecycle, startup, and safety-hook wiring. |
-| `bin/` | 25 command-line tools and focused harness scripts behind the above. |
+| `bin/` | 26 command-line tools and focused harness scripts behind the above — including `fsp-mcp-install`, which registers the Free State Party's MCP server (Mycroft, as you) with every agent CLI here. |
 | `lib/` | Shared libraries behind the skills — among them `doctor.mjs` (config integrity), the `workspace*.mjs` state/Git/database/delivery modules and CLI façade, and `project.mjs` (derived project profile plus tracked `.agent/project.json` overrides). |
 | `systemd/user/` | 9 units — the timers that make durability and resurrection actually run. |
 | `instructions/AGENTS.md` | The canonical standing instructions. Workflow orchestration, core principles, and a section on the economics of an agent's time vs. yours. |

@@ -81,6 +81,18 @@ Every production site runs on one shared droplet. **`~/projects/server-config/SE
 - Stop temporary servers explicitly when review ends, then verify that their listening port closed. Session-bound cleanup is the final safety net, not a substitute for ordinary cleanup.
 
 
+## Party data (Free State Party)
+
+The `fsp` MCP server (`https://freestate.party/api/mcp`, registered by
+`bin/fsp-mcp-install`) is Mycroft — fsp-app's assistant — acting as me with my own
+permissions, read-only. Outside an fsp-app checkout it is THE way to reach Party data
+(people, events, RSVPs, groups, documents, notes): use its tools (`mcp__fsp__…`) or
+`ask_mycroft`. If Mycroft cannot answer something, that is a tool request against
+fsp-app's registry, not a reason to go around it. Every call is logged under my name at
+`/admin/ai`. (Inside fsp-app, that repo's `AGENTS.md` still governs — its `db:prod-query`
+is a developer debugging tool, not a member surface.) Docs:
+`fsp-app/docs/knowledge/agent-access.md`.
+
 ## Writing
 
 For any **longform I'll publish under my own name** — essays, articles, Substack posts, threads, arguments — invoke the **`writing`** skill first (process, preferences, and the Google Doc collaboration protocol live there; don't restate them). Core rule: **I write the words; you build the scaffold** — bullets and structure, never finished prose. `kauffj-voice` is for tweets and throwaway, not for ghostwriting signed work.

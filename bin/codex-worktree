@@ -1520,6 +1520,20 @@ def main():
     environment = scrub_git_routing(os.environ)
     for key in ("NODE_OPTIONS", "NODE_PATH"):
         environment.pop(key, None)
+    # Bearer token for the `fsp` MCP server (freestate.party — Mycroft as
+    # you). Codex reads `--bearer-token-env-var FSP_TOKEN` from ITS OWN
+    # process environment, so it has to be set here, at launch, not in
+    # shell_environment_policy (which only shapes the commands Codex spawns;
+    # its default excludes keep *TOKEN* out of those anyway). Registered by
+    # bin/fsp-mcp-install; absent file = nothing changes.
+    fsp_token_file = Path.home() / ".config" / "party-ops" / "token"
+    if "FSP_TOKEN" not in environment and fsp_token_file.is_file():
+        try:
+            fsp_token = fsp_token_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            fsp_token = ""
+        if fsp_token.startswith("fsp_pt_"):
+            environment["FSP_TOKEN"] = fsp_token
     launch_arguments = [*real["argv"], *launch_plan["arguments"], *args]
     try:
         ensure_exec_budget(launch_arguments, environment)

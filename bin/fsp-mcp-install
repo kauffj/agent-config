@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# fsp-mcp-install — register freestate.party's MCP server ("fsp": Mycroft, as
+# you, read-only) with every agent CLI on this machine. Idempotent; run it
+# again after rotating the token.
+#
+#   fsp-mcp-install [TOKEN_FILE]     default: ~/.config/party-ops/token
+#
+# The token is a per-person fsp-app credential (mint one at
+# https://freestate.party/members/ai/access, or reuse the pop-cli one — same
+# person, same laptop, one thing to revoke). What each client gets:
+#   claude  — a user-scope `fsp` HTTP server with the literal bearer header,
+#             for every account in ~/.claude/meta/accounts.json (each account's
+#             .claude.json is mode 600 and gitignored, so the literal is fine;
+#             ${ENV} expansion is only documented for project .mcp.json files).
+#   codex   — a `fsp` HTTP server reading FSP_TOKEN from Codex's OWN process
+#             env; bin/codex-worktree (what `codex` resolves to) exports it from
+#             the token file. shell_environment_policy would be the wrong knob:
+#             it governs the commands Codex spawns, not Codex itself.
+#   grok    — a user-scope `fsp` HTTP server with the literal bearer header.
+# Docs: fsp-app/docs/knowledge/agent-access.md; decision 0018 there.
+set -euo pipefail
+
+URL="${FSP_MCP_URL:-https://freestate.party/api/mcp}"
+TOKEN_FILE="${1:-$HOME/.config/party-ops/token}"
+
+if [ ! -r "$TOKEN_FILE" ]; then
+  echo "fsp-mcp-install: no token at $TOKEN_FILE" >&2
+  echo "  Mint one at https://freestate.party/members/ai/access, then:" >&2
+  echo "    install -m 600 /dev/stdin $TOKEN_FILE <<< 'fsp_pt_…'" >&2
+  exit 1
+fi
+TOKEN=$(tr -d '[:space:]' < "$TOKEN_FILE")
+case "$TOKEN" in
+  fsp_pt_*) ;;
+  *) echo "fsp-mcp-install: $TOKEN_FILE does not hold an fsp person token (fsp_pt_…)" >&2; exit 1 ;;
+esac
+HEADER="Authorization: Bearer $TOKEN"
+done_list=()
+
+# ── Claude Code: every account in the roster ────────────────────────────────
+if command -v claude >/dev/null 2>&1; then
+  roster="$HOME/.claude/meta/accounts.json"
+  if [ -r "$roster" ]; then
+    mapfile -t dirs < <(python3 -c '
+import json,sys
+for a in json.load(open(sys.argv[1])):
+    print(a.get("configDir") or "")
+' "$roster")
+  else
+    dirs=("")
+  fi
+  for dir in "${dirs[@]}"; do
+    if [ -n "$dir" ]; then
+      CLAUDE_CONFIG_DIR="$dir" claude mcp remove -s user fsp >/dev/null 2>&1 || true
+      CLAUDE_CONFIG_DIR="$dir" claude mcp add --transport http --scope user fsp "$URL" --header "$HEADER" >/dev/null
+      done_list+=("claude ($dir)")
+    else
+      claude mcp remove -s user fsp >/dev/null 2>&1 || true
+      claude mcp add --transport http --scope user fsp "$URL" --header "$HEADER" >/dev/null
+      done_list+=("claude (default account)")
+    fi
+  done
+fi
+
+# ── Codex ───────────────────────────────────────────────────────────────────
+if command -v codex >/dev/null 2>&1; then
+  codex mcp remove fsp >/dev/null 2>&1 || true
+  codex mcp add fsp --url "$URL" --bearer-token-env-var FSP_TOKEN >/dev/null
+  done_list+=("codex (FSP_TOKEN exported by codex-worktree from $TOKEN_FILE)")
+fi
+
+# ── Grok ────────────────────────────────────────────────────────────────────
+if command -v grok >/dev/null 2>&1; then
+  grok mcp add -t http -s user -H "$HEADER" fsp "$URL" >/dev/null
+  done_list+=("grok")
+fi
+
+if [ "${#done_list[@]}" -eq 0 ]; then
+  echo "fsp-mcp-install: no agent CLI found (claude, codex, grok)" >&2
+  exit 1
+fi
+printf 'fsp MCP server registered (%s):\n' "$URL"
+printf '  • %s\n' "${done_list[@]}"
+echo "Verify: claude mcp list · codex mcp list · grok mcp list"

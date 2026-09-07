@@ -23,6 +23,7 @@
       "mcp__playwright",
       "mcp__google-docs",
       "mcp__google-sheets",
+      "mcp__fsp",
       "mcp__claude_ai_Gmail",
       "mcp__claude_ai_Google_Calendar",
       "mcp__claude_ai_Google_Drive"
