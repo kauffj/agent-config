@@ -85,12 +85,15 @@ Every production site runs on one shared droplet. **`~/projects/server-config/SE
 
 The `fsp` MCP server (`https://freestate.party/api/mcp`, registered by
 `bin/fsp-mcp-install`) is Mycroft — fsp-app's assistant — acting as me with my own
-permissions, read-only. Outside an fsp-app checkout it is THE way to reach Party data
-(people, events, RSVPs, groups, documents, notes): use its tools (`mcp__fsp__…`) or
-`ask_mycroft`. If Mycroft cannot answer something, that is a tool request against
-fsp-app's registry, not a reason to go around it. Every call is logged under my name at
-`/admin/ai`. (Inside fsp-app, that repo's `AGENTS.md` still governs — its `db:prod-query`
-is a developer debugging tool, not a member surface.) Docs:
+permissions. It is THE programmatic way to reach Party data and org state (people,
+events, RSVPs, groups, documents, notes, tasks, decisions): use its tools (`mcp__fsp__…`)
+or `ask_mycroft`. Its writes are the ones Mycroft makes without asking anywhere — file,
+claim, log, complete a task; record a decision; an RSVP; a note — so use them for real
+work; anything that needs a confirmation is not offered and happens on the website. There
+is no pop-cli and no REST API anymore. If Mycroft cannot do something, that is a tool
+request against fsp-app's registry, not a reason to go around it. Every call is logged
+under my name at `/admin/ai`. (Inside fsp-app, that repo's `AGENTS.md` still governs — its
+`db:prod-query` is a developer debugging tool, not a member surface.) Docs:
 `fsp-app/docs/knowledge/agent-access.md`.
 
 ## Writing

@@ -1521,7 +1521,8 @@ def main():
     for key in ("NODE_OPTIONS", "NODE_PATH"):
         environment.pop(key, None)
     # Bearer token for the `fsp` MCP server (freestate.party — Mycroft as
-    # you). Codex reads `--bearer-token-env-var FSP_TOKEN` from ITS OWN
+    # you; the file's name predates pop-cli's retirement). Codex reads
+    # `--bearer-token-env-var FSP_TOKEN` from ITS OWN
     # process environment, so it has to be set here, at launch, not in
     # shell_environment_policy (which only shapes the commands Codex spawns;
     # its default excludes keep *TOKEN* out of those anyway). Registered by

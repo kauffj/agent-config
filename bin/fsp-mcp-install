@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # fsp-mcp-install — register freestate.party's MCP server ("fsp": Mycroft, as
-# you, read-only) with every agent CLI on this machine. Idempotent; run it
-# again after rotating the token.
+# you — reads plus the changes he makes without asking) with every agent CLI
+# on this machine. Idempotent; run it again after rotating the token.
 #
 #   fsp-mcp-install [TOKEN_FILE]     default: ~/.config/party-ops/token
 #
 # The token is a per-person fsp-app credential (mint one at
-# https://freestate.party/members/ai/access, or reuse the pop-cli one — same
-# person, same laptop, one thing to revoke). What each client gets:
+# https://freestate.party/members/ai/access; ~/.config/party-ops/token is the
+# conventional home, a path that outlived the CLI it was named for). What each
+# client gets:
 #   claude  — a user-scope `fsp` HTTP server with the literal bearer header,
 #             for every account in ~/.claude/meta/accounts.json (each account's
 #             .claude.json is mode 600 and gitignored, so the literal is fine;
@@ -17,7 +18,7 @@
 #             the token file. shell_environment_policy would be the wrong knob:
 #             it governs the commands Codex spawns, not Codex itself.
 #   grok    — a user-scope `fsp` HTTP server with the literal bearer header.
-# Docs: fsp-app/docs/knowledge/agent-access.md; decision 0018 there.
+# Docs: fsp-app/docs/knowledge/agent-access.md; decisions 0018 and 0027 there.
 set -euo pipefail
 
 URL="${FSP_MCP_URL:-https://freestate.party/api/mcp}"
