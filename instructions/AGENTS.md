@@ -57,6 +57,14 @@
 - Do not create project instruction files when the project has no local guidance, and do not copy global policy into every repository
 
 
+## Browser Automation
+
+- Use the `playwright` MCP server for ordinary browser work. On this workstation it connects Claude and Codex sessions to one shared Brave `Default` profile, so logged-in state is reused instead of recreated per agent account.
+- Start and keep work in the Playwright tab group assigned to this client. Shared browser state is cooperative convenience, not a security boundary: another local agent may carry the same logged-in authority. Stay within the user's requested scope, and never take a destructive or externally consequential browser action without authorization.
+- Claude OAuth and Claude-in-Chrome remain account-specific. Use those browser profiles only for Claude login, or when the user explicitly wants the Claude-in-Chrome integration; do not substitute them silently when shared Playwright is unavailable.
+- When shared browser startup fails, run `playwright-mcp-install --check` and report the concrete failed prerequisite. Do not retry browser calls against an unknown profile.
+
+
 ## Core Principles
 
 - **Simplicity First**: Make every change as simple as possible — touch only what’s necessary, minimal code, minimal blast radius.

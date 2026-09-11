@@ -1,0 +1,139 @@
+#!/bin/bash -p
+# Start the pinned Playwright MCP server against the one shared Brave profile.
+set -euo pipefail
+
+die() {
+  printf 'playwright-mcp: %s\n' "$1" >&2
+  exit 1
+}
+
+token_file="$HOME/.config/playwright-mcp/extension-token"
+browser_exe="/usr/bin/brave-browser"
+user_data_dir="$HOME/.config/BraveSoftware/Brave-Browser"
+output_base="${XDG_RUNTIME_DIR:-$HOME/.local/state}"
+output_dir="$output_base/playwright-mcp"
+runtime_root="$HOME/.local/share/playwright-mcp-runtime"
+runtime_cli="$runtime_root/node_modules/@playwright/mcp/cli.js"
+node_file="$runtime_root/node-path"
+
+[[ "$token_file" == /* ]] || die "token file path must be absolute"
+[[ "$browser_exe" == /* ]] || die "browser executable path must be absolute"
+[[ "$user_data_dir" == /* ]] || die "browser user-data path must be absolute"
+[[ "$output_dir" == /* ]] || die "output directory path must be absolute"
+[[ "$runtime_root" == /* ]] || die "runtime directory path must be absolute"
+
+# Output can contain snapshots of authenticated pages. Refuse any symlink in
+# its path so a test override or a compromised parent cannot redirect them.
+output_component="$output_dir"
+while [[ "$output_component" != "/" ]]; do
+  [[ ! -L "$output_component" ]] || \
+    die "output directory path contains a symlink: $output_component"
+  output_component=$(/usr/bin/dirname -- "$output_component")
+done
+unset output_component output_base
+
+if [[ ! -e "$output_dir" ]]; then
+  old_umask=$(umask)
+  umask 077
+  /usr/bin/mkdir -p -- "$output_dir" || die "cannot create output directory: $output_dir"
+  umask "$old_umask"
+  unset old_umask
+fi
+[[ -d "$output_dir" && ! -L "$output_dir" ]] || \
+  die "output directory is not a regular directory: $output_dir"
+[[ "$(/usr/bin/stat -c '%u' -- "$output_dir")" == "$(/usr/bin/id -u)" ]] || \
+  die "output directory is not owned by the current user: $output_dir"
+[[ "$(/usr/bin/stat -c '%a' -- "$output_dir")" == "700" ]] || \
+  die "output directory must have mode 700: $output_dir"
+
+token_dir=$(/usr/bin/dirname -- "$token_file")
+[[ -d "$token_dir" && ! -L "$token_dir" ]] || \
+  die "token directory is not a regular directory: $token_dir"
+[[ "$(/usr/bin/stat -c '%u' -- "$token_dir")" == "$(/usr/bin/id -u)" ]] || \
+  die "token directory is not owned by the current user: $token_dir"
+[[ "$(/usr/bin/stat -c '%a' -- "$token_dir")" == "700" ]] || \
+  die "token directory must have mode 700: $token_dir"
+
+[[ -f "$token_file" && ! -L "$token_file" ]] || \
+  die "token file is missing or is not a regular file: $token_file"
+[[ "$(/usr/bin/stat -c '%u' -- "$token_file")" == "$(/usr/bin/id -u)" ]] || \
+  die "token file is not owned by the current user: $token_file"
+[[ "$(/usr/bin/stat -c '%a' -- "$token_file")" == "600" ]] || \
+  die "token file must have mode 600: $token_file"
+
+mapfile -t token_lines < "$token_file"
+[[ "${#token_lines[@]}" -eq 1 ]] || \
+  die "token file must contain one nonblank token: $token_file"
+token="${token_lines[0]}"
+unset token_lines
+[[ "$token" =~ ^[A-Za-z0-9_-]{43}$ ]] || \
+  die "token file must contain one 43-character base64url token: $token_file"
+[[ -x "$browser_exe" ]] || die "browser executable is not executable: $browser_exe"
+[[ -d "$user_data_dir" ]] || die "browser user-data directory is missing: $user_data_dir"
+[[ -d "$runtime_root" && ! -L "$runtime_root" ]] || \
+  die "pinned runtime directory is missing: $runtime_root"
+[[ "$(/usr/bin/stat -c '%u' -- "$runtime_root")" == "$(/usr/bin/id -u)" ]] || \
+  die "pinned runtime directory is not owned by the current user: $runtime_root"
+[[ "$(/usr/bin/stat -c '%a' -- "$runtime_root")" == "700" ]] || \
+  die "pinned runtime directory must have mode 700: $runtime_root"
+[[ -f "$runtime_cli" && ! -L "$runtime_cli" ]] || \
+  die "pinned Playwright MCP CLI is missing: $runtime_cli"
+[[ -f "$node_file" && ! -L "$node_file" ]] || \
+  die "pinned runtime Node path is missing: $node_file"
+[[ "$(/usr/bin/stat -c '%u' -- "$node_file")" == "$(/usr/bin/id -u)" ]] || \
+  die "pinned runtime Node path is not owned by the current user: $node_file"
+[[ "$(/usr/bin/stat -c '%a' -- "$node_file")" == "600" ]] || \
+  die "pinned runtime Node path must have mode 600: $node_file"
+mapfile -t node_lines < "$node_file"
+[[ "${#node_lines[@]}" -eq 1 && -n "${node_lines[0]}" ]] || \
+  die "pinned runtime Node path must contain one nonblank path: $node_file"
+node_exe="${node_lines[0]}"
+unset node_lines node_file
+if [[ "$node_exe" != "/usr/bin/node" ]]; then
+  nvm_node_prefix="$HOME/.nvm/versions/node/"
+  [[ "$node_exe" == "$nvm_node_prefix"* ]] || \
+    die "pinned runtime Node path is outside trusted locations: $node_exe"
+  nvm_node_relative="${node_exe#"$nvm_node_prefix"}"
+  [[ "$nvm_node_relative" =~ ^v[0-9]+(\.[0-9]+){0,3}/bin/node$ ]] || \
+    die "pinned runtime Node path is outside trusted locations: $node_exe"
+  unset nvm_node_prefix nvm_node_relative
+fi
+[[ -f "$node_exe" && ! -L "$node_exe" && -x "$node_exe" ]] || \
+  die "trusted Node executable is missing: $node_exe"
+node_uid=$(/usr/bin/stat -c '%u' -- "$node_exe")
+[[ "$node_uid" == "0" || "$node_uid" == "$(/usr/bin/id -u)" ]] || \
+  die "trusted Node executable has the wrong owner: $node_exe"
+node_mode=$((8#$(/usr/bin/stat -c '%a' -- "$node_exe")))
+(( (node_mode & 8#022) == 0 )) || \
+  die "trusted Node executable is group/world-writable: $node_exe"
+unset node_uid node_mode
+
+# These are the complete set of account/browser routing variables maintained
+# by this repository. Explicit MCP arguments below own browser selection.
+unset BROWSER CLAUDE_ACCT CLAUDE_ACCT_BROWSER_PROFILE CLAUDE_CONFIG_DIR
+
+# Build a small explicit environment. In particular, no project-provided
+# NODE_OPTIONS, NODE_PATH, npm configuration, or package-resolution controls
+# reach the host-side process that holds the extension token.
+child_env=(
+  "HOME=$HOME"
+  "PATH=/usr/bin:/bin"
+  "USER=$(/usr/bin/id -un)"
+  "LOGNAME=$(/usr/bin/id -un)"
+  "PLAYWRIGHT_MCP_EXTENSION_TOKEN=$token"
+)
+for name in DISPLAY WAYLAND_DISPLAY XAUTHORITY XDG_RUNTIME_DIR \
+  DBUS_SESSION_BUS_ADDRESS LANG LC_ALL; do
+  if [[ -v "$name" ]]; then
+    child_env+=("$name=${!name}")
+  fi
+done
+unset token name
+
+cd "$runtime_root"
+exec /usr/bin/env -i "${child_env[@]}" "$node_exe" "$runtime_cli" \
+  --extension \
+  --executable-path="$browser_exe" \
+  --user-data-dir="$user_data_dir" \
+  --output-dir="$output_dir" \
+  --output-max-size=10485760

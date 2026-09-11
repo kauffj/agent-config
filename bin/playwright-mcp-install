@@ -1,0 +1,551 @@
+#!/usr/bin/python3 -E
+"""Install, check, or remove the shared Playwright MCP registration."""
+
+from __future__ import annotations
+
+import argparse
+import getpass
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import tomllib
+from pathlib import Path
+
+from _playwright_mcp_runtime import (
+    RuntimeInstallError,
+    install_runtime,
+    require_runtime,
+)
+
+
+SERVER_NAME = "playwright"
+EXTENSION_ID = "mmlmfjhmonkocbjadbfplnigmagldckm"
+MIN_EXTENSION_VERSION = (0, 4, 0)
+WEB_STORE_URL = (
+    "https://chromewebstore.google.com/detail/playwright-mcp-bridge/"
+    f"{EXTENSION_ID}"
+)
+STATUS_URL = f"chrome-extension://{EXTENSION_ID}/status.html"
+TOKEN_ASSIGNMENT = "PLAYWRIGHT_MCP_EXTENSION_TOKEN="
+TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{43}")
+ACCOUNT_ROUTING_VARS = (
+    "BROWSER",
+    "CLAUDE_ACCT",
+    "CLAUDE_ACCT_BROWSER_PROFILE",
+    "CLAUDE_CONFIG_DIR",
+)
+
+
+class InstallError(Exception):
+    """An expected preflight or lifecycle failure."""
+
+
+def parse_args(argv: list[str]) -> str:
+    parser = argparse.ArgumentParser(
+        description="Manage the shared Playwright MCP registration."
+    )
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument(
+        "--check", action="store_true",
+        help="verify prerequisites and registrations without changing anything",
+    )
+    modes.add_argument(
+        "--uninstall", action="store_true",
+        help="remove only registrations owned by this command",
+    )
+    args = parser.parse_args(argv)
+    if args.check:
+        return "check"
+    if args.uninstall:
+        return "uninstall"
+    return "install"
+
+
+def require_private_directory(path: Path, label: str) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError as exc:
+        raise InstallError(f"{label} is missing: {path}") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise InstallError(f"{label} is not a regular directory: {path}")
+    if info.st_uid != os.getuid():
+        raise InstallError(f"{label} is not owned by the current user: {path}")
+    actual = stat.S_IMODE(info.st_mode)
+    if actual != 0o700:
+        raise InstallError(
+            f"{label} must have mode 700, not {actual:o}: {path}"
+        )
+
+
+def read_token(token_dir: Path, token_file: Path, allow_missing: bool) -> str | None:
+    if not token_file.exists() and not token_file.is_symlink():
+        if token_dir.exists() or token_dir.is_symlink():
+            require_private_directory(token_dir, "token directory")
+        if allow_missing:
+            return None
+        raise InstallError(f"token file is missing: {token_file}")
+
+    require_private_directory(token_dir, "token directory")
+    try:
+        info = token_file.lstat()
+    except FileNotFoundError as exc:
+        raise InstallError(f"token file is missing: {token_file}") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise InstallError(f"token file is not a regular file: {token_file}")
+    if info.st_uid != os.getuid():
+        raise InstallError(
+            f"token file is not owned by the current user: {token_file}"
+        )
+    actual = stat.S_IMODE(info.st_mode)
+    if actual != 0o600:
+        raise InstallError(
+            f"token file must have mode 600, not {actual:o}: {token_file}"
+        )
+    try:
+        raw = token_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise InstallError(f"cannot read token file: {token_file}") from exc
+    token = raw[:-1] if raw.endswith("\n") else raw
+    if not TOKEN_RE.fullmatch(token):
+        raise InstallError(
+            f"token file must contain one 43-character base64url token: {token_file}"
+        )
+    return token
+
+
+def parse_token(raw: str) -> str:
+    value = raw.strip()
+    if value.startswith(TOKEN_ASSIGNMENT):
+        value = value[len(TOKEN_ASSIGNMENT):]
+    if not TOKEN_RE.fullmatch(value):
+        raise InstallError(
+            "copied value must be a raw 43-character token or the complete "
+            f"{TOKEN_ASSIGNMENT}… assignment"
+        )
+    return value
+
+
+def store_token(token_dir: Path, token_file: Path, token: str) -> None:
+    if token_dir.exists() or token_dir.is_symlink():
+        require_private_directory(token_dir, "token directory")
+    else:
+        token_dir.mkdir(mode=0o700, parents=True)
+        token_dir.chmod(0o700)
+        require_private_directory(token_dir, "token directory")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(token_file, flags, 0o600)
+    except FileExistsError as exc:
+        raise InstallError(f"token file appeared during setup: {token_file}") from exc
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            fd = -1
+            stream.write(token + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
+def version_tuple(raw: object) -> tuple[int, ...] | None:
+    if not isinstance(raw, str) or not re.fullmatch(r"\d+(?:\.\d+){0,3}", raw):
+        return None
+    return tuple(int(part) for part in raw.split("."))
+
+
+def extension_version(
+    home: Path, *, allow_missing: bool = False
+) -> tuple[int, ...] | None:
+    root = (
+        home / ".config" / "BraveSoftware" / "Brave-Browser" / "Default" /
+        "Extensions" / EXTENSION_ID
+    )
+    versions: list[tuple[int, ...]] = []
+    if root.is_dir():
+        for manifest in root.glob("*/manifest.json"):
+            try:
+                data = json.loads(manifest.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                continue
+            parsed = version_tuple(data.get("version"))
+            if parsed is not None:
+                versions.append(parsed)
+    if not versions:
+        if allow_missing:
+            return None
+        raise InstallError(
+            "Playwright Extension is not installed in Brave's Default profile "
+            f"({root})"
+        )
+    installed = max(versions)
+    padded = installed + (0,) * (len(MIN_EXTENSION_VERSION) - len(installed))
+    if padded < MIN_EXTENSION_VERSION:
+        display = ".".join(str(part) for part in installed)
+        minimum = ".".join(str(part) for part in MIN_EXTENSION_VERSION)
+        raise InstallError(
+            f"Playwright Extension {display} is too old; {minimum}+ is required "
+            "for multiple simultaneous clients"
+        )
+    return installed
+
+
+def load_roster(home: Path) -> tuple[list[dict[str, object]], str | None]:
+    roster_path = home / ".claude" / "meta" / "accounts.json"
+    targets: list[dict[str, object]] = [{
+        "kind": "claude",
+        "label": "Claude default",
+        "config_dir": None,
+        "config": home / ".claude.json",
+    }]
+    if not roster_path.exists():
+        return targets, f"Claude roster not found; managing only the default account ({roster_path})"
+    try:
+        roster = json.loads(roster_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise InstallError(f"cannot parse Claude roster: {roster_path}") from exc
+    if not isinstance(roster, list):
+        raise InstallError(f"Claude roster must be a JSON array: {roster_path}")
+
+    seen: set[Path] = set()
+    for index, account in enumerate(roster):
+        if not isinstance(account, dict):
+            raise InstallError(f"Claude roster entry {index} must be an object")
+        raw_dir = account.get("configDir")
+        if raw_dir in (None, ""):
+            continue
+        if not isinstance(raw_dir, str):
+            raise InstallError(
+                f"Claude roster entry {index} configDir must be a string or null"
+            )
+        expanded = Path(os.path.expanduser(raw_dir))
+        if not expanded.is_absolute():
+            raise InstallError(
+                f"Claude roster entry {index} configDir must resolve to an absolute path"
+            )
+        normalized = Path(os.path.normpath(expanded))
+        if normalized in seen:
+            raise InstallError(f"duplicate Claude configDir in roster: {normalized}")
+        seen.add(normalized)
+        name = account.get("name")
+        label = f"Claude {name}" if isinstance(name, str) and name else f"Claude {normalized}"
+        targets.append({
+            "kind": "claude",
+            "label": label,
+            "config_dir": normalized,
+            "config": normalized / ".claude.json",
+        })
+    return targets, None
+
+
+def claude_registration(config: Path) -> dict[str, object] | None:
+    if not config.exists():
+        return None
+    try:
+        data = json.loads(config.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise InstallError(f"cannot parse Claude configuration: {config}") from exc
+    if not isinstance(data, dict):
+        raise InstallError(f"Claude configuration must be a JSON object: {config}")
+    servers = data.get("mcpServers", {})
+    if not isinstance(servers, dict):
+        raise InstallError(f"mcpServers must be an object in {config}")
+    server = servers.get(SERVER_NAME)
+    if server is not None and not isinstance(server, dict):
+        raise InstallError(f"{SERVER_NAME} registration is malformed in {config}")
+    return server
+
+
+def codex_registration(config: Path) -> dict[str, object] | None:
+    if not config.exists():
+        return None
+    try:
+        data = tomllib.loads(config.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as exc:
+        raise InstallError(f"cannot parse Codex configuration: {config}") from exc
+    servers = data.get("mcp_servers", {})
+    if not isinstance(servers, dict):
+        raise InstallError(f"mcp_servers must be a table in {config}")
+    server = servers.get(SERVER_NAME)
+    if server is not None and not isinstance(server, dict):
+        raise InstallError(f"{SERVER_NAME} registration is malformed in {config}")
+    return server
+
+
+def expected_registration(kind: str, wrapper: Path) -> dict[str, object]:
+    if kind == "claude":
+        return {
+            "type": "stdio",
+            "command": str(wrapper),
+            "args": [],
+            "env": {},
+        }
+    return {"command": str(wrapper)}
+
+
+def inspect_targets(
+    targets: list[dict[str, object]], wrapper: Path
+) -> list[dict[str, object]]:
+    inspected: list[dict[str, object]] = []
+    for target in targets:
+        config = target["config"]
+        assert isinstance(config, Path)
+        if target["kind"] == "claude":
+            actual = claude_registration(config)
+        else:
+            actual = codex_registration(config)
+        expected = expected_registration(str(target["kind"]), wrapper)
+        state = "missing" if actual is None else "owned" if actual == expected else "collision"
+        item = dict(target)
+        item["state"] = state
+        inspected.append(item)
+    return inspected
+
+
+def refuse_collisions(inspected: list[dict[str, object]]) -> None:
+    collisions = [
+        str(target["label"])
+        for target in inspected
+        if target["state"] == "collision"
+    ]
+    if collisions:
+        raise InstallError(
+            "refusing all changes: unrelated or structurally different "
+            f"'{SERVER_NAME}' registration for " + ", ".join(collisions)
+        )
+
+
+def mutation_still_needed(
+    action: str, target: dict[str, object], wrapper: Path
+) -> bool:
+    current = inspect_targets([target], wrapper)[0]["state"]
+    expected_before = "missing" if action == "add" else "owned"
+    expected_after = "owned" if action == "add" else "missing"
+    if current == expected_before:
+        return True
+    if current == expected_after:
+        return False
+    raise InstallError(
+        f"registration changed before {action} for {target['label']}; "
+        "refusing to overwrite or remove it"
+    )
+
+
+def child_env(target: dict[str, object]) -> dict[str, str]:
+    env = os.environ.copy()
+    env.pop("PLAYWRIGHT_MCP_EXTENSION_TOKEN", None)
+    if target["kind"] == "claude":
+        config_dir = target["config_dir"]
+        if config_dir is None:
+            env.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+    else:
+        for name in ACCOUNT_ROUTING_VARS:
+            env.pop(name, None)
+        env["CODEX_HOME"] = str(target["config_dir"])
+    return env
+
+
+def mutate(
+    action: str,
+    target: dict[str, object],
+    wrapper: Path,
+    codex_cwd: Path,
+) -> None:
+    cli = str(target["cli"])
+    if target["kind"] == "claude":
+        if action == "add":
+            command = [
+                cli, "mcp", "add", "--scope", "user", SERVER_NAME, str(wrapper)
+            ]
+        else:
+            command = [cli, "mcp", "remove", "--scope", "user", SERVER_NAME]
+        cwd = None
+    else:
+        if action == "add":
+            command = [cli, "mcp", "add", SERVER_NAME, "--", str(wrapper)]
+        else:
+            command = [cli, "mcp", "remove", SERVER_NAME]
+        cwd = codex_cwd
+    result = subprocess.run(
+        command,
+        env=child_env(target),
+        cwd=cwd,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise InstallError(
+            f"{action} failed for {target['label']} (exit {result.returncode}); "
+            "some earlier exact mutations may already have completed"
+        )
+
+
+def bootstrap_token(browser: str, home: Path, token_dir: Path, token_file: Path) -> str:
+    clean_env = os.environ.copy()
+    clean_env.pop("PLAYWRIGHT_MCP_EXTENSION_TOKEN", None)
+    opened = subprocess.run(
+        [browser, WEB_STORE_URL, STATUS_URL],
+        cwd=home,
+        env=clean_env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if opened.returncode != 0:
+        raise InstallError("Brave could not open the official extension setup pages")
+    print("Opened the official Playwright Extension store and status pages in Brave.")
+    print("Install the extension if prompted, then open it from Brave's toolbar.")
+    print("Use the Copy button beside its token; the complete KEY=value line is accepted.")
+    raw = getpass.getpass(
+        "Paste the copied token or PLAYWRIGHT_MCP_EXTENSION_TOKEN=… assignment: "
+    )
+    token = parse_token(raw)
+    store_token(token_dir, token_file, token)
+    return token
+
+
+def main(argv: list[str]) -> int:
+    mode = parse_args(argv)
+    try:
+        home = Path(os.environ.get("HOME", ""))
+        if not home.is_absolute() or not home.is_dir():
+            raise InstallError("HOME must name an existing absolute directory")
+
+        wrapper = home / ".config" / "agent-config" / "bin" / "playwright-mcp"
+        if not wrapper.is_absolute():
+            raise InstallError("expected wrapper path must be absolute")
+        if mode != "uninstall" and (
+            not wrapper.is_file() or not os.access(wrapper, os.X_OK)
+        ):
+            raise InstallError(f"expected wrapper is not executable: {wrapper}")
+
+        claude = shutil.which("claude")
+        codex = shutil.which("codex")
+        if claude is None and codex is None:
+            raise InstallError("no supported client found on PATH (claude or codex)")
+
+        notes: list[str] = []
+        targets: list[dict[str, object]] = []
+        if claude is not None:
+            claude_targets, roster_note = load_roster(home)
+            for target in claude_targets:
+                target["cli"] = claude
+            targets.extend(claude_targets)
+            if roster_note:
+                notes.append(roster_note)
+        else:
+            notes.append("Claude CLI not found; skipped Claude accounts")
+        if codex is not None:
+            codex_home = home / ".codex"
+            targets.append({
+                "kind": "codex",
+                "label": "Codex",
+                "config_dir": codex_home,
+                "config": codex_home / "config.toml",
+                "cli": codex,
+            })
+        else:
+            notes.append("Codex CLI not found; skipped Codex")
+
+        inspected = inspect_targets(targets, wrapper)
+        refuse_collisions(inspected)
+
+        installed_version: tuple[int, ...] | None = None
+        runtime = home / ".local" / "share" / "playwright-mcp-runtime"
+        runtime_repaired = False
+        if mode != "uninstall":
+            token_dir = home / ".config" / "playwright-mcp"
+            token_file = token_dir / "extension-token"
+            token = read_token(
+                token_dir, token_file, allow_missing=(mode == "install")
+            )
+            installed_version = extension_version(
+                home, allow_missing=(mode == "install" and token is None)
+            )
+            browser = shutil.which("brave-browser")
+            if browser is None:
+                raise InstallError("brave-browser is not available on PATH")
+            if token is None:
+                token = bootstrap_token(browser, home, token_dir, token_file)
+                installed_version = extension_version(home)
+            del token
+            if mode == "check":
+                require_runtime(home, runtime)
+            else:
+                runtime_repaired = install_runtime(home, runtime)
+
+        if mode == "check":
+            missing = [str(item["label"]) for item in inspected if item["state"] == "missing"]
+            if missing:
+                raise InstallError("registration is missing for " + ", ".join(missing))
+            for note in notes:
+                print(f"Note: {note}")
+            assert installed_version is not None
+            version = ".".join(str(part) for part in installed_version)
+            print(
+                f"Shared Playwright MCP is structurally correct for {len(inspected)} "
+                f"target(s); Playwright Extension {version}."
+            )
+            return 0
+
+        action = "remove" if mode == "uninstall" else "add"
+        candidates = [
+            item for item in inspected
+            if (mode == "uninstall" and item["state"] == "owned")
+            or (mode == "install" and item["state"] == "missing")
+        ]
+        mutation_count = 0
+        with tempfile.TemporaryDirectory(prefix="playwright-mcp-install-") as work:
+            codex_cwd = Path(work)
+            for target in candidates:
+                if mutation_still_needed(action, target, wrapper):
+                    mutate(action, target, wrapper, codex_cwd)
+                    mutation_count += 1
+
+        final = inspect_targets(targets, wrapper)
+        expected_final = "missing" if mode == "uninstall" else "owned"
+        wrong = [str(item["label"]) for item in final if item["state"] != expected_final]
+        if wrong:
+            raise InstallError(
+                f"post-{mode} verification failed for " + ", ".join(wrong)
+            )
+
+        for note in notes:
+            print(f"Note: {note}")
+        if runtime_repaired:
+            print(f"Installed the locked private runtime at {runtime}.")
+        if mode == "uninstall":
+            print(
+                f"Removed {mutation_count} exact shared Playwright MCP registration(s)."
+            )
+            print("The Brave profile, extension, and token were preserved.")
+            print("Already-running clients keep their MCP process until restarted.")
+        elif mutation_count:
+            print(
+                f"Installed {mutation_count} shared Playwright MCP registration(s); "
+                f"{len(inspected)} target(s) are now exact."
+            )
+        else:
+            print(
+                f"Shared Playwright MCP was already exact for {len(inspected)} target(s)."
+            )
+        return 0
+    except (InstallError, RuntimeInstallError) as exc:
+        print(f"playwright-mcp-install: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

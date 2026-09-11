@@ -224,6 +224,55 @@ states are distinguished carefully: an expired *access* token is healthy (claude
 refreshes it at launch) and an unreachable API is healthy (offline laptops still
 work); only a 401/403 or a dead *refresh* token counts as broken.
 
+**Ordinary agent browser work shares one logged-in Brave profile through
+Playwright.** `playwright-mcp-install` registers the same `playwright` stdio
+server for the default Claude account, every alternate account in the roster,
+and Codex. Its runtime wrapper pins `@playwright/mcp@0.0.80` in extension mode
+to `/usr/bin/brave-browser` and Brave's `Default` profile. Sign into a site once
+there; every agent client gets the same cookies and session state without being
+tied to the Claude subscription that launched it.
+
+The installer resolves that package only from the committed npm lockfile, with
+registry integrity hashes and lifecycle scripts disabled, into the private
+`~/.local/share/playwright-mcp-runtime` directory. The installer records a
+validated absolute Node 20+ executable there; the wrapper uses it to run the
+absolute CLI path from that directory and with an explicit environment
+allowlist. It never asks `npx` to resolve code from the agent's current project,
+so a repository-local package or `.npmrc` cannot inherit the browser token.
+
+The setup command opens Microsoft's official Playwright Extension pages when
+the token is absent, accepts either the Copy button's complete
+`PLAYWRIGHT_MCP_EXTENSION_TOKEN=...` line or its raw value through a hidden
+prompt, and stores only the raw token at
+`~/.config/playwright-mcp/extension-token` (directory mode 700, file mode 600).
+The token is read by `bin/playwright-mcp` at runtime; it is never copied into a
+Claude or Codex config. Extension 0.4.0 or newer is required because that is the
+first version used here with simultaneous per-client tab groups.
+
+```sh
+playwright-mcp-install             # install/repair every exact registration
+playwright-mcp-install --check     # read-only structural check
+playwright-mcp-install --uninstall # remove exact registrations; keep browser state
+```
+
+Install and check refuse before mutation if any client already has a different
+server named `playwright`; uninstall likewise removes only the exact wrapper it
+owns. Uninstall preserves the pinned runtime as well as the browser state and
+token. A client loads MCP servers at startup, so restart existing Claude/Codex
+sessions after install or uninstall. Browser snapshots and console artifacts can
+contain authenticated content: the wrapper keeps them in a private mode-700
+runtime directory outside repositories and caps retained output at 10 MiB.
+
+This is shared authority, not a security boundary. Playwright Extension 0.4.0
+gave two simultaneous clients separate tab groups in the 2026-09-11 live pilot,
+and a session cookie set through one was received by the other. That is exactly
+why it removes duplicate logins—and why every connected local agent must stay in
+its own Playwright group and within the user's authorized scope.
+
+The account-specific browsers below still exist, but only for Claude OAuth and
+Claude-in-Chrome fallback. They solve Claude identity binding; they are not the
+default path for ordinary browser automation.
+
 **Each account logs in through its own browser session.** `claude auth login`
 hands its OAuth URL to `$BROWSER`; the wrapper points that at
 `bin/claude-acct-browser`, which opens Brave on `~/.claude-browsers/<account>`.
