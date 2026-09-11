@@ -49,15 +49,20 @@ for a in json.load(open(sys.argv[1])):
   else
     dirs=("")
   fi
+  # The default account is selected by the ABSENCE of CLAUDE_CONFIG_DIR, and
+  # a session of another account exports it to every child process — so run
+  # from inside the alt session, the "default" branch silently wrote to the alt
+  # config (that is how the first install left claudepersonal unregistered).
+  # Clear it explicitly; never rely on the caller's environment.
   for dir in "${dirs[@]}"; do
     if [ -n "$dir" ]; then
       CLAUDE_CONFIG_DIR="$dir" claude mcp remove -s user fsp >/dev/null 2>&1 || true
       CLAUDE_CONFIG_DIR="$dir" claude mcp add --transport http --scope user fsp "$URL" --header "$HEADER" >/dev/null
       done_list+=("claude ($dir)")
     else
-      claude mcp remove -s user fsp >/dev/null 2>&1 || true
-      claude mcp add --transport http --scope user fsp "$URL" --header "$HEADER" >/dev/null
-      done_list+=("claude (default account)")
+      env -u CLAUDE_CONFIG_DIR claude mcp remove -s user fsp >/dev/null 2>&1 || true
+      env -u CLAUDE_CONFIG_DIR claude mcp add --transport http --scope user fsp "$URL" --header "$HEADER" >/dev/null
+      done_list+=("claude (default account, ~/.claude.json)")
     fi
   done
 fi
@@ -81,4 +86,4 @@ if [ "${#done_list[@]}" -eq 0 ]; then
 fi
 printf 'fsp MCP server registered (%s):\n' "$URL"
 printf '  • %s\n' "${done_list[@]}"
-echo "Verify: claude mcp list · codex mcp list · grok mcp list"
+echo "Verify: env -u CLAUDE_CONFIG_DIR claude mcp list · CLAUDE_CONFIG_DIR=<dir> claude mcp list · codex mcp list · grok mcp list"
