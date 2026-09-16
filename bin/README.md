@@ -187,6 +187,17 @@ plus how long until the soonest Claude reset and the `--acct` override to start
 Claude anyway. It never launches another vendor for you: typing `claude` should
 never hand you a different model and a different CLI's keybindings.
 
+**`venice-code` runs Codex on Venice AI instead of OpenAI** — same Codex, same
+`AGENTS.md`/hooks/skills/fleet wiring, pay-per-token through Venice's
+OpenAI-compatible endpoint. It reads `~/.config/venice/api-key` (0600, minted at
+venice.ai/settings/api with a daily USD cap) at launch and passes
+`-c model_provider=venice -c model=…` rather than `--profile`, because the managed
+`codex` launcher treats a profile flag as a policy override and drops the
+linked-worktree Git preflight. `VENICE_MODEL=<id>` picks any model from Venice's
+catalog; the default is GLM 5.3. The provider block lives in `~/.codex/config.toml`
+(`[model_providers.venice]`, `env_key = "VENICE_API_KEY"`). Kimi models do not
+work: Venice rejects Codex's `namespace` tool type for them (see the script header).
+
 **Every launch first probes all accounts and prints one enumeration line** before
 exec'ing claude, e.g. `claude-acct: claudepersonal s84%/2h11m w54%/3d16h · claude s12%/4h w41%/1d8h → claude`
 (accounts are named by the subscription they log into — the email's local part).

@@ -1,0 +1,30 @@
+#!/bin/sh
+# Codex on Venice AI's OpenAI-compatible endpoint (pay-per-token).
+#
+# Same Codex, same AGENTS.md/hooks/skills/fleet wiring — only the provider
+# differs. Selected with `-c` rather than `--profile` on purpose: the managed
+# codex launcher treats a profile flag as a policy override and skips the
+# linked-worktree Git preflight, while `model_provider`/`model` overrides keep
+# it. The key is read here, at launch, so it never sits in every shell's
+# environment; Codex's default shell policy keeps *_KEY out of the agent's
+# own shell tool.
+#
+#   venice-code [codex args...]
+#   VENICE_MODEL=deepseek-v4-flash venice-code   # cheaper; any ID from /api/v1/models
+#
+# Verified 2026-09-16: z-ai-glm-5-3, deepseek-v4-flash and openai-gpt-54
+# complete a turn. kimi-k2-5 is rejected (400) because Venice's Kimi backend
+# refuses the `namespace` tool type Codex emits for MCP servers — function
+# tools alone pass. zai-org-glm-5-1 (Venice's documented default) answered
+# "overloaded" on both wire APIs. This Codex (v0.153) only speaks
+# `wire_api = "responses"`; the chat wire was removed upstream.
+set -eu
+key_file="${VENICE_API_KEY_FILE:-$HOME/.config/venice/api-key}"
+if [ ! -r "$key_file" ]; then
+    echo "venice-code: no key at $key_file (create one at https://venice.ai/settings/api)" >&2
+    exit 1
+fi
+VENICE_API_KEY="$(cat "$key_file")" exec codex \
+    -c model_provider=venice \
+    -c model="${VENICE_MODEL:-z-ai-glm-5-3}" \
+    "$@"
