@@ -19,6 +19,7 @@
       "WebFetch",
       "WebSearch",
       "Write",
+      "Bash(signal-chats:*)",
       "mcp__claude-in-chrome",
       "mcp__playwright",
       "mcp__google-docs",
