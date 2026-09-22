@@ -104,6 +104,36 @@ under my name at `/admin/ai`. (Inside fsp-app, that repo's `AGENTS.md` still gov
 `db:prod-query` is a developer debugging tool, not a member surface.) Docs:
 `fsp-app/docs/knowledge/agent-access.md`.
 
+## Email (Proton)
+
+My mail is already readable on this machine from any session, with no password
+prompt. **Never ask me for the Bridge password and never type one.** Credentials
+live in `~/.config/life-accounts/env` (`PROTON_IMAP_*`, mode 600); the scripts read
+that file themselves and never print it.
+
+- **Default: read the local mirror, not the server.** `~/mail/proton/` holds a full
+  copy of All Mail — `eml/<uid>.eml` plus `index.db`, a SQLite FTS5 index — refreshed
+  every 15 minutes by the `proton-mirror.timer` user unit. Nothing needs to be running
+  and it works from any cwd:
+  - `python3 ~/projects/me/scripts/mail/mirror.py find [--since YYYY-MM] [--limit N] QUERY`
+    — full-text search; FTS5 syntax with `from:`, `to:`, `subject:` prefixes, quoted
+    phrases, AND/OR/NOT. Prints `uid  date  sender  subject  snippet`.
+  - `… mirror.py show UID` — one message as plain text. `… mirror.py status` — count
+    and last sync time.
+  - Or open `~/mail/proton/index.db` read-only: table
+    `msg(uid, date, gone, sender, recipients, subject, body)`. Server deletions are
+    kept with `gone=1`; the mirror is an archive, never pruned.
+- **Live IMAP only when the mirror can't answer** — mail newer than the last sync, or
+  which folder a message sits in now: `python3 ~/projects/me/scripts/mail/mail.py`
+  (`test`, `folders`, `inbox`, `search`, `show`). It talks to Proton Bridge on
+  localhost; if Bridge isn't running, say so rather than route around it. Everything
+  is read-only except `move`, which is a dry run without `--go`.
+- **Filing and triage belong to the life agent in `~/projects/me`** (`scripts/triage/`,
+  `scripts/finance/`, `scripts/bills/`). Other sessions read mail; they don't archive,
+  move, or classify it.
+- Sending mail is not wired up anywhere. If a task needs an email sent, draft it and
+  hand it to me.
+
 ## Writing
 
 For any **longform I'll publish under my own name** — essays, articles, Substack posts, threads, arguments — invoke the **`writing`** skill first (process, preferences, and the Google Doc collaboration protocol live there; don't restate them). Core rule: **I write the words; you build the scaffold** — bullets and structure, never finished prose. `kauffj-voice` is for tweets and throwaway, not for ghostwriting signed work.
