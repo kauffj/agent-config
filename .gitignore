@@ -102,3 +102,8 @@ chrome/
 
 # Other agents' transcript mirrors (claude-transcript-sync)
 vendor-backup/
+
+# Claude Code syncs the skills enabled on claude.ai into skills/synced/ (and parks
+# removed ones in skills/.trash/). Managed by the CLI, not source; doctor skips it.
+skills/synced/
+skills/.trash/
