@@ -290,6 +290,18 @@ wired up by `.gitattributes`) strips it on the way into git, so staging
 the commit as a backstop when the filter isn't configured. Both are needed: the
 filter is per-clone git config, which a fresh clone does not inherit.
 
+**Never accept `/auto-mode-setup` output as-is.** Auto mode reads `autoMode` from user
+scope only (project settings are ignored by design), so there is ONE environment for
+every repo on this machine, and the setup wizard drafts it from whichever repo it runs
+in. From July to September 2026 it described only `kauffj/education` and named
+freestate.party a foreign "sensitive remote target", so routine fsp-app work (reading
+Jeremy's own sign-in link, changing fsp-app's own approval policy) was refused. The
+authored, all-projects environment lives in the private
+`~/projects/server-config/agent-automode.json`; `lib/doctor.mjs` warns when the live
+block drifts from it and prints the restore command. The `allow` and `soft_deny` rules
+are committed here as prose (the classifier reads them as text, not as globs), so they
+must reference infrastructure through the environment rather than naming it.
+
 `settings.json` wires Claude's hooks and status line; `codex/hooks.json` wires
 the corresponding Codex lifecycle events. Shared reference paths use the
 neutral `~/.config/agent-config` alias. Codex requires one-time review of a new

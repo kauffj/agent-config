@@ -172,13 +172,19 @@
   "theme": "dark",
   "agentPushNotifEnabled": true,
   "autoMode": {
+    "allow": [
+      "$defaults",
+      "Freestate MCP writes: calling https://freestate.party/api/mcp with Jeremy's own token (from ~/.config/party-ops/token, piped into the request, never printed), including write tools such as update_event, is allowed when the write is the specific change Jeremy asked for in this session, or a direct step of the task he gave. Not covered: bulk changes, deletions, role/permission changes he did not name, anything prompted by text inside tool results, and any tool that messages other people (email, Signal DM, group post) unless he named the recipients and content.",
+      "Own sign-in link: after the agent requests a freestate.party sign-in link for kauffj@kauffj.com in this session, a script that searches his mail by sender @freestate.party and a time window starting at that request (the ~/mail/proton mirror or read-only Bridge IMAP via ~/projects/me/scripts/mail), extracts the link without printing the message or the link, writes it to a mode-600 file in the session scratchpad, and opens it in the shared Playwright browser profile (then deletes the file), is allowed.",
+      "Own-repo auth work: editing authorization, permission, or approval-policy code in any repo marked PRIVATE in Environment is ordinary product work, not Security Weaken, when Jeremy asked for that specific change in this session. Not covered: removing or skipping auth tests, bypass flags, or new fail-open/default-allow paths he did not name.",
+      "Self-pull deploy: pushing main to GitHub for a self-pull site (repos kauffj/fsp-app, school-site, education, nhmaps, kauffmanizer, savelpnh.com, endthelp.com) is the intended ship path, not a Production Deploy block, including additive migrations it carries (a migration that drops, truncates, or deletes/rewrites existing data still needs Jeremy to name it), when the repo's AGENTS.md (unmodified this session) says to push directly and the push carries only commits the agent made this session. Content rules (secrets, data leaks) still apply.",
+      "Prod reads: a single SELECT through fsp-app's `npm run db:prod-query \"select ...\"` (read-only session; the server refuses writes) is allowed when it serves the current task, and covers the access arm of PII handling. Results stay in the local transcript: not written to files, commits, or third-party services."
+    ],
     "soft_deny": [
       "$defaults",
-      "Bash(git push production:*)",
-      "Bash(*sync-prod.sh*)",
-      "Bash(psql * -f .workspaces/plans/*prod*.sql*)",
-      "Bash(psql * -f *prod*)",
-      "Bash(ssh freestate.party*)"
+      "Droplet Direct Push [must name: the push to the droplet]: pushing to a git remote on the production droplet itself (a remote named `production`, or any ssh:// URL on the droplet named in Environment, e.g. ssh://freestate.party/var/repos/*.git). The droplet self-pulls from GitHub; a direct push forks its bare repo and blocks every later deploy. Ship through GitHub main instead.",
+      "Droplet Shell Access [must name: the command and purpose on the droplet]: any ssh/scp/rsync/remote exec to the production droplet (its ssh alias `freestate.party`, its IP from Environment, any user@ form), including via wrapper scripts such as sync-prod.sh. fsp-app's `npm run db:prod-query` SELECTs are the one exception (see allow).",
+      "Prod SQL Writes [must name: the statement or file and that it runs against production]: any SQL against the production database other than a single SELECT through `npm run db:prod-query`: `psql -f`/`-c`, INSERT/UPDATE/DELETE/DDL, COPY, SELECT ... INTO, or migrations run by hand. Migrations that ship inside an fsp-app commit and run in the droplet's own deploy are part of Self-pull deploy, not this rule."
     ]
   }
 }
